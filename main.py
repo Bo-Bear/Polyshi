@@ -703,7 +703,7 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
 # -----------------------------
 # Hedge logic
 # -----------------------------
-def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQuote) -> Optional[HedgeCandidate]:
+def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQuote) -> Tuple[Optional[HedgeCandidate], List[HedgeCandidate]]:
     # Interpret Kalshi YES as "Up", NO as "Down" for Up/Down markets.
     kalshi_up = kalshi.yes_ask
     kalshi_down = kalshi.no_ask
@@ -770,10 +770,10 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
     # and require net_edge > 0 (profit after fees/extras).
     viable = [c for c in cands if c.total_cost < 1.0 and c.net_edge > 0]
     if not viable:
-        return None
+        return None, cands
 
     viable.sort(key=lambda x: x.net_edge, reverse=True)
-    return viable[0]
+    return viable[0], cands
 
 
 
@@ -868,19 +868,29 @@ def summarize(log_rows: List[dict], coins: List[str]) -> None:
 # -----------------------------
 # Parallel fetch helper
 # -----------------------------
-def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> Tuple[str, Optional[KalshiMarketQuote], Optional[PolyMarketQuote]]:
-    """Fetch Kalshi and Polymarket quotes for a single coin. Thread-safe."""
-    kalshi = None
-    poly = None
+def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> dict:
+    """Fetch Kalshi and Polymarket quotes for a single coin. Returns dict with quotes, timing, and errors."""
+    result: dict = {
+        "coin": coin, "kalshi": None, "poly": None,
+        "kalshi_ms": 0.0, "poly_ms": 0.0,
+        "kalshi_err": None, "poly_err": None,
+    }
+
+    t0 = time.monotonic()
     try:
-        kalshi = pick_current_kalshi_market(KALSHI_SERIES[coin])
-    except Exception:
-        pass
+        result["kalshi"] = pick_current_kalshi_market(KALSHI_SERIES[coin])
+    except Exception as e:
+        result["kalshi_err"] = str(e)
+    result["kalshi_ms"] = (time.monotonic() - t0) * 1000
+
+    t0 = time.monotonic()
     try:
-        poly = extract_poly_quote_for_coin(poly_events, coin)
-    except Exception:
-        pass
-    return coin, kalshi, poly
+        result["poly"] = extract_poly_quote_for_coin(poly_events, coin)
+    except Exception as e:
+        result["poly_err"] = str(e)
+    result["poly_ms"] = (time.monotonic() - t0) * 1000
+
+    return result
 
 
 # -----------------------------
@@ -913,12 +923,16 @@ def main() -> None:
 
     while len(logged) < MAX_TEST_TRADES:
         scan_i += 1
+        scan_t0 = time.monotonic()
         print_scan_header(scan_i)
 
         # Pull Polymarket 15M crypto events once per scan (covers BTC/ETH/SOL)
+        gamma_t0 = time.monotonic()
         poly_events = poly_get_active_15m_crypto_events(crypto_tag_id=crypto_tag_id, limit=250)
+        gamma_ms = (time.monotonic() - gamma_t0) * 1000
 
         # Local filter: keep only events that are actually 15-minute recurrence (if field present)
+        pre_filter_count = len(poly_events)
         filtered = []
         for e in poly_events:
             rec = (e.get("recurrence") or "").upper()
@@ -929,71 +943,101 @@ def main() -> None:
                 filtered.append(e)
 
         poly_events = filtered
+        print(f"  [timing] Poly Gamma: {gamma_ms:.0f}ms ({pre_filter_count} events, {len(poly_events)} after filter)")
 
 
         # Fetch all coin quotes in parallel (Kalshi + Poly CLOB calls concurrently)
-        coin_data: Dict[str, Tuple[Optional[KalshiMarketQuote], Optional[PolyMarketQuote]]] = {}
+        fetch_t0 = time.monotonic()
+        coin_data: Dict[str, dict] = {}
         with ThreadPoolExecutor(max_workers=len(selected_coins)) as executor:
             futures = {
                 executor.submit(_fetch_coin_quotes, coin, poly_events): coin
                 for coin in selected_coins
             }
             for future in as_completed(futures):
-                c, kq, pq = future.result()
-                coin_data[c] = (kq, pq)
+                result = future.result()
+                coin_data[result["coin"]] = result
+        fetch_ms = (time.monotonic() - fetch_t0) * 1000
+
+        # Per-coin timing breakdown
+        print(f"  [timing] Parallel coin fetch: {fetch_ms:.0f}ms")
+        for coin in selected_coins:
+            cd = coin_data[coin]
+            parts = [f"Kalshi {cd['kalshi_ms']:.0f}ms", f"Poly CLOB {cd['poly_ms']:.0f}ms"]
+            if cd["kalshi_err"]:
+                parts.append(f"ERR kalshi: {cd['kalshi_err'][:80]}")
+            if cd["poly_err"]:
+                parts.append(f"ERR poly: {cd['poly_err'][:80]}")
+            print(f"    {coin}: {' | '.join(parts)}")
 
         best_global: Optional[HedgeCandidate] = None
 
         for coin in selected_coins:
-            kalshi, poly = coin_data[coin]
+            cd = coin_data[coin]
+            kalshi, poly = cd["kalshi"], cd["poly"]
 
             display_market_block(market_type, coin, kalshi, poly)
 
-
             if kalshi is None or poly is None:
+                if cd["kalshi_err"]:
+                    print(f"  -> Error: Kalshi fetch failed: {cd['kalshi_err']}")
+                if cd["poly_err"]:
+                    print(f"  -> Error: Poly fetch failed: {cd['poly_err']}")
                 continue
 
             # Window alignment: require Kalshi close_ts ~ Polymarket end_ts
             delta_s = abs((kalshi.close_ts - poly.end_ts).total_seconds())
+            now = datetime.now(timezone.utc)
+            remaining_s = (kalshi.close_ts - now).total_seconds()
+            remaining_str = f"{int(remaining_s // 60)}m {int(remaining_s % 60)}s" if remaining_s > 0 else "CLOSED"
+
             if delta_s > WINDOW_ALIGN_TOLERANCE_SECONDS:
                 print(f"  -> Alignment: ❌ SKIP (Kalshi close vs Poly end differ by {delta_s:.1f}s; tol={WINDOW_ALIGN_TOLERANCE_SECONDS}s)")
                 continue
             else:
-                print(f"  -> Alignment: ✅ OK (Δ {delta_s:.1f}s)")
+                print(f"  -> Alignment: ✅ OK (Δ {delta_s:.1f}s) | Window closes in: {remaining_str}")
                 print(f"          Liquidity threshold: ${MIN_LEG_NOTIONAL:.0f} per outcome (enforced)")
 
-            # TEMP: Skip Kalshi depth enforcement (orderbook schema varies)
-            kalshi_up_price = kalshi.yes_ask
-            kalshi_down_price = kalshi.no_ask
+            best_for_coin, all_combos = best_hedge_for_coin(coin, poly, kalshi)
 
-
-            # Overwrite displayed prices with depth-aware prices for this scan
-            kalshi.yes_ask = kalshi_up_price
-            kalshi.no_ask = kalshi_down_price
-
-            best_for_coin = best_hedge_for_coin(coin, poly, kalshi)
+            # Show both hedge combos for visibility
+            print(f"  -> Hedge combos:")
+            for c in all_combos:
+                tag = "VIABLE" if c.total_cost < 1.0 and c.net_edge > 0 else "skip"
+                print(
+                    f"       Poly {c.direction_on_poly} {c.poly_price:.3f} + Kalshi {c.direction_on_kalshi} {c.kalshi_price:.3f} "
+                    f"= {c.total_cost:.3f} | gross {pct(c.gross_edge)} | net {pct(c.net_edge)} "
+                    f"| fees ${c.poly_fee:.4f}+${c.kalshi_fee:.4f} [{tag}]"
+                )
 
             if best_for_coin is None:
-                print("  -> Candidate: ❌ SKIP (no combo with total cost < $1.00 and positive edge)")
+                print("  -> Candidate: ❌ SKIP (no combo with positive net edge)")
                 continue
 
             print(
-                f"  -> Candidate: ✅ OK | Poly {best_for_coin.direction_on_poly} {best_for_coin.poly_price:.3f} "
+                f"  -> Candidate: ✅ BEST | Poly {best_for_coin.direction_on_poly} {best_for_coin.poly_price:.3f} "
                 f"+ Kalshi {best_for_coin.direction_on_kalshi} {best_for_coin.kalshi_price:.3f} "
                 f"= {best_for_coin.total_cost:.3f} | gross {pct(best_for_coin.gross_edge)} | "
                 f"fees poly {fmt_money(best_for_coin.poly_fee)} + kalshi {fmt_money(best_for_coin.kalshi_fee)} "
                 f"+ extras {fmt_money(best_for_coin.extras)} = net {pct(best_for_coin.net_edge)}"
             )
 
-
             if best_global is None or best_for_coin.net_edge > best_global.net_edge:
                 best_global = best_for_coin
 
 
+        # Scan timing summary
+        scan_ms = (time.monotonic() - scan_t0) * 1000
+        process_ms = scan_ms - gamma_ms - fetch_ms
+        print(f"\n  [timing] Scan #{scan_i} total: {scan_ms:.0f}ms (Gamma {gamma_ms:.0f}ms + fetch {fetch_ms:.0f}ms + process {process_ms:.0f}ms)")
+
         # Log at most one paper trade per scan (the best across BTC/ETH/SOL)
         if best_global is not None:
+            # Gather per-coin latency for the winning coin
+            winning_cd = coin_data[best_global.coin]
             row = {
                 "ts": utc_ts(),
+                "scan_num": scan_i,
                 "coin": best_global.coin,
                 "poly_side": best_global.direction_on_poly,
                 "kalshi_side": best_global.direction_on_kalshi,
@@ -1007,12 +1051,17 @@ def main() -> None:
                 "extras": best_global.extras,
                 "poly_ref": best_global.poly_ref,
                 "kalshi_ref": best_global.kalshi_ref,
+                "scan_ms": round(scan_ms, 1),
+                "gamma_ms": round(gamma_ms, 1),
+                "fetch_ms": round(fetch_ms, 1),
+                "kalshi_latency_ms": round(winning_cd["kalshi_ms"], 1),
+                "poly_latency_ms": round(winning_cd["poly_ms"], 1),
             }
             append_log(logfile, row)
             logged.append(row)
-            print(f"\n[paper] Logged test trade #{len(logged)} -> {best_global.coin} | net {pct(best_global.net_edge)} (gross {pct(best_global.gross_edge)})")
+            print(f"[paper] Logged test trade #{len(logged)} -> {best_global.coin} | net {pct(best_global.net_edge)} (gross {pct(best_global.gross_edge)})")
         else:
-            print("\nNo viable paper trades found in this scan.")
+            print("No viable paper trades found in this scan.")
 
         if len(logged) < MAX_TEST_TRADES:
             time.sleep(SCAN_SLEEP_SECONDS)
