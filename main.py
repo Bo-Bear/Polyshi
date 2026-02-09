@@ -4,6 +4,7 @@ import time
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -66,6 +67,22 @@ POLY_TITLE_PREFIX = {
 
 # Output
 LOG_DIR = os.getenv("LOG_DIR", "logs")
+
+
+# -----------------------------
+# HTTP session + caches
+# -----------------------------
+_http_session: Optional[requests.Session] = None
+
+
+def _get_session() -> requests.Session:
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+    return _http_session
+
+
+_clob_working_route_idx: Optional[int] = None
 
 
 # -----------------------------
@@ -336,7 +353,7 @@ def kalshi_get_markets_for_series(series_ticker: str) -> List[dict]:
     # Docs show /markets?series_ticker=...&status=open
     url = f"{KALSHI_BASE}/markets"
     params = {"series_ticker": series_ticker, "status": "open"}
-    r = requests.get(url, params=params, timeout=15)
+    r = _get_session().get(url, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
     return data.get("markets", [])
@@ -344,7 +361,7 @@ def kalshi_get_markets_for_series(series_ticker: str) -> List[dict]:
 
 def kalshi_get_market(ticker: str) -> dict:
     url = f"{KALSHI_BASE}/markets/{ticker}"
-    r = requests.get(url, timeout=15)
+    r = _get_session().get(url, timeout=15)
     r.raise_for_status()
     return r.json().get("market", {})
 
@@ -429,7 +446,7 @@ def pick_current_kalshi_market(series_ticker: str) -> Optional[KalshiMarketQuote
 
 def kalshi_get_orderbook(ticker: str) -> dict:
     url = f"{KALSHI_BASE}/markets/{ticker}/orderbook"
-    r = requests.get(url, timeout=15)
+    r = _get_session().get(url, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -481,7 +498,7 @@ def kalshi_asks_from_orderbook(ob: dict) -> Tuple[List[Tuple[float, float]], Lis
 def poly_get_crypto_tag_id() -> Optional[int]:
     # Tag slug "crypto" exists on the site; Gamma supports /tags/slug/{slug}
     url = f"{POLY_GAMMA_BASE}/tags/slug/crypto"
-    r = requests.get(url, timeout=15)
+    r = _get_session().get(url, timeout=15)
     if r.status_code != 200:
         return None
     data = r.json()
@@ -506,7 +523,7 @@ def poly_get_active_15m_crypto_events(crypto_tag_id: int, limit: int = 200) -> L
         "limit": str(limit),
         "offset": "0",
     }
-    r = requests.get(url, params=params, timeout=20)
+    r = _get_session().get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -556,10 +573,18 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
         (f"{POLY_CLOB_BASE}/orderbook/{token_id}", None),
     ]
 
+    global _clob_working_route_idx
+    # Try cached route first to avoid unnecessary 404s
+    if _clob_working_route_idx is not None:
+        order = [_clob_working_route_idx] + [i for i in range(len(candidates)) if i != _clob_working_route_idx]
+    else:
+        order = list(range(len(candidates)))
+
     last_err = None
-    for url, params in candidates:
+    for idx in order:
+        url, params = candidates[idx]
         try:
-            r = requests.get(url, params=params, timeout=15)
+            r = _get_session().get(url, params=params, timeout=15)
             if r.status_code == 404:
                 continue
             r.raise_for_status()
@@ -583,13 +608,12 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
                 asks.append((p, s))
 
             asks.sort(key=lambda x: x[0])
+            _clob_working_route_idx = idx
             return asks
         except Exception as e:
             last_err = e
             continue
 
-    # No route worked
-    #print(f"DEBUG: No CLOB book route worked for token_id={token_id}. Last error={last_err}")
     return []
 
 
@@ -842,6 +866,24 @@ def summarize(log_rows: List[dict], coins: List[str]) -> None:
 
 
 # -----------------------------
+# Parallel fetch helper
+# -----------------------------
+def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> Tuple[str, Optional[KalshiMarketQuote], Optional[PolyMarketQuote]]:
+    """Fetch Kalshi and Polymarket quotes for a single coin. Thread-safe."""
+    kalshi = None
+    poly = None
+    try:
+        kalshi = pick_current_kalshi_market(KALSHI_SERIES[coin])
+    except Exception:
+        pass
+    try:
+        poly = extract_poly_quote_for_coin(poly_events, coin)
+    except Exception:
+        pass
+    return coin, kalshi, poly
+
+
+# -----------------------------
 # Main loop
 # -----------------------------
 def main() -> None:
@@ -889,14 +931,21 @@ def main() -> None:
         poly_events = filtered
 
 
+        # Fetch all coin quotes in parallel (Kalshi + Poly CLOB calls concurrently)
+        coin_data: Dict[str, Tuple[Optional[KalshiMarketQuote], Optional[PolyMarketQuote]]] = {}
+        with ThreadPoolExecutor(max_workers=len(selected_coins)) as executor:
+            futures = {
+                executor.submit(_fetch_coin_quotes, coin, poly_events): coin
+                for coin in selected_coins
+            }
+            for future in as_completed(futures):
+                c, kq, pq = future.result()
+                coin_data[c] = (kq, pq)
+
         best_global: Optional[HedgeCandidate] = None
 
         for coin in selected_coins:
-            # Kalshi quote
-            kalshi = pick_current_kalshi_market(KALSHI_SERIES[coin])
-
-            # Polymarket quote
-            poly = extract_poly_quote_for_coin(poly_events, coin)
+            kalshi, poly = coin_data[coin]
 
             display_market_block(market_type, coin, kalshi, poly)
 
