@@ -721,7 +721,7 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
     total1 = poly.up_price + kalshi_down
     gross1 = 1.0 - total1
     poly_fee1, kalshi_fee1 = fees_for_leg(poly.up_price, kalshi_down)
-    net1 = 1.0 - total1 - poly_fee1 - kalshi_fee1 - extras
+    net1 = 1.0 - total1 - (poly_fee1 + kalshi_fee1 + extras) / PAPER_CONTRACTS
 
     cands.append(
         HedgeCandidate(
@@ -745,7 +745,7 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
     total2 = poly.down_price + kalshi_up
     gross2 = 1.0 - total2
     poly_fee2, kalshi_fee2 = fees_for_leg(poly.down_price, kalshi_up)
-    net2 = 1.0 - total2 - poly_fee2 - kalshi_fee2 - extras
+    net2 = 1.0 - total2 - (poly_fee2 + kalshi_fee2 + extras) / PAPER_CONTRACTS
 
     cands.append(
         HedgeCandidate(
