@@ -30,6 +30,29 @@ MIN_LEG_NOTIONAL = float(os.getenv("MIN_LEG_NOTIONAL", "10"))  # $ minimum liqui
 USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 
 # -----------------------------
+# Execution safeguards
+# -----------------------------
+# Minimum net edge to accept a trade (protects against slippage/rounding eating thin edges)
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.005"))  # 0.5%
+
+# Minimum seconds remaining in the window before we'll trade (need time to fill both legs)
+MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "120"))  # 2 minutes
+
+# Maximum spread (ask_up + ask_down - 1) we'll accept; wider means unreliable pricing
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))  # 10%
+
+# Reject prices in extreme ranges where outcome is nearly decided (hedging is risky)
+PRICE_FLOOR = float(os.getenv("PRICE_FLOOR", "0.05"))   # skip legs priced below 5c
+PRICE_CEILING = float(os.getenv("PRICE_CEILING", "0.95"))  # skip legs priced above 95c
+
+# Session-level circuit breaker: stop scanning after this many consecutive no-trade scans
+# (may indicate stale data or broken feeds)
+MAX_CONSECUTIVE_SKIPS = int(os.getenv("MAX_CONSECUTIVE_SKIPS", "50"))
+
+# Maximum gross cost we'll accept (tighter than 1.0 to leave room for execution slippage)
+MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.995"))
+
+# -----------------------------
 # Fees (paper-trade model)
 # -----------------------------
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
@@ -997,10 +1020,8 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
         )
     )
 
-    # Fee-aware viability:
-    # still require total_cost < 1 (otherwise you lose before fees),
-    # and require net_edge > 0 (profit after fees/extras).
-    viable = [c for c in cands if c.total_cost < 1.0 and c.net_edge > 0]
+    # Fee-aware viability with execution safeguards:
+    viable = [c for c in cands if c.total_cost < MAX_TOTAL_COST and c.net_edge >= MIN_NET_EDGE]
     if not viable:
         return None, cands
 
@@ -1142,6 +1163,13 @@ def main() -> None:
     print("=" * 45)
     print(f"Market Type: {market_type}")
     print(f"Coins: {', '.join(selected_coins)}")
+    print(f"\nExecution safeguards:")
+    print(f"  Min net edge:       {pct(MIN_NET_EDGE)}")
+    print(f"  Max total cost:     {MAX_TOTAL_COST:.3f}")
+    print(f"  Min window time:    {MIN_WINDOW_REMAINING_S:.0f}s")
+    print(f"  Max spread:         {pct(MAX_SPREAD)}")
+    print(f"  Price range:        [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}]")
+    print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
 
     # Start Polymarket CLOB WebSocket for real-time orderbook data
     global _poly_ws
@@ -1161,6 +1189,7 @@ def main() -> None:
 
     logged: List[dict] = []
     scan_i = 0
+    consecutive_skips = 0
 
     while len(logged) < MAX_TEST_TRADES:
         scan_i += 1
@@ -1237,14 +1266,38 @@ def main() -> None:
                 continue
             else:
                 print(f"  -> Alignment: ✅ OK (Δ {delta_s:.1f}s) | Window closes in: {remaining_str}")
-                print(f"          Liquidity threshold: ${MIN_LEG_NOTIONAL:.0f} per outcome (enforced)")
+
+            # Safeguard: minimum time remaining in window
+            if remaining_s < MIN_WINDOW_REMAINING_S:
+                print(f"  -> Window: ❌ SKIP (only {remaining_str} left; need {MIN_WINDOW_REMAINING_S:.0f}s to fill both legs)")
+                continue
+
+            # Safeguard: spread sanity — reject if either exchange has abnormally wide spread
+            kalshi_spread = (kalshi.yes_ask + kalshi.no_ask) - 1.0
+            poly_spread = (poly.up_price + poly.down_price) - 1.0
+            if kalshi_spread > MAX_SPREAD:
+                print(f"  -> Spread: ❌ SKIP Kalshi spread {pct(kalshi_spread)} exceeds {pct(MAX_SPREAD)} max")
+                continue
+            if poly_spread > MAX_SPREAD:
+                print(f"  -> Spread: ❌ SKIP Poly spread {pct(poly_spread)} exceeds {pct(MAX_SPREAD)} max")
+                continue
+
+            # Safeguard: extreme prices — outcome nearly decided, hedging is unreliable
+            prices = [poly.up_price, poly.down_price, kalshi.yes_ask, kalshi.no_ask]
+            extreme = [p for p in prices if p < PRICE_FLOOR or p > PRICE_CEILING]
+            if extreme:
+                print(f"  -> Price: ❌ SKIP extreme prices detected ({', '.join(f'{p:.3f}' for p in extreme)}); "
+                      f"outside [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}] range")
+                continue
+
+            print(f"          Safeguards: ✅ all passed (min edge {pct(MIN_NET_EDGE)}, min window {MIN_WINDOW_REMAINING_S:.0f}s)")
 
             best_for_coin, all_combos = best_hedge_for_coin(coin, poly, kalshi)
 
             # Show both hedge combos for visibility
             print(f"  -> Hedge combos:")
             for c in all_combos:
-                tag = "VIABLE" if c.total_cost < 1.0 and c.net_edge > 0 else "skip"
+                tag = "VIABLE" if c.total_cost < MAX_TOTAL_COST and c.net_edge >= MIN_NET_EDGE else "skip"
                 print(
                     f"       Poly {c.direction_on_poly} {c.poly_price:.3f} + Kalshi {c.direction_on_kalshi} {c.kalshi_price:.3f} "
                     f"= {c.total_cost:.3f} | gross {pct(c.gross_edge)} | net {pct(c.net_edge)} "
@@ -1252,7 +1305,7 @@ def main() -> None:
                 )
 
             if best_for_coin is None:
-                print("  -> Candidate: ❌ SKIP (no combo with positive net edge)")
+                print(f"  -> Candidate: ❌ SKIP (no combo with net edge >= {pct(MIN_NET_EDGE)} and cost < {MAX_TOTAL_COST:.3f})")
                 continue
 
             print(
@@ -1303,9 +1356,14 @@ def main() -> None:
             }
             append_log(logfile, row)
             logged.append(row)
+            consecutive_skips = 0
             print(f"[paper] Logged test trade #{len(logged)} -> {best_global.coin} | net {pct(best_global.net_edge)} (gross {pct(best_global.gross_edge)})")
         else:
-            print("No viable paper trades found in this scan.")
+            consecutive_skips += 1
+            print(f"No viable paper trades found in this scan. ({consecutive_skips} consecutive skips)")
+            if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
+                print(f"\n⚠ Circuit breaker: {MAX_CONSECUTIVE_SKIPS} consecutive scans with no viable trades. Stopping.")
+                break
 
         if len(logged) < MAX_TEST_TRADES:
             time.sleep(SCAN_SLEEP_SECONDS)
