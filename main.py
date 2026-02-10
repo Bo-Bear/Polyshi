@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
+import re
+
 import requests
 from dotenv import load_dotenv
 
@@ -51,6 +53,11 @@ MAX_CONSECUTIVE_SKIPS = int(os.getenv("MAX_CONSECUTIVE_SKIPS", "50"))
 
 # Maximum gross cost we'll accept (tighter than 1.0 to leave room for execution slippage)
 MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.995"))
+
+# Maximum allowed divergence between implied probabilities across exchanges.
+# Large divergence signals mismatched strikes (Kalshi uses fixed $, Poly uses relative).
+# If |kalshi_up_prob - poly_up_prob| > this, skip the trade.
+MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.10"))  # 10 percentage points
 
 # -----------------------------
 # Fees (paper-trade model)
@@ -659,8 +666,17 @@ def pick_current_kalshi_market(series_ticker: str) -> Optional[KalshiMarketQuote
     if yes_ask is None or no_ask is None:
         return None
 
-    # Best-effort strike extraction (often present in market fields like functional_strike)
-    strike = full.get("functional_strike") or None
+    # Strike extraction: Kalshi 15M crypto markets use a fixed dollar strike.
+    # Primary: floor_strike (numeric). Fallback: parse subtitle (e.g., "$96,250 or above").
+    strike = full.get("floor_strike") or full.get("cap_strike") or None
+    if strike is None:
+        subtitle = full.get("subtitle") or full.get("yes_sub_title") or ""
+        m = re.search(r'\$([\d,]+(?:\.\d+)?)', subtitle)
+        if m:
+            try:
+                strike = float(m.group(1).replace(',', ''))
+            except ValueError:
+                pass
 
     return KalshiMarketQuote(
         ticker=best["ticker"],
@@ -1054,7 +1070,14 @@ def display_market_block(market_type: str, coin: str, kalshi: Optional[KalshiMar
         print("  Kalshi:  (no open market found)")
     else:
         spread = (kalshi.yes_ask + kalshi.no_ask) - 1.0
-        strike_txt = f" | Strike: {kalshi.strike}" if kalshi.strike else ""
+        if kalshi.strike is not None:
+            try:
+                strike_val = float(kalshi.strike)
+                strike_txt = f" | Strike: ${strike_val:,.0f}"
+            except (ValueError, TypeError):
+                strike_txt = f" | Strike: {kalshi.strike}"
+        else:
+            strike_txt = " | Strike: UNKNOWN"
         print(f"  Kalshi:  {kalshi.title}{strike_txt}")
         print(f"          Up/Down (asks): {fmt_price_pair(kalshi.yes_ask, kalshi.no_ask)}")
         print(f"          Close (UTC): {kalshi.close_ts.strftime('%H:%M:%S')}")
@@ -1068,6 +1091,7 @@ def display_market_block(market_type: str, coin: str, kalshi: Optional[KalshiMar
         print(f"          Up/Down:        {fmt_price_pair(poly.up_price, poly.down_price)}")
         print(f"          End   (UTC): {poly.end_ts.strftime('%H:%M:%S')}")
         print(f"          Spread (sum - 1): {pct(spread)}")
+        print(f"          Strike: relative (end >= start-of-window price)")
 
 
 def append_log(path: str, row: dict) -> None:
@@ -1169,6 +1193,7 @@ def main() -> None:
     print(f"  Min window time:    {MIN_WINDOW_REMAINING_S:.0f}s")
     print(f"  Max spread:         {pct(MAX_SPREAD)}")
     print(f"  Price range:        [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}]")
+    print(f"  Max prob diverge:   {pct(MAX_PROB_DIVERGENCE)} (strike mismatch detector)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
 
     # Start Polymarket CLOB WebSocket for real-time orderbook data
@@ -1290,7 +1315,18 @@ def main() -> None:
                       f"outside [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}] range")
                 continue
 
-            print(f"          Safeguards: ✅ all passed (min edge {pct(MIN_NET_EDGE)}, min window {MIN_WINDOW_REMAINING_S:.0f}s)")
+            # Safeguard: probability divergence — large disagreement signals mismatched strikes.
+            # Kalshi uses fixed $ strikes; Poly uses relative (end >= start). If implied probs
+            # diverge too much, the markets are pricing different events.
+            kalshi_up_prob = 1.0 - kalshi.no_ask  # implied P(up) from Kalshi
+            poly_up_prob = poly.up_price           # implied P(up) from Poly
+            prob_div = abs(kalshi_up_prob - poly_up_prob)
+            if prob_div > MAX_PROB_DIVERGENCE:
+                print(f"  -> Divergence: ❌ SKIP implied P(up) Kalshi={kalshi_up_prob:.2f} vs Poly={poly_up_prob:.2f} "
+                      f"(Δ{pct(prob_div)} > {pct(MAX_PROB_DIVERGENCE)} max — likely different strikes)")
+                continue
+
+            print(f"          Safeguards: ✅ all passed (Δprob {pct(prob_div)}, min edge {pct(MIN_NET_EDGE)}, min window {MIN_WINDOW_REMAINING_S:.0f}s)")
 
             best_for_coin, all_combos = best_hedge_for_coin(coin, poly, kalshi)
 
