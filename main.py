@@ -33,7 +33,7 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 # Execution safeguards
 # -----------------------------
 # Minimum net edge to accept a trade (protects against slippage/rounding eating thin edges)
-MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.005"))  # 0.5%
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.0004"))  # 0.04%
 
 # Minimum seconds remaining in the window before we'll trade (need time to fill both legs)
 MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "120"))  # 2 minutes
@@ -56,7 +56,7 @@ MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.995"))
 # Fees (paper-trade model)
 # -----------------------------
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
-PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "100"))
+PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "10"))
 
 # Toggle fee modeling
 INCLUDE_POLY_FEES = os.getenv("INCLUDE_POLY_FEES", "true").lower() == "true"
