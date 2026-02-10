@@ -121,6 +121,37 @@ def _get_session() -> requests.Session:
 
 _clob_working_route_idx: Optional[int] = None
 
+# Spot price cache (one fetch per scan, shared across coins)
+_spot_prices: Dict[str, float] = {}
+_spot_prices_ts: float = 0.0
+
+COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
+
+def fetch_spot_prices() -> Dict[str, float]:
+    """Fetch current spot prices from CoinGecko. Returns {coin: usd_price}."""
+    global _spot_prices, _spot_prices_ts
+    # Cache for 10 seconds to avoid hammering
+    if time.monotonic() - _spot_prices_ts < 10 and _spot_prices:
+        return _spot_prices
+    ids = ",".join(COINGECKO_IDS.values())
+    try:
+        r = _get_session().get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ids, "vs_currencies": "usd"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        result: Dict[str, float] = {}
+        for coin, cg_id in COINGECKO_IDS.items():
+            if cg_id in data and "usd" in data[cg_id]:
+                result[coin] = float(data[cg_id]["usd"])
+        _spot_prices = result
+        _spot_prices_ts = time.monotonic()
+    except Exception:
+        pass  # return stale cache on failure
+    return _spot_prices
+
 
 # -----------------------------
 # Polymarket CLOB WebSocket (real-time orderbook cache)
@@ -342,6 +373,7 @@ class PolyMarketQuote:
     up_price: float    # dollars
     down_price: float  # dollars
     end_ts: datetime   # window end timestamp (UTC)
+    description: str = ""  # resolution criteria text (may contain reference price)
 
 
 @dataclass
@@ -957,6 +989,9 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
         if end_ts is None:
             continue
 
+        # Try to extract description (may contain "price to beat" or reference price)
+        desc = m0.get("description") or e.get("description") or ""
+
         return PolyMarketQuote(
             event_slug=e.get("slug") or "",
             market_slug=m0.get("slug") or "",
@@ -964,6 +999,7 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
             up_price=up_ask,
             down_price=down_ask,
             end_ts=end_ts,
+            description=desc,
         )
 
 
@@ -1061,10 +1097,26 @@ def fmt_price_pair(up: float, down: float) -> str:
     return f"{up:.3f}/{down:.3f}"
 
 
-def display_market_block(market_type: str, coin: str, kalshi: Optional[KalshiMarketQuote], poly: Optional[PolyMarketQuote]) -> None:
+def _parse_price_from_description(desc: str) -> Optional[float]:
+    """Try to extract a dollar reference price from Poly market description."""
+    # Look for patterns like "$97,250", "$97,250.00", "$2,345.67"
+    m = re.search(r'\$([\d,]+(?:\.\d+)?)', desc)
+    if m:
+        try:
+            return float(m.group(1).replace(',', ''))
+        except ValueError:
+            pass
+    return None
+
+
+def display_market_block(market_type: str, coin: str, kalshi: Optional[KalshiMarketQuote],
+                         poly: Optional[PolyMarketQuote], spot_price: Optional[float] = None) -> None:
     label = MARKET_TYPE_LABELS.get(market_type, market_type)
     print(f"\n[MARKET] {coin} ({label})")
 
+    # Spot price reference line
+    if spot_price is not None:
+        print(f"  Spot:    ${spot_price:,.2f} (CoinGecko)")
 
     if kalshi is None:
         print("  Kalshi:  (no open market found)")
@@ -1073,7 +1125,7 @@ def display_market_block(market_type: str, coin: str, kalshi: Optional[KalshiMar
         if kalshi.strike is not None:
             try:
                 strike_val = float(kalshi.strike)
-                strike_txt = f" | Strike: ${strike_val:,.0f}"
+                strike_txt = f" | Strike: ${strike_val:,.2f}"
             except (ValueError, TypeError):
                 strike_txt = f" | Strike: {kalshi.strike}"
         else:
@@ -1087,11 +1139,17 @@ def display_market_block(market_type: str, coin: str, kalshi: Optional[KalshiMar
         print("  Poly:    (no active 15M event found)")
     else:
         spread = (poly.up_price + poly.down_price) - 1.0
+        # Try to extract reference price from description
+        desc_price = _parse_price_from_description(poly.description)
+        if desc_price is not None:
+            ref_txt = f"${desc_price:,.2f} (from description)"
+        else:
+            ref_txt = "start-of-window (not in API)"
         print(f"  Poly:    {poly.title}  ({poly.event_slug}/{poly.market_slug})")
         print(f"          Up/Down:        {fmt_price_pair(poly.up_price, poly.down_price)}")
         print(f"          End   (UTC): {poly.end_ts.strftime('%H:%M:%S')}")
         print(f"          Spread (sum - 1): {pct(spread)}")
-        print(f"          Strike: relative (end >= start-of-window price)")
+        print(f"          Price to beat: {ref_txt}")
 
 
 def append_log(path: str, row: dict) -> None:
@@ -1267,11 +1325,14 @@ def main() -> None:
 
         best_global: Optional[HedgeCandidate] = None
 
+        # Fetch spot prices once per scan for strike reference
+        spot_prices = fetch_spot_prices()
+
         for coin in selected_coins:
             cd = coin_data[coin]
             kalshi, poly = cd["kalshi"], cd["poly"]
 
-            display_market_block(market_type, coin, kalshi, poly)
+            display_market_block(market_type, coin, kalshi, poly, spot_price=spot_prices.get(coin))
 
             if kalshi is None or poly is None:
                 if cd["kalshi_err"]:
