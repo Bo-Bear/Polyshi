@@ -925,10 +925,23 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
 
 def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyMarketQuote]:
     prefix = POLY_TITLE_PREFIX[coin]
+    now = datetime.now(timezone.utc)
 
     # pick earliest-ending active event matching title prefix
-    candidates = [e for e in events if isinstance(e.get("title"), str) and e["title"].startswith(prefix)]
-    _diag_add("poly_match", 0, f"{len(candidates)}/{len(events)} events for {coin}")
+    all_matches = [e for e in events if isinstance(e.get("title"), str) and e["title"].startswith(prefix)]
+
+    # Filter to events whose endDate is still in the future (skip expired windows)
+    candidates = []
+    skipped = 0
+    for e in all_matches:
+        end_raw = e.get("endDate") or e.get("end_date") or e.get("end")
+        end_ts = parse_iso_utc(end_raw) if isinstance(end_raw, str) else None
+        if end_ts is not None and end_ts < now:
+            skipped += 1
+            continue
+        candidates.append(e)
+
+    _diag_add("poly_match", 0, f"{len(candidates)} active/{len(all_matches)} total ({skipped} expired) for {coin}")
     if not candidates:
         return None
 
