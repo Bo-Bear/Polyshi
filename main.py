@@ -177,6 +177,7 @@ class _PolyOrderbookWS:
         self._running = False
         self._cache_hits = 0
         self._cache_misses = 0
+        self._last_update_ts: Dict[str, float] = {}  # token_id -> monotonic timestamp of last update
 
     def start(self):
         if not _HAS_WS_CLIENT:
@@ -243,6 +244,7 @@ class _PolyOrderbookWS:
             with self._lock:
                 self._asks[asset_id] = asks_dict
                 self._ready_ids.add(asset_id)
+                self._last_update_ts[asset_id] = time.monotonic()
 
         elif event_type == "price_change":
             with self._lock:
@@ -257,6 +259,7 @@ class _PolyOrderbookWS:
                             self._best_ask[asset_id] = float(best_ask_str)
                         except (ValueError, TypeError):
                             pass
+                    self._last_update_ts[asset_id] = time.monotonic()
                     # Update ask-side book level from SELL trades
                     side = str(pc.get("side", "")).upper()
                     if side == "SELL" and asset_id in self._asks:
@@ -278,6 +281,7 @@ class _PolyOrderbookWS:
                     ba = float(data["best_ask"])
                     with self._lock:
                         self._best_ask[asset_id] = ba
+                        self._last_update_ts[asset_id] = time.monotonic()
                         if asset_id not in self._ready_ids:
                             self._ready_ids.add(asset_id)
                             self._asks.setdefault(asset_id, {})
@@ -339,6 +343,33 @@ class _PolyOrderbookWS:
             self._cache_hits = self._cache_misses = 0
             return hits, misses
 
+    def get_staleness_s(self, token_id: str) -> Optional[float]:
+        """Seconds since last WS update for this token. None if never updated."""
+        with self._lock:
+            ts = self._last_update_ts.get(token_id)
+            if ts is None:
+                return None
+            return time.monotonic() - ts
+
+    def get_book_depth(self, token_id: str) -> Optional[dict]:
+        """Return depth summary for a token's cached ask-side book."""
+        with self._lock:
+            if token_id not in self._asks:
+                return None
+            asks = self._asks[token_id]
+            if not asks:
+                return {"levels": 0, "total_size": 0, "total_notional_usd": 0.0}
+            levels = sorted(asks.items())
+            total_size = sum(s for _, s in levels)
+            total_notional = sum(p * s for p, s in levels)
+            return {
+                "levels": len(levels),
+                "total_size": int(total_size),
+                "total_notional_usd": round(total_notional, 2),
+                "best_ask": levels[0][0],
+                "worst_ask": levels[-1][0],
+            }
+
     def stop(self):
         self._running = False
         if self._ws:
@@ -374,6 +405,8 @@ class PolyMarketQuote:
     down_price: float  # dollars
     end_ts: datetime   # window end timestamp (UTC)
     description: str = ""  # resolution criteria text (may contain reference price)
+    up_token_id: str = ""   # CLOB token ID for UP outcome
+    down_token_id: str = "" # CLOB token ID for DOWN outcome
 
 
 @dataclass
@@ -1020,6 +1053,8 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
             down_price=down_ask,
             end_ts=end_ts,
             description=desc,
+            up_token_id=outcome_to_token["up"],
+            down_token_id=outcome_to_token["down"],
         )
 
 
@@ -1177,46 +1212,115 @@ def append_log(path: str, row: dict) -> None:
         f.write(json.dumps(row) + "\n")
 
 
-def summarize(log_rows: List[dict], coins: List[str]) -> None:
+def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict[str, int]] = None) -> None:
     if not log_rows:
         print("\nNo test trades were logged.")
+        if skip_counts:
+            print("\nSkip reasons:")
+            for reason, count in sorted(skip_counts.items(), key=lambda x: -x[1]):
+                print(f"  {reason}: {count}")
         return
 
-    # Aggregate by coin + direction
     by_coin: Dict[str, List[dict]] = {}
     for r in log_rows:
         by_coin.setdefault(r["coin"], []).append(r)
 
-    print("\n=========================")
+    print("\n" + "=" * 60)
     print("  TEST TRADE SUMMARY")
-    print("=========================")
+    print("=" * 60)
 
     total_edge = sum(r["net_edge"] for r in log_rows)
     avg_edge = total_edge / len(log_rows)
 
-    print(f"\nLogged trades: {len(log_rows)}")
-    print(f"Avg net:       {pct(avg_edge)}")
-    print(f"Best net:      {pct(max(r['net_edge'] for r in log_rows))}")
-    print(f"Worst net:     {pct(min(r['net_edge'] for r in log_rows))}")
+    print(f"\n--- Edge Analysis ---")
+    print(f"Logged trades:  {len(log_rows)}")
+    print(f"Avg net edge:   {pct(avg_edge)}")
+    print(f"Best net edge:  {pct(max(r['net_edge'] for r in log_rows))}")
+    print(f"Worst net edge: {pct(min(r['net_edge'] for r in log_rows))}")
 
+    # P&L section (populated after outcome verification)
+    verified = [r for r in log_rows if r.get("actual_pnl_total") is not None]
+    if verified:
+        wins = [r for r in verified if r["actual_pnl_total"] > 0]
+        losses = [r for r in verified if r["actual_pnl_total"] < 0]
+        breakevens = [r for r in verified if r["actual_pnl_total"] == 0]
+        mismatches = [r for r in verified if not r.get("hedge_consistent", True)]
 
-    print("\nBy coin:")
+        total_pnl = sum(r["actual_pnl_total"] for r in verified)
+
+        # Running P&L for drawdown calculation
+        running = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        consec_losses = 0
+        max_consec_losses = 0
+        for r in verified:
+            running += r["actual_pnl_total"]
+            peak = max(peak, running)
+            dd = peak - running
+            max_dd = max(max_dd, dd)
+            if r["actual_pnl_total"] < 0:
+                consec_losses += 1
+                max_consec_losses = max(max_consec_losses, consec_losses)
+            else:
+                consec_losses = 0
+
+        print(f"\n--- Outcome Verification ---")
+        print(f"Verified:          {len(verified)}/{len(log_rows)} trades")
+        win_pct = len(wins) / len(verified) * 100 if verified else 0
+        print(f"Win rate:          {len(wins)}/{len(verified)} ({win_pct:.0f}%)")
+        print(f"Wins/Losses/BE:    {len(wins)}/{len(losses)}/{len(breakevens)}")
+        if mismatches:
+            print(f"Hedge mismatches:  {len(mismatches)} (BOTH legs lost — strike mismatch risk!)")
+        else:
+            print(f"Hedge mismatches:  0 (all hedges consistent)")
+
+        print(f"\n--- Paper P&L ({int(PAPER_CONTRACTS)} contracts/trade) ---")
+        print(f"Total P&L:         ${total_pnl:+.4f}")
+        print(f"Avg P&L/trade:     ${total_pnl / len(verified):+.4f}")
+        if wins:
+            print(f"Best trade:        ${max(r['actual_pnl_total'] for r in verified):+.4f}")
+        if losses:
+            print(f"Worst trade:       ${min(r['actual_pnl_total'] for r in verified):+.4f}")
+        print(f"Max drawdown:      ${max_dd:.4f}")
+        print(f"Max consec losses: {max_consec_losses}")
+
+    print(f"\n--- By Coin ---")
     for coin in coins:
         rows = by_coin.get(coin, [])
         if not rows:
             continue
         avg = sum(r["net_edge"] for r in rows) / len(rows)
         best = max(r["net_edge"] for r in rows)
-        print(f"  {coin}: n={len(rows)} | avg_net={pct(avg)} | best_net={pct(best)}")
+        coin_verified = [r for r in rows if r.get("actual_pnl_total") is not None]
+        if coin_verified:
+            coin_pnl = sum(r["actual_pnl_total"] for r in coin_verified)
+            coin_wins = sum(1 for r in coin_verified if r["actual_pnl_total"] > 0)
+            print(f"  {coin}: n={len(rows)} | avg_edge={pct(avg)} | best={pct(best)} | P&L=${coin_pnl:+.4f} | wins={coin_wins}/{len(coin_verified)}")
+        else:
+            print(f"  {coin}: n={len(rows)} | avg_edge={pct(avg)} | best={pct(best)}")
 
+    if skip_counts:
+        print(f"\n--- Skip Reasons ---")
+        total_skips = sum(skip_counts.values())
+        print(f"Total skips: {total_skips}")
+        for reason, count in sorted(skip_counts.items(), key=lambda x: -x[1]):
+            print(f"  {reason}: {count}")
 
-    print("\nMost recent trades:")
+    print(f"\n--- Recent Trades ---")
     for r in log_rows[-5:]:
+        pnl_str = ""
+        if r.get("actual_pnl_total") is not None:
+            pnl_str = f" | P&L=${r['actual_pnl_total']:+.4f}"
+        depth_str = ""
+        if r.get("poly_book_levels") is not None:
+            depth_str = f" | depth={r['poly_book_levels']}lvl/${r.get('poly_book_notional_usd', 0):.0f}$"
         print(
             f"  [{r['ts']}] {r['coin']} | Poly {r['poly_side']} {r['poly_price']:.3f} "
             f"+ Kalshi {r['kalshi_side']} {r['kalshi_price']:.3f} "
             f"= total {r['total_cost']:.3f} | net {pct(r['net_edge'])} (gross {pct(r['gross_edge'])}) "
             f"| fees {r['poly_fee']:.4f}+{r['kalshi_fee']:.4f}+{r['extras']:.4f}"
+            f"{depth_str}{pnl_str}"
         )
 
 
@@ -1246,6 +1350,104 @@ def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> dict:
     result["poly_ms"] = (time.monotonic() - t0) * 1000
 
     return result
+
+
+# -----------------------------
+# Outcome verification (post-trade)
+# -----------------------------
+def _poll_kalshi_result(ticker: str, max_retries: int = 6, poll_interval: float = 10.0) -> Optional[str]:
+    """Poll Kalshi market for settled result. Returns 'yes', 'no', or None if still unsettled."""
+    for attempt in range(max_retries):
+        try:
+            mkt = kalshi_get_market(ticker)
+            result = mkt.get("result")
+            if result in ("yes", "no"):
+                return result
+            if attempt < max_retries - 1:
+                time.sleep(poll_interval)
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(poll_interval)
+    return None
+
+
+def verify_trade_outcomes(trades: List[dict], logfile: str) -> List[dict]:
+    """Wait for windows to close, poll Kalshi for results, compute actual P&L."""
+    if not trades:
+        return trades
+
+    print("\n" + "=" * 60)
+    print("  OUTCOME VERIFICATION")
+    print("=" * 60)
+
+    # Find latest window close across all trades
+    latest_close: Optional[datetime] = None
+    for row in trades:
+        close_str = row.get("window_close_ts")
+        if close_str:
+            ct = parse_iso_utc(close_str)
+            if ct and (latest_close is None or ct > latest_close):
+                latest_close = ct
+
+    if latest_close:
+        now = datetime.now(timezone.utc)
+        wait_s = (latest_close - now).total_seconds() + 30  # 30s buffer for settlement
+        if wait_s > 0:
+            print(f"\n  Waiting {wait_s:.0f}s for last window to close + settle...")
+            time.sleep(wait_s)
+
+    print(f"\n  Checking {len(trades)} trade outcomes...\n")
+
+    # Cache Kalshi results per ticker (multiple trades may share same window)
+    kalshi_results: Dict[str, Optional[str]] = {}
+
+    for row in trades:
+        ticker = row["kalshi_ref"]
+        if ticker not in kalshi_results:
+            print(f"  Polling Kalshi {ticker}...", end=" ", flush=True)
+            result = _poll_kalshi_result(ticker)
+            kalshi_results[ticker] = result
+            print(f"result={result or 'UNKNOWN'}")
+
+        result = kalshi_results[ticker]
+        row["kalshi_result"] = result
+
+        if result in ("yes", "no"):
+            price_went_up = (result == "yes")
+
+            poly_won = (row["poly_side"] == "UP" and price_went_up) or \
+                       (row["poly_side"] == "DOWN" and not price_went_up)
+            kalshi_won = (row["kalshi_side"] == "UP" and price_went_up) or \
+                         (row["kalshi_side"] == "DOWN" and not price_went_up)
+
+            payout = (1.0 if poly_won else 0.0) + (1.0 if kalshi_won else 0.0)
+            cost = row["total_cost"]
+            fees_pc = (row["poly_fee"] + row["kalshi_fee"] + row["extras"]) / PAPER_CONTRACTS
+            actual_pnl_pc = payout - cost - fees_pc
+            actual_pnl_total = actual_pnl_pc * PAPER_CONTRACTS
+
+            row["poly_won"] = poly_won
+            row["kalshi_won"] = kalshi_won
+            row["payout_per_contract"] = payout
+            row["actual_pnl_total"] = round(actual_pnl_total, 4)
+            row["hedge_consistent"] = (poly_won != kalshi_won)  # exactly one should win
+
+            tag = "WIN" if actual_pnl_total > 0 else ("LOSS" if actual_pnl_total < 0 else "BREAK-EVEN")
+            hedge_tag = "OK" if row["hedge_consistent"] else "BOTH-LOST" if not poly_won and not kalshi_won else "BOTH-WON"
+
+            print(f"  [{row['ts']}] {row['coin']} | Kalshi: {result} | "
+                  f"Poly {row['poly_side']}: {'WON' if poly_won else 'LOST'} | "
+                  f"Kalshi {row['kalshi_side']}: {'WON' if kalshi_won else 'LOST'} | "
+                  f"Hedge: {hedge_tag} | P&L: ${actual_pnl_total:+.4f} ({tag})")
+        else:
+            row["actual_pnl_total"] = None
+            row["hedge_consistent"] = None
+            print(f"  [{row['ts']}] {row['coin']} | Result: UNKNOWN (settlement not available)")
+
+        # Append outcome row to logfile
+        append_log(logfile, {**row, "log_type": "outcome"})
+
+    return trades
 
 
 # -----------------------------
@@ -1291,8 +1493,12 @@ def main() -> None:
         raise RuntimeError("Could not resolve Polymarket tag id for slug 'crypto' (Gamma /tags/slug/crypto).")
 
     logged: List[dict] = []
+    skip_counts: Dict[str, int] = {}  # reason -> count
     scan_i = 0
     consecutive_skips = 0
+
+    # Store poly quotes per-coin per-scan for book depth lookups on winning trade
+    _scan_poly_quotes: Dict[str, Optional[PolyMarketQuote]] = {}
 
     while len(logged) < MAX_TEST_TRADES:
         scan_i += 1
@@ -1344,17 +1550,42 @@ def main() -> None:
             print(f"    {coin}: {' | '.join(parts)}")
 
         best_global: Optional[HedgeCandidate] = None
+        best_global_poly: Optional[PolyMarketQuote] = None
+        best_global_kalshi: Optional[KalshiMarketQuote] = None
 
         # Fetch spot prices once per scan for strike reference
         spot_prices = fetch_spot_prices()
 
+        _scan_poly_quotes.clear()
+
         for coin in selected_coins:
             cd = coin_data[coin]
             kalshi, poly = cd["kalshi"], cd["poly"]
+            _scan_poly_quotes[coin] = poly
 
             display_market_block(market_type, coin, kalshi, poly, spot_price=spot_prices.get(coin))
 
+            # Staleness warning for Poly WS data
+            if poly and _poly_ws:
+                up_stale = _poly_ws.get_staleness_s(poly.up_token_id)
+                dn_stale = _poly_ws.get_staleness_s(poly.down_token_id)
+                stale_parts = []
+                if up_stale is not None and up_stale > 30:
+                    stale_parts.append(f"UP {up_stale:.0f}s")
+                if dn_stale is not None and dn_stale > 30:
+                    stale_parts.append(f"DOWN {dn_stale:.0f}s")
+                if stale_parts:
+                    print(f"  -> Staleness: ⚠ Poly WS data stale ({', '.join(stale_parts)} since last update)")
+
             if kalshi is None or poly is None:
+                reason = "no_kalshi_market" if kalshi is None else "no_poly_market"
+                skip_counts[reason] = skip_counts.get(reason, 0) + 1
+                skip_row = {"log_type": "skip", "ts": utc_ts(), "scan_num": scan_i, "coin": coin, "reason": reason}
+                if poly:
+                    skip_row.update({"poly_up": poly.up_price, "poly_down": poly.down_price})
+                if kalshi:
+                    skip_row.update({"kalshi_up": kalshi.yes_ask, "kalshi_down": kalshi.no_ask})
+                append_log(logfile, skip_row)
                 if cd["kalshi_err"]:
                     print(f"  -> Error: Kalshi fetch failed: {cd['kalshi_err']}")
                 if cd["poly_err"]:
@@ -1367,8 +1598,20 @@ def main() -> None:
             remaining_s = (kalshi.close_ts - now).total_seconds()
             remaining_str = f"{int(remaining_s // 60)}m {int(remaining_s % 60)}s" if remaining_s > 0 else "CLOSED"
 
+            # Helper to log a skip with prices
+            def _log_skip(reason: str) -> None:
+                skip_counts[reason] = skip_counts.get(reason, 0) + 1
+                append_log(logfile, {
+                    "log_type": "skip", "ts": utc_ts(), "scan_num": scan_i, "coin": coin,
+                    "reason": reason,
+                    "poly_up": poly.up_price, "poly_down": poly.down_price,
+                    "kalshi_up": kalshi.yes_ask, "kalshi_down": kalshi.no_ask,
+                    "remaining_s": round(remaining_s, 1),
+                })
+
             if delta_s > WINDOW_ALIGN_TOLERANCE_SECONDS:
                 print(f"  -> Alignment: ❌ SKIP (Kalshi close vs Poly end differ by {delta_s:.1f}s; tol={WINDOW_ALIGN_TOLERANCE_SECONDS}s)")
+                _log_skip("alignment")
                 continue
             else:
                 print(f"  -> Alignment: ✅ OK (Δ {delta_s:.1f}s) | Window closes in: {remaining_str}")
@@ -1376,6 +1619,7 @@ def main() -> None:
             # Safeguard: minimum time remaining in window
             if remaining_s < MIN_WINDOW_REMAINING_S:
                 print(f"  -> Window: ❌ SKIP (only {remaining_str} left; need {MIN_WINDOW_REMAINING_S:.0f}s to fill both legs)")
+                _log_skip("window_time")
                 continue
 
             # Safeguard: spread sanity — reject if either exchange has abnormally wide spread
@@ -1383,9 +1627,11 @@ def main() -> None:
             poly_spread = (poly.up_price + poly.down_price) - 1.0
             if kalshi_spread > MAX_SPREAD:
                 print(f"  -> Spread: ❌ SKIP Kalshi spread {pct(kalshi_spread)} exceeds {pct(MAX_SPREAD)} max")
+                _log_skip("kalshi_spread")
                 continue
             if poly_spread > MAX_SPREAD:
                 print(f"  -> Spread: ❌ SKIP Poly spread {pct(poly_spread)} exceeds {pct(MAX_SPREAD)} max")
+                _log_skip("poly_spread")
                 continue
 
             # Safeguard: extreme prices — outcome nearly decided, hedging is unreliable
@@ -1394,6 +1640,7 @@ def main() -> None:
             if extreme:
                 print(f"  -> Price: ❌ SKIP extreme prices detected ({', '.join(f'{p:.3f}' for p in extreme)}); "
                       f"outside [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}] range")
+                _log_skip("extreme_price")
                 continue
 
             # Safeguard: probability divergence — large disagreement signals mismatched strikes.
@@ -1405,6 +1652,7 @@ def main() -> None:
             if prob_div > MAX_PROB_DIVERGENCE:
                 print(f"  -> Divergence: ❌ SKIP implied P(up) Kalshi={kalshi_up_prob:.2f} vs Poly={poly_up_prob:.2f} "
                       f"(Δ{pct(prob_div)} > {pct(MAX_PROB_DIVERGENCE)} max — likely different strikes)")
+                _log_skip("prob_divergence")
                 continue
 
             print(f"          Safeguards: ✅ all passed (Δprob {pct(prob_div)}, min edge {pct(MIN_NET_EDGE)}, min window {MIN_WINDOW_REMAINING_S:.0f}s)")
@@ -1423,6 +1671,7 @@ def main() -> None:
 
             if best_for_coin is None:
                 print(f"  -> Candidate: ❌ SKIP (no combo with net edge >= {pct(MIN_NET_EDGE)} and cost < {MAX_TOTAL_COST:.3f})")
+                _log_skip("no_viable_edge")
                 continue
 
             print(
@@ -1435,6 +1684,8 @@ def main() -> None:
 
             if best_global is None or best_for_coin.net_edge > best_global.net_edge:
                 best_global = best_for_coin
+                best_global_poly = poly
+                best_global_kalshi = kalshi
 
 
         # Scan timing summary
@@ -1446,10 +1697,20 @@ def main() -> None:
             timing_parts += f" | WS cache: {ws_hits} hits, {ws_misses} misses"
         print(f"\n  [timing] Scan #{scan_i} total: {scan_ms:.0f}ms ({timing_parts})")
         # Log at most one paper trade per scan (the best across BTC/ETH/SOL)
-        if best_global is not None:
+        if best_global is not None and best_global_poly is not None and best_global_kalshi is not None:
             # Gather per-coin latency for the winning coin
             winning_cd = coin_data[best_global.coin]
+
+            # Book depth snapshot for the traded Poly leg
+            poly_token = best_global_poly.up_token_id if best_global.direction_on_poly == "UP" else best_global_poly.down_token_id
+            poly_depth = None
+            poly_staleness_s = None
+            if _poly_ws:
+                poly_depth = _poly_ws.get_book_depth(poly_token)
+                poly_staleness_s = _poly_ws.get_staleness_s(poly_token)
+
             row = {
+                "log_type": "trade",
                 "ts": utc_ts(),
                 "scan_num": scan_i,
                 "coin": best_global.coin,
@@ -1465,12 +1726,31 @@ def main() -> None:
                 "extras": best_global.extras,
                 "poly_ref": best_global.poly_ref,
                 "kalshi_ref": best_global.kalshi_ref,
+                "window_close_ts": best_global_kalshi.close_ts.isoformat(),
+                "spot_price": spot_prices.get(best_global.coin),
+                "kalshi_strike": best_global_kalshi.strike,
+                # Poly book depth snapshot
+                "poly_book_levels": poly_depth["levels"] if poly_depth else None,
+                "poly_book_size": poly_depth["total_size"] if poly_depth else None,
+                "poly_book_notional_usd": poly_depth["total_notional_usd"] if poly_depth else None,
+                "poly_ws_staleness_s": round(poly_staleness_s, 1) if poly_staleness_s is not None else None,
+                # Timing
                 "scan_ms": round(scan_ms, 1),
                 "gamma_ms": round(gamma_ms, 1),
                 "fetch_ms": round(fetch_ms, 1),
                 "kalshi_latency_ms": round(winning_cd["kalshi_ms"], 1),
                 "poly_latency_ms": round(winning_cd["poly_ms"], 1),
             }
+
+            # Staleness warning in console
+            if poly_staleness_s is not None and poly_staleness_s > 30:
+                print(f"  [warn] Poly WS data for traded leg is {poly_staleness_s:.0f}s stale!")
+
+            # Book depth in console
+            if poly_depth:
+                print(f"  [depth] Poly book: {poly_depth['levels']} levels, "
+                      f"{poly_depth['total_size']} contracts, ${poly_depth['total_notional_usd']:.2f} notional")
+
             append_log(logfile, row)
             logged.append(row)
             consecutive_skips = 0
@@ -1485,9 +1765,13 @@ def main() -> None:
         if len(logged) < MAX_TEST_TRADES:
             time.sleep(SCAN_SLEEP_SECONDS)
 
-    print(f"\nDone. Wrote logs to: {logfile}")
+    print(f"\nDone scanning. Wrote logs to: {logfile}")
 
-    summarize(logged, selected_coins)
+    # Outcome verification: wait for windows to close, then check actual results
+    if logged:
+        verify_trade_outcomes(logged, logfile)
+
+    summarize(logged, selected_coins, skip_counts=skip_counts)
 
 
 if __name__ == "__main__":
