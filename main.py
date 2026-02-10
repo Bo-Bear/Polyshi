@@ -91,6 +91,28 @@ def _get_session() -> requests.Session:
 
 _clob_working_route_idx: Optional[int] = None
 
+# Thread-local diagnostic trace: functions append timing events here
+_diag = threading.local()
+
+def _diag_reset():
+    """Reset diagnostic trace for the current thread."""
+    _diag.events = []
+
+def _diag_add(label: str, ms: float, detail: str = ""):
+    """Append a timing event to the current thread's trace."""
+    if not hasattr(_diag, "events"):
+        _diag.events = []
+    entry = f"{label} {ms:.0f}ms"
+    if detail:
+        entry += f" ({detail})"
+    _diag.events.append(entry)
+
+def _diag_collect() -> List[str]:
+    """Return and clear all diagnostic events for the current thread."""
+    events = getattr(_diag, "events", [])
+    _diag.events = []
+    return events
+
 
 # -----------------------------
 # Polymarket CLOB WebSocket (real-time orderbook cache)
@@ -595,7 +617,10 @@ def kalshi_get_market(ticker: str) -> dict:
 
 
 def pick_current_kalshi_market(series_ticker: str) -> Optional[KalshiMarketQuote]:
+    t0 = time.monotonic()
     markets = kalshi_get_markets_for_series(series_ticker)
+    list_ms = (time.monotonic() - t0) * 1000
+    _diag_add("kalshi_list", list_ms, f"{len(markets)} mkts")
     if not markets:
         return None
 
@@ -633,7 +658,10 @@ def pick_current_kalshi_market(series_ticker: str) -> Optional[KalshiMarketQuote
         return None
 
     # Pull richer pricing from Get Market (includes yes_ask/no_ask)
+    t1 = time.monotonic()
     full = kalshi_get_market(best["ticker"])
+    detail_ms = (time.monotonic() - t1) * 1000
+    _diag_add("kalshi_detail", detail_ms, best["ticker"])
     
     # close time: prefer "close_time", fall back to "expiration_time"
     close_time_raw = full.get("close_time") or best.get("close_time") or full.get("expiration_time") or best.get("expiration_time")
@@ -797,10 +825,15 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
 
     Checks WebSocket cache first (near-zero latency), then falls back to HTTP.
     """
+    t0 = time.monotonic()
+    tid_short = token_id[-8:]  # last 8 chars for logging
+
     # Try WebSocket cache first
     if _poly_ws is not None:
         cached = _poly_ws.get_asks(token_id)
         if cached is not None:
+            ms = (time.monotonic() - t0) * 1000
+            _diag_add("clob_ws_hit", ms, f"..{tid_short} {len(cached)}lvls")
             return cached
 
     # Fall back to HTTP
@@ -819,8 +852,10 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
         order = list(range(len(candidates)))
 
     last_err = None
+    routes_tried = 0
     for idx in order:
         url, params = candidates[idx]
+        routes_tried += 1
         try:
             r = _get_session().get(url, params=params, timeout=15)
             if r.status_code == 404:
@@ -847,11 +882,15 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
 
             asks.sort(key=lambda x: x[0])
             _clob_working_route_idx = idx
+            ms = (time.monotonic() - t0) * 1000
+            _diag_add("clob_http", ms, f"..{tid_short} route#{idx} {routes_tried}try {len(asks)}lvls")
             return asks
         except Exception as e:
             last_err = e
             continue
 
+    ms = (time.monotonic() - t0) * 1000
+    _diag_add("clob_http_fail", ms, f"..{tid_short} {routes_tried}try err={last_err}")
     return []
 
 
@@ -860,6 +899,7 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
 
     # pick earliest-ending active event matching title prefix
     candidates = [e for e in events if isinstance(e.get("title"), str) and e["title"].startswith(prefix)]
+    _diag_add("poly_match", 0, f"{len(candidates)}/{len(events)} events for {coin}")
     if not candidates:
         return None
 
@@ -911,11 +951,14 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
         if _poly_ws is not None:
             _poly_ws.subscribe([outcome_to_token["up"], outcome_to_token["down"]])
 
+        clob_t0 = time.monotonic()
         best = poly_clob_best_asks_from_tokens(
             up_token_id=outcome_to_token["up"],
             down_token_id=outcome_to_token["down"],
             target_notional=MIN_LEG_NOTIONAL,
         )
+        clob_ms = (time.monotonic() - clob_t0) * 1000
+        _diag_add("poly_clob_pair", clob_ms, f"{coin} UP+DOWN")
 
         if best is None:
             # no real liquidity on one/both sides (or book route not supported)
@@ -1112,10 +1155,12 @@ def summarize(log_rows: List[dict], coins: List[str]) -> None:
 # -----------------------------
 def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> dict:
     """Fetch Kalshi and Polymarket quotes for a single coin. Returns dict with quotes, timing, and errors."""
+    _diag_reset()
     result: dict = {
         "coin": coin, "kalshi": None, "poly": None,
         "kalshi_ms": 0.0, "poly_ms": 0.0,
         "kalshi_err": None, "poly_err": None,
+        "diag": [],
     }
 
     t0 = time.monotonic()
@@ -1132,6 +1177,7 @@ def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> dict:
         result["poly_err"] = str(e)
     result["poly_ms"] = (time.monotonic() - t0) * 1000
 
+    result["diag"] = _diag_collect()
     return result
 
 
@@ -1220,6 +1266,8 @@ def main() -> None:
             if cd["poly_err"]:
                 parts.append(f"ERR poly: {cd['poly_err'][:80]}")
             print(f"    {coin}: {' | '.join(parts)}")
+            for diag_event in cd.get("diag", []):
+                print(f"      -> {diag_event}")
 
         best_global: Optional[HedgeCandidate] = None
 
