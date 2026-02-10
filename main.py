@@ -24,7 +24,7 @@ except ImportError:
 load_dotenv()
 
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "5"))
-MAX_TEST_TRADES = int(os.getenv("MAX_TEST_TRADES", "5"))
+MAX_TEST_TRADES = int(os.getenv("MAX_TEST_TRADES", "1"))
 WINDOW_ALIGN_TOLERANCE_SECONDS = int(os.getenv("WINDOW_ALIGN_TOLERANCE_SECONDS", "10"))
 MIN_LEG_NOTIONAL = float(os.getenv("MIN_LEG_NOTIONAL", "10"))  # $ minimum liquidity per leg
 USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
@@ -144,6 +144,9 @@ class _PolyOrderbookWS:
         self._price_change_count = 0
         self._last_error: Optional[str] = None
         self._connect_count = 0
+        self._sample_msgs: List[str] = []  # first N raw messages for debugging
+        self._max_samples = 5
+        self._sub_log: List[str] = []  # subscription events log
 
     def start(self):
         if not _HAS_WS_CLIENT:
@@ -178,6 +181,8 @@ class _PolyOrderbookWS:
 
     def _on_message(self, ws, message):
         self._msg_count += 1
+        if len(self._sample_msgs) < self._max_samples:
+            self._sample_msgs.append(message[:300])
         try:
             data = json.loads(message)
         except (json.JSONDecodeError, TypeError):
@@ -267,7 +272,9 @@ class _PolyOrderbookWS:
         if not new_ids:
             return
         self._subscribed_ids.update(new_ids)
-        if self._connected.is_set() and self._ws:
+        connected = self._connected.is_set()
+        self._sub_log.append(f"subscribe({len(new_ids)} new, conn={connected}): ..{[t[-8:] for t in new_ids]}")
+        if connected and self._ws:
             self._send_dynamic_subscribe(new_ids)
 
     def _send_initial_subscribe(self, token_ids: List[str]):
@@ -322,6 +329,25 @@ class _PolyOrderbookWS:
         if self._last_error:
             parts.append(f"err={self._last_error[:60]}")
         return " | ".join(parts)
+
+    def dump(self) -> str:
+        """Return verbose diagnostic dump for deep debugging."""
+        lines = ["  [ws-dump] === WebSocket Diagnostic Dump ==="]
+        lines.append(f"    Status: {self.status()}")
+        lines.append(f"    Subscribed IDs ({len(self._subscribed_ids)}):")
+        for tid in sorted(self._subscribed_ids):
+            ready = "READY" if tid in self._ready_ids else "waiting"
+            ask_count = len(self._asks.get(tid, {}))
+            ba = self._best_ask.get(tid)
+            ba_str = f", best_ask={ba:.4f}" if ba is not None else ""
+            lines.append(f"      ..{tid[-12:]}: {ready}, {ask_count} ask levels{ba_str}")
+        lines.append(f"    Subscription log ({len(self._sub_log)}):")
+        for entry in self._sub_log:
+            lines.append(f"      {entry}")
+        lines.append(f"    Sample messages ({len(self._sample_msgs)}/{self._max_samples}):")
+        for i, msg in enumerate(self._sample_msgs):
+            lines.append(f"      [{i}] {msg}")
+        return "\n".join(lines)
 
     def stop(self):
         self._running = False
@@ -661,7 +687,9 @@ def pick_current_kalshi_market(series_ticker: str) -> Optional[KalshiMarketQuote
     t1 = time.monotonic()
     full = kalshi_get_market(best["ticker"])
     detail_ms = (time.monotonic() - t1) * 1000
-    _diag_add("kalshi_detail", detail_ms, best["ticker"])
+    yes_raw = full.get("yes_ask")
+    no_raw = full.get("no_ask")
+    _diag_add("kalshi_detail", detail_ms, f"{best['ticker']} yes_ask={yes_raw} no_ask={no_raw}")
     
     # close time: prefer "close_time", fall back to "expiration_time"
     close_time_raw = full.get("close_time") or best.get("close_time") or full.get("expiration_time") or best.get("expiration_time")
@@ -883,7 +911,8 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
             asks.sort(key=lambda x: x[0])
             _clob_working_route_idx = idx
             ms = (time.monotonic() - t0) * 1000
-            _diag_add("clob_http", ms, f"..{tid_short} route#{idx} {routes_tried}try {len(asks)}lvls")
+            resp_kb = len(r.content) / 1024
+            _diag_add("clob_http", ms, f"..{tid_short} route#{idx} {routes_tried}try {len(asks)}lvls {resp_kb:.1f}KB")
             return asks
         except Exception as e:
             last_err = e
@@ -947,9 +976,13 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
         if "up" not in outcome_to_token or "down" not in outcome_to_token:
             continue
 
+        up_tid = outcome_to_token["up"]
+        down_tid = outcome_to_token["down"]
+        _diag_add("poly_tokens", 0, f"UP=..{up_tid[-8:]} DOWN=..{down_tid[-8:]} event={e.get('title', '?')[:50]}")
+
         # Subscribe tokens to WebSocket for real-time updates on future scans
         if _poly_ws is not None:
-            _poly_ws.subscribe([outcome_to_token["up"], outcome_to_token["down"]])
+            _poly_ws.subscribe([up_tid, down_tid])
 
         clob_t0 = time.monotonic()
         best = poly_clob_best_asks_from_tokens(
@@ -1335,6 +1368,7 @@ def main() -> None:
         print(f"\n  [timing] Scan #{scan_i} total: {scan_ms:.0f}ms ({timing_parts})")
         if _poly_ws is not None:
             print(f"  [ws] {_poly_ws.status()}")
+            print(_poly_ws.dump())
 
         # Log at most one paper trade per scan (the best across BTC/ETH/SOL)
         if best_global is not None:
@@ -1365,6 +1399,22 @@ def main() -> None:
             append_log(logfile, row)
             logged.append(row)
             print(f"[paper] Logged test trade #{len(logged)} -> {best_global.coin} | net {pct(best_global.net_edge)} (gross {pct(best_global.gross_edge)})")
+
+            # Comprehensive trade detail dump
+            bg = best_global
+            print(f"\n  [trade-detail] === Trade #{len(logged)} Full Breakdown ===")
+            print(f"    Coin: {bg.coin}")
+            print(f"    Poly side: {bg.direction_on_poly} @ {bg.poly_price:.4f}  |  Kalshi side: {bg.direction_on_kalshi} @ {bg.kalshi_price:.4f}")
+            print(f"    Total cost: {bg.total_cost:.4f}  |  Gross edge: {pct(bg.gross_edge)}")
+            print(f"    Poly fee: ${bg.poly_fee:.4f}  |  Kalshi fee: ${bg.kalshi_fee:.4f}  |  Extras: ${bg.extras:.4f}")
+            print(f"    Net edge: {pct(bg.net_edge)}  |  P&L per {int(PAPER_CONTRACTS)} contracts: ${bg.net_edge * PAPER_CONTRACTS:.2f}")
+            print(f"    Poly ref: {bg.poly_ref}")
+            print(f"    Kalshi ref: {bg.kalshi_ref}")
+            print(f"    Timing: scan {scan_ms:.0f}ms (gamma {gamma_ms:.0f} + fetch {fetch_ms:.0f} + process {process_ms:.0f})")
+            wcd = coin_data[bg.coin]
+            print(f"    {bg.coin} latency: Kalshi {wcd['kalshi_ms']:.0f}ms | Poly {wcd['poly_ms']:.0f}ms")
+            for de in wcd.get("diag", []):
+                print(f"      -> {de}")
         else:
             print("No viable paper trades found in this scan.")
 
