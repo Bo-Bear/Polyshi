@@ -532,8 +532,12 @@ def poly_clob_best_asks_from_tokens(up_token_id: str, down_token_id: str, target
     """
     Returns (up_price, up_liq, down_price, down_liq) using either best-ask or VWAP-to-fill target_notional.
     """
-    up_asks = poly_clob_get_asks(str(up_token_id))
-    down_asks = poly_clob_get_asks(str(down_token_id))
+    # Fetch UP and DOWN orderbooks in parallel
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        up_future = ex.submit(poly_clob_get_asks, str(up_token_id))
+        down_future = ex.submit(poly_clob_get_asks, str(down_token_id))
+        up_asks = up_future.result()
+        down_asks = down_future.result()
 
     if not up_asks or not down_asks:
         return None
