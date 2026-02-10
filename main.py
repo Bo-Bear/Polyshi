@@ -903,12 +903,32 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
     return []
 
 
+def _is_15m_poly_event(e: dict) -> bool:
+    """Check if a Polymarket event is a 15-minute window market (not hourly or other)."""
+    # Check slug for "15m" (e.g., "btc-updown-15m-1770702300")
+    slug = (e.get("slug") or "").lower()
+    if "15m" in slug:
+        return True
+    # Check recurrence field
+    rec = (e.get("recurrence") or "").upper()
+    if rec in ("15M", "15MIN", "15MINUTES"):
+        return True
+    # Check title for a time range with minutes (e.g., "12:45AM-1:00AM") — sub-hourly indicator
+    title = e.get("title") or ""
+    if re.search(r'\d{1,2}:\d{2}\s*[AP]M\s*-\s*\d{1,2}:\d{2}\s*[AP]M', title, re.IGNORECASE):
+        return True
+    return False
+
+
 def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyMarketQuote]:
     prefix = POLY_TITLE_PREFIX[coin]
     now = datetime.now(timezone.utc)
 
     # pick earliest-ending active event matching title prefix
     all_matches = [e for e in events if isinstance(e.get("title"), str) and e["title"].startswith(prefix)]
+
+    # Filter to 15-minute markets only (skip hourly, daily, etc.)
+    all_matches = [e for e in all_matches if _is_15m_poly_event(e)]
 
     # Filter to events whose endDate is still in the future (skip expired windows)
     candidates = []
