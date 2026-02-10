@@ -106,6 +106,7 @@ class _PolyOrderbookWS:
 
     def __init__(self):
         self._asks: Dict[str, Dict[float, float]] = {}  # token_id -> {price: size}
+        self._best_ask: Dict[str, float] = {}  # token_id -> best ask price (from price_change)
         self._lock = threading.Lock()
         self._ws: Optional[object] = None
         self._thread: Optional[threading.Thread] = None
@@ -115,6 +116,12 @@ class _PolyOrderbookWS:
         self._running = False
         self._cache_hits = 0
         self._cache_misses = 0
+        # Diagnostic counters
+        self._msg_count = 0
+        self._book_count = 0
+        self._price_change_count = 0
+        self._last_error: Optional[str] = None
+        self._connect_count = 0
 
     def start(self):
         if not _HAS_WS_CLIENT:
@@ -135,26 +142,39 @@ class _PolyOrderbookWS:
                 )
                 self._ws = ws
                 ws.run_forever(ping_interval=30, ping_timeout=10)
-            except Exception:
-                pass
+            except Exception as e:
+                self._last_error = f"connect_loop: {e}"
             self._connected.clear()
             if self._running:
                 time.sleep(2)
 
     def _on_open(self, ws):
         self._connected.set()
+        self._connect_count += 1
         if self._subscribed_ids:
-            self._send_subscribe(list(self._subscribed_ids))
+            self._send_initial_subscribe(list(self._subscribed_ids))
 
     def _on_message(self, ws, message):
+        self._msg_count += 1
         try:
             data = json.loads(message)
         except (json.JSONDecodeError, TypeError):
             return
 
+        # Handle list messages (some endpoints send arrays)
+        if isinstance(data, list):
+            for item in data:
+                self._handle_event(item)
+        else:
+            self._handle_event(data)
+
+    def _handle_event(self, data: dict):
+        if not isinstance(data, dict):
+            return
         event_type = data.get("event_type")
 
         if event_type == "book":
+            self._book_count += 1
             asset_id = data.get("asset_id")
             if not asset_id:
                 return
@@ -173,28 +193,48 @@ class _PolyOrderbookWS:
                 self._ready_ids.add(asset_id)
 
         elif event_type == "price_change":
+            self._price_change_count += 1
             with self._lock:
                 for pc in data.get("price_changes", []):
                     asset_id = pc.get("asset_id")
                     if not asset_id or asset_id not in self._ready_ids:
                         continue
+                    # Use best_ask field (Sept 2025+) to update best ask price
+                    best_ask_str = pc.get("best_ask")
+                    if best_ask_str is not None:
+                        try:
+                            self._best_ask[asset_id] = float(best_ask_str)
+                        except (ValueError, TypeError):
+                            pass
+                    # Update ask-side book level from SELL trades
                     side = str(pc.get("side", "")).upper()
-                    if side not in ("SELL", "ASK"):
-                        continue
-                    try:
-                        p = float(pc["price"])
-                        s = float(pc["size"])
-                    except (KeyError, ValueError, TypeError):
-                        continue
-                    if asset_id not in self._asks:
-                        continue
-                    if s > 0:
-                        self._asks[asset_id][p] = s
-                    else:
-                        self._asks[asset_id].pop(p, None)
+                    if side == "SELL" and asset_id in self._asks:
+                        try:
+                            p = float(pc["price"])
+                            s = float(pc["size"])
+                        except (KeyError, ValueError, TypeError):
+                            continue
+                        if s > 0:
+                            self._asks[asset_id][p] = s
+                        else:
+                            self._asks[asset_id].pop(p, None)
+
+        elif event_type == "best_bid_ask":
+            # Direct best-ask update (requires custom_feature_enabled)
+            asset_id = data.get("asset_id")
+            if asset_id:
+                try:
+                    ba = float(data["best_ask"])
+                    with self._lock:
+                        self._best_ask[asset_id] = ba
+                        if asset_id not in self._ready_ids:
+                            self._ready_ids.add(asset_id)
+                            self._asks.setdefault(asset_id, {})
+                except (KeyError, ValueError, TypeError):
+                    pass
 
     def _on_error(self, ws, error):
-        pass
+        self._last_error = str(error)[:200]
 
     def _on_close(self, ws, close_status, close_msg):
         self._connected.clear()
@@ -206,14 +246,30 @@ class _PolyOrderbookWS:
             return
         self._subscribed_ids.update(new_ids)
         if self._connected.is_set() and self._ws:
-            self._send_subscribe(new_ids)
+            self._send_dynamic_subscribe(new_ids)
 
-    def _send_subscribe(self, token_ids: List[str]):
+    def _send_initial_subscribe(self, token_ids: List[str]):
+        """Send subscription on initial connection (uses 'type' key)."""
         if self._ws:
             try:
-                self._ws.send(json.dumps({"assets_ids": token_ids, "type": "market"}))
-            except Exception:
-                pass
+                self._ws.send(json.dumps({
+                    "assets_ids": token_ids,
+                    "type": "market",
+                    "custom_feature_enabled": True,
+                }))
+            except Exception as e:
+                self._last_error = f"initial_sub: {e}"
+
+    def _send_dynamic_subscribe(self, token_ids: List[str]):
+        """Send subscription after connection is already open (uses 'operation' key)."""
+        if self._ws:
+            try:
+                self._ws.send(json.dumps({
+                    "assets_ids": token_ids,
+                    "operation": "subscribe",
+                }))
+            except Exception as e:
+                self._last_error = f"dynamic_sub: {e}"
 
     def get_asks(self, token_id: str) -> Optional[List[Tuple[float, float]]]:
         """Get cached asks for a token. Returns None if not in cache yet."""
@@ -231,6 +287,19 @@ class _PolyOrderbookWS:
             hits, misses = self._cache_hits, self._cache_misses
             self._cache_hits = self._cache_misses = 0
             return hits, misses
+
+    def status(self) -> str:
+        """Return diagnostic status string."""
+        parts = []
+        parts.append(f"conn={'Y' if self._connected.is_set() else 'N'}({self._connect_count})")
+        parts.append(f"subs={len(self._subscribed_ids)}")
+        parts.append(f"ready={len(self._ready_ids)}")
+        parts.append(f"msgs={self._msg_count}")
+        parts.append(f"book={self._book_count}")
+        parts.append(f"pc={self._price_change_count}")
+        if self._last_error:
+            parts.append(f"err={self._last_error[:60]}")
+        return " | ".join(parts)
 
     def stop(self):
         self._running = False
@@ -1216,6 +1285,8 @@ def main() -> None:
             ws_hits, ws_misses = _poly_ws.get_and_reset_stats()
             timing_parts += f" | WS cache: {ws_hits} hits, {ws_misses} misses"
         print(f"\n  [timing] Scan #{scan_i} total: {scan_ms:.0f}ms ({timing_parts})")
+        if _poly_ws is not None:
+            print(f"  [ws] {_poly_ws.status()}")
 
         # Log at most one paper trade per scan (the best across BTC/ETH/SOL)
         if best_global is not None:
