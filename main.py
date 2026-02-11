@@ -105,6 +105,9 @@ POLY_TITLE_PREFIX = {
 # Output
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 
+# Execution mode: "paper" (default) or "live"
+EXEC_MODE = os.getenv("EXEC_MODE", "paper").lower()  # "paper" or "live"
+
 
 # -----------------------------
 # HTTP session + caches
@@ -424,6 +427,34 @@ class HedgeCandidate:
     extras: float
     poly_ref: str
     kalshi_ref: str
+
+
+@dataclass
+class LegFill:
+    """Result of executing one leg of a hedge on a single exchange."""
+    exchange: str           # "poly" or "kalshi"
+    side: str               # "UP" or "DOWN"
+    planned_price: float
+    actual_price: Optional[float]
+    planned_contracts: float
+    filled_contracts: float
+    order_id: Optional[str]
+    fill_ts: Optional[str]  # ISO UTC timestamp of fill
+    latency_ms: float       # time to place + confirm
+    status: str             # "filled", "partial", "rejected", "error"
+    error: Optional[str]
+
+
+@dataclass
+class ExecutionResult:
+    """Combined result of executing both legs of a hedge."""
+    leg1: LegFill           # first leg placed
+    leg2: LegFill           # second leg placed
+    total_latency_ms: float # total time for both legs
+    slippage_poly: float    # actual_price - planned_price (positive = worse)
+    slippage_kalshi: float
+    both_filled: bool       # True if both legs fully filled
+
 
 # -----------------------------
 # Helpers
@@ -1353,6 +1384,241 @@ def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> dict:
 
 
 # -----------------------------
+# Execution layer
+# -----------------------------
+def check_balances(logfile: str) -> Dict[str, float]:
+    """Check available balances on both exchanges. Returns {exchange: usd_balance}.
+
+    In paper mode, returns configured PAPER_CONTRACTS * max_price as available.
+    In live mode, calls exchange APIs (TODO: wire up authenticated clients).
+    """
+    if EXEC_MODE == "paper":
+        bal = {"poly": PAPER_CONTRACTS * 1.0, "kalshi": PAPER_CONTRACTS * 1.0}
+        return bal
+
+    # --- LIVE MODE (placeholder) ---
+    # TODO: Replace with authenticated API calls:
+    #   Polymarket: GET /balances (py-clob-client)
+    #   Kalshi:     GET /portfolio/balance
+    bal: Dict[str, float] = {}
+    try:
+        # Kalshi balance
+        r = _get_session().get(f"{KALSHI_BASE}/portfolio/balance", timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        bal["kalshi"] = float(data.get("balance", 0)) / 100.0  # cents -> dollars
+    except Exception as e:
+        bal["kalshi"] = -1.0
+        print(f"  [balance] Kalshi balance check failed: {e}")
+
+    try:
+        # Polymarket balance (requires authenticated CLOB client)
+        # TODO: Implement with py-clob-client or direct API
+        bal["poly"] = -1.0
+        print("  [balance] Poly balance check not yet implemented for live mode")
+    except Exception as e:
+        bal["poly"] = -1.0
+        print(f"  [balance] Poly balance check failed: {e}")
+
+    append_log(logfile, {"log_type": "balance_check", "ts": utc_ts(), **bal})
+    return bal
+
+
+def execute_leg(exchange: str, side: str, planned_price: float,
+                contracts: float, **kwargs) -> LegFill:
+    """Execute a single leg on an exchange. Returns fill details.
+
+    In paper mode, simulates an instant fill at planned_price.
+    In live mode, places the order and waits for confirmation (TODO).
+    """
+    t0 = time.monotonic()
+
+    if EXEC_MODE == "paper":
+        latency = (time.monotonic() - t0) * 1000
+        return LegFill(
+            exchange=exchange, side=side,
+            planned_price=planned_price, actual_price=planned_price,
+            planned_contracts=contracts, filled_contracts=contracts,
+            order_id=f"paper-{int(time.time()*1000)}", fill_ts=utc_ts(),
+            latency_ms=latency, status="filled", error=None,
+        )
+
+    # --- LIVE MODE (placeholder) ---
+    # TODO: Replace with actual order placement:
+    #   Polymarket: POST order via py-clob-client (GTC limit at planned_price)
+    #   Kalshi:     POST /portfolio/orders (limit order)
+    #
+    # After placing, poll for fill status until filled/timeout.
+    # Return actual fill price, filled qty, order ID from exchange response.
+
+    order_id = None
+    actual_price = None
+    filled = 0.0
+    status = "error"
+    error_msg = None
+
+    try:
+        if exchange == "kalshi":
+            ticker = kwargs.get("ticker", "")
+            kalshi_side = "yes" if side == "UP" else "no"
+            # TODO: POST /portfolio/orders with authenticated session
+            # body = {"ticker": ticker, "action": "buy", "side": kalshi_side,
+            #         "type": "limit", "count": int(contracts),
+            #         "yes_price" or "no_price": int(planned_price * 100)}
+            error_msg = "live Kalshi order placement not yet implemented"
+
+        elif exchange == "poly":
+            token_id = kwargs.get("token_id", "")
+            # TODO: Use py-clob-client to create and sign order
+            # order = clob_client.create_and_post_order(
+            #     OrderArgs(token_id=token_id, price=planned_price,
+            #               size=contracts, side=BUY))
+            error_msg = "live Poly order placement not yet implemented"
+
+    except Exception as e:
+        error_msg = str(e)
+
+    latency = (time.monotonic() - t0) * 1000
+    return LegFill(
+        exchange=exchange, side=side,
+        planned_price=planned_price, actual_price=actual_price,
+        planned_contracts=contracts, filled_contracts=filled,
+        order_id=order_id, fill_ts=utc_ts() if filled > 0 else None,
+        latency_ms=latency, status=status, error=error_msg,
+    )
+
+
+def execute_hedge(candidate: HedgeCandidate,
+                  poly_quote: PolyMarketQuote,
+                  kalshi_quote: KalshiMarketQuote,
+                  logfile: str) -> ExecutionResult:
+    """Execute both legs of a hedge and log full execution details."""
+    contracts = PAPER_CONTRACTS
+
+    # Determine Poly token ID for the leg we're buying
+    if candidate.direction_on_poly == "UP":
+        poly_token = poly_quote.up_token_id
+    else:
+        poly_token = poly_quote.down_token_id
+
+    # Execute leg 1: Polymarket (usually faster, fills via CLOB)
+    t_total = time.monotonic()
+    leg1 = execute_leg("poly", candidate.direction_on_poly,
+                       candidate.poly_price, contracts, token_id=poly_token)
+    leg1_done = time.monotonic()
+
+    # Execute leg 2: Kalshi
+    leg2 = execute_leg("kalshi", candidate.direction_on_kalshi,
+                       candidate.kalshi_price, contracts, ticker=kalshi_quote.ticker)
+    total_ms = (time.monotonic() - t_total) * 1000
+
+    # Compute slippage
+    slip_poly = (leg1.actual_price - leg1.planned_price) if leg1.actual_price is not None else 0.0
+    slip_kalshi = (leg2.actual_price - leg2.planned_price) if leg2.actual_price is not None else 0.0
+    both_filled = (leg1.status == "filled" and leg2.status == "filled")
+
+    result = ExecutionResult(
+        leg1=leg1, leg2=leg2,
+        total_latency_ms=total_ms,
+        slippage_poly=slip_poly, slippage_kalshi=slip_kalshi,
+        both_filled=both_filled,
+    )
+
+    # Log execution details
+    exec_row = {
+        "log_type": "execution",
+        "ts": utc_ts(),
+        "coin": candidate.coin,
+        "exec_mode": EXEC_MODE,
+        "both_filled": both_filled,
+        "total_exec_ms": round(total_ms, 1),
+        "leg1_exchange": leg1.exchange,
+        "leg1_side": leg1.side,
+        "leg1_planned_price": leg1.planned_price,
+        "leg1_actual_price": leg1.actual_price,
+        "leg1_planned_qty": leg1.planned_contracts,
+        "leg1_filled_qty": leg1.filled_contracts,
+        "leg1_order_id": leg1.order_id,
+        "leg1_status": leg1.status,
+        "leg1_latency_ms": round(leg1.latency_ms, 1),
+        "leg1_error": leg1.error,
+        "leg2_exchange": leg2.exchange,
+        "leg2_side": leg2.side,
+        "leg2_planned_price": leg2.planned_price,
+        "leg2_actual_price": leg2.actual_price,
+        "leg2_planned_qty": leg2.planned_contracts,
+        "leg2_filled_qty": leg2.filled_contracts,
+        "leg2_order_id": leg2.order_id,
+        "leg2_status": leg2.status,
+        "leg2_latency_ms": round(leg2.latency_ms, 1),
+        "leg2_error": leg2.error,
+        "slippage_poly": round(slip_poly, 6),
+        "slippage_kalshi": round(slip_kalshi, 6),
+        "slippage_total_bps": round((slip_poly + slip_kalshi) * 10000, 1),
+    }
+    append_log(logfile, exec_row)
+
+    # Console output
+    s1 = f"Poly {leg1.side}: {leg1.status}"
+    if leg1.actual_price is not None and leg1.actual_price != leg1.planned_price:
+        s1 += f" (slip {slip_poly:+.4f})"
+    s2 = f"Kalshi {leg2.side}: {leg2.status}"
+    if leg2.actual_price is not None and leg2.actual_price != leg2.planned_price:
+        s2 += f" (slip {slip_kalshi:+.4f})"
+
+    fill_gap_ms = (leg1_done - t_total) * 1000
+    print(f"  [exec] {s1} | {s2} | gap={fill_gap_ms:.0f}ms | total={total_ms:.0f}ms")
+
+    if leg1.status == "partial" or leg2.status == "partial":
+        print(f"  [exec] PARTIAL FILL: Poly {leg1.filled_contracts}/{leg1.planned_contracts} "
+              f"| Kalshi {leg2.filled_contracts}/{leg2.planned_contracts}")
+
+    if not both_filled:
+        print(f"  [exec] *** WARNING: NOT BOTH LEGS FILLED — UNHEDGED EXPOSURE ***")
+        if leg1.error:
+            print(f"  [exec]   Poly error: {leg1.error}")
+        if leg2.error:
+            print(f"  [exec]   Kalshi error: {leg2.error}")
+
+    return result
+
+
+def log_skip(logfile: str, skip_counts: Dict[str, int], scan_num: int,
+             coin: str, reason: str, poly: Optional[PolyMarketQuote] = None,
+             kalshi: Optional[KalshiMarketQuote] = None,
+             remaining_s: Optional[float] = None) -> None:
+    """Log a trade skip with reason and prices."""
+    skip_counts[reason] = skip_counts.get(reason, 0) + 1
+    row: dict = {
+        "log_type": "skip", "ts": utc_ts(), "scan_num": scan_num,
+        "coin": coin, "reason": reason,
+    }
+    if poly:
+        row["poly_up"] = poly.up_price
+        row["poly_down"] = poly.down_price
+    if kalshi:
+        row["kalshi_up"] = kalshi.yes_ask
+        row["kalshi_down"] = kalshi.no_ask
+    if remaining_s is not None:
+        row["remaining_s"] = round(remaining_s, 1)
+    append_log(logfile, row)
+
+
+def log_kill_switch(logfile: str, reason: str, context: dict) -> None:
+    """Log exactly why the bot is shutting down."""
+    row = {
+        "log_type": "kill_switch",
+        "ts": utc_ts(),
+        "reason": reason,
+        **context,
+    }
+    append_log(logfile, row)
+    print(f"\n  [KILL SWITCH] {reason}")
+    for k, v in context.items():
+        print(f"    {k}: {v}")
+
+
+# -----------------------------
 # Outcome verification (post-trade)
 # -----------------------------
 def _poll_kalshi_result(ticker: str, max_retries: int = 6, poll_interval: float = 10.0) -> Optional[str]:
@@ -1465,8 +1731,11 @@ def main() -> None:
 
     print("\nConfirm settings")
     print("=" * 45)
+    mode_label = "*** LIVE TRADING ***" if EXEC_MODE == "live" else "Paper Trading"
+    print(f"Execution:  {mode_label} ({EXEC_MODE})")
     print(f"Market Type: {market_type}")
     print(f"Coins: {', '.join(selected_coins)}")
+    print(f"Contracts:  {int(PAPER_CONTRACTS)}")
     print(f"\nExecution safeguards:")
     print(f"  Min net edge:       {pct(MIN_NET_EDGE)}")
     print(f"  Max total cost:     {MAX_TOTAL_COST:.3f}")
@@ -1485,8 +1754,24 @@ def main() -> None:
     else:
         print("WebSocket: websocket-client not installed; using HTTP-only (pip install websocket-client)")
 
+    # Extra confirmation for live mode
+    if EXEC_MODE == "live":
+        print("\n*** WARNING: LIVE TRADING MODE ***")
+        print("Real orders will be placed on Polymarket and Kalshi.")
+        if not prompt_yes_no("Are you sure you want to continue?", default=False):
+            print("Aborted.")
+            return
+
     print("\nPress ENTER to start scanning (Ctrl+C to stop)...")
     input()
+
+    # Pre-flight balance check
+    balances = check_balances(logfile)
+    for exch, bal in balances.items():
+        if bal < 0:
+            print(f"  [balance] {exch}: UNAVAILABLE")
+        else:
+            print(f"  [balance] {exch}: ${bal:.2f}")
 
     crypto_tag_id = poly_get_crypto_tag_id()
     if crypto_tag_id is None:
@@ -1579,13 +1864,7 @@ def main() -> None:
 
             if kalshi is None or poly is None:
                 reason = "no_kalshi_market" if kalshi is None else "no_poly_market"
-                skip_counts[reason] = skip_counts.get(reason, 0) + 1
-                skip_row = {"log_type": "skip", "ts": utc_ts(), "scan_num": scan_i, "coin": coin, "reason": reason}
-                if poly:
-                    skip_row.update({"poly_up": poly.up_price, "poly_down": poly.down_price})
-                if kalshi:
-                    skip_row.update({"kalshi_up": kalshi.yes_ask, "kalshi_down": kalshi.no_ask})
-                append_log(logfile, skip_row)
+                log_skip(logfile, skip_counts, scan_i, coin, reason, poly=poly, kalshi=kalshi)
                 if cd["kalshi_err"]:
                     print(f"  -> Error: Kalshi fetch failed: {cd['kalshi_err']}")
                 if cd["poly_err"]:
@@ -1598,20 +1877,9 @@ def main() -> None:
             remaining_s = (kalshi.close_ts - now).total_seconds()
             remaining_str = f"{int(remaining_s // 60)}m {int(remaining_s % 60)}s" if remaining_s > 0 else "CLOSED"
 
-            # Helper to log a skip with prices
-            def _log_skip(reason: str) -> None:
-                skip_counts[reason] = skip_counts.get(reason, 0) + 1
-                append_log(logfile, {
-                    "log_type": "skip", "ts": utc_ts(), "scan_num": scan_i, "coin": coin,
-                    "reason": reason,
-                    "poly_up": poly.up_price, "poly_down": poly.down_price,
-                    "kalshi_up": kalshi.yes_ask, "kalshi_down": kalshi.no_ask,
-                    "remaining_s": round(remaining_s, 1),
-                })
-
             if delta_s > WINDOW_ALIGN_TOLERANCE_SECONDS:
                 print(f"  -> Alignment: ❌ SKIP (Kalshi close vs Poly end differ by {delta_s:.1f}s; tol={WINDOW_ALIGN_TOLERANCE_SECONDS}s)")
-                _log_skip("alignment")
+                log_skip(logfile, skip_counts, scan_i, coin, "alignment", poly, kalshi, remaining_s)
                 continue
             else:
                 print(f"  -> Alignment: ✅ OK (Δ {delta_s:.1f}s) | Window closes in: {remaining_str}")
@@ -1619,7 +1887,7 @@ def main() -> None:
             # Safeguard: minimum time remaining in window
             if remaining_s < MIN_WINDOW_REMAINING_S:
                 print(f"  -> Window: ❌ SKIP (only {remaining_str} left; need {MIN_WINDOW_REMAINING_S:.0f}s to fill both legs)")
-                _log_skip("window_time")
+                log_skip(logfile, skip_counts, scan_i, coin, "window_time", poly, kalshi, remaining_s)
                 continue
 
             # Safeguard: spread sanity — reject if either exchange has abnormally wide spread
@@ -1627,11 +1895,11 @@ def main() -> None:
             poly_spread = (poly.up_price + poly.down_price) - 1.0
             if kalshi_spread > MAX_SPREAD:
                 print(f"  -> Spread: ❌ SKIP Kalshi spread {pct(kalshi_spread)} exceeds {pct(MAX_SPREAD)} max")
-                _log_skip("kalshi_spread")
+                log_skip(logfile, skip_counts, scan_i, coin, "kalshi_spread", poly, kalshi, remaining_s)
                 continue
             if poly_spread > MAX_SPREAD:
                 print(f"  -> Spread: ❌ SKIP Poly spread {pct(poly_spread)} exceeds {pct(MAX_SPREAD)} max")
-                _log_skip("poly_spread")
+                log_skip(logfile, skip_counts, scan_i, coin, "poly_spread", poly, kalshi, remaining_s)
                 continue
 
             # Safeguard: extreme prices — outcome nearly decided, hedging is unreliable
@@ -1640,19 +1908,17 @@ def main() -> None:
             if extreme:
                 print(f"  -> Price: ❌ SKIP extreme prices detected ({', '.join(f'{p:.3f}' for p in extreme)}); "
                       f"outside [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}] range")
-                _log_skip("extreme_price")
+                log_skip(logfile, skip_counts, scan_i, coin, "extreme_price", poly, kalshi, remaining_s)
                 continue
 
             # Safeguard: probability divergence — large disagreement signals mismatched strikes.
-            # Kalshi uses fixed $ strikes; Poly uses relative (end >= start). If implied probs
-            # diverge too much, the markets are pricing different events.
-            kalshi_up_prob = 1.0 - kalshi.no_ask  # implied P(up) from Kalshi
-            poly_up_prob = poly.up_price           # implied P(up) from Poly
+            kalshi_up_prob = 1.0 - kalshi.no_ask
+            poly_up_prob = poly.up_price
             prob_div = abs(kalshi_up_prob - poly_up_prob)
             if prob_div > MAX_PROB_DIVERGENCE:
                 print(f"  -> Divergence: ❌ SKIP implied P(up) Kalshi={kalshi_up_prob:.2f} vs Poly={poly_up_prob:.2f} "
                       f"(Δ{pct(prob_div)} > {pct(MAX_PROB_DIVERGENCE)} max — likely different strikes)")
-                _log_skip("prob_divergence")
+                log_skip(logfile, skip_counts, scan_i, coin, "prob_divergence", poly, kalshi, remaining_s)
                 continue
 
             print(f"          Safeguards: ✅ all passed (Δprob {pct(prob_div)}, min edge {pct(MIN_NET_EDGE)}, min window {MIN_WINDOW_REMAINING_S:.0f}s)")
@@ -1671,7 +1937,7 @@ def main() -> None:
 
             if best_for_coin is None:
                 print(f"  -> Candidate: ❌ SKIP (no combo with net edge >= {pct(MIN_NET_EDGE)} and cost < {MAX_TOTAL_COST:.3f})")
-                _log_skip("no_viable_edge")
+                log_skip(logfile, skip_counts, scan_i, coin, "no_viable_edge", poly, kalshi, remaining_s)
                 continue
 
             print(
@@ -1751,10 +2017,32 @@ def main() -> None:
                 print(f"  [depth] Poly book: {poly_depth['levels']} levels, "
                       f"{poly_depth['total_size']} contracts, ${poly_depth['total_notional_usd']:.2f} notional")
 
+            # Execute both legs (paper=instant fill, live=real orders)
+            exec_result = execute_hedge(best_global, best_global_poly, best_global_kalshi, logfile)
+
+            # Attach execution details to the trade log row
+            row["exec_mode"] = EXEC_MODE
+            row["exec_both_filled"] = exec_result.both_filled
+            row["exec_total_ms"] = round(exec_result.total_latency_ms, 1)
+            row["exec_slippage_poly"] = round(exec_result.slippage_poly, 6)
+            row["exec_slippage_kalshi"] = round(exec_result.slippage_kalshi, 6)
+            row["exec_slippage_total_bps"] = round((exec_result.slippage_poly + exec_result.slippage_kalshi) * 10000, 1)
+            row["exec_leg1_order_id"] = exec_result.leg1.order_id
+            row["exec_leg1_status"] = exec_result.leg1.status
+            row["exec_leg1_actual_price"] = exec_result.leg1.actual_price
+            row["exec_leg1_latency_ms"] = round(exec_result.leg1.latency_ms, 1)
+            row["exec_leg2_order_id"] = exec_result.leg2.order_id
+            row["exec_leg2_status"] = exec_result.leg2.status
+            row["exec_leg2_actual_price"] = exec_result.leg2.actual_price
+            row["exec_leg2_latency_ms"] = round(exec_result.leg2.latency_ms, 1)
+
             append_log(logfile, row)
             logged.append(row)
             consecutive_skips = 0
-            print(f"[paper] Logged test trade #{len(logged)} -> {best_global.coin} | net {pct(best_global.net_edge)} (gross {pct(best_global.gross_edge)})")
+            mode_tag = "LIVE" if EXEC_MODE == "live" else "paper"
+            fill_tag = "FILLED" if exec_result.both_filled else "INCOMPLETE"
+            print(f"[{mode_tag}] Logged trade #{len(logged)} -> {best_global.coin} | net {pct(best_global.net_edge)} "
+                  f"(gross {pct(best_global.gross_edge)}) | exec: {fill_tag}")
         else:
             consecutive_skips += 1
             print(f"No viable paper trades found in this scan. ({consecutive_skips} consecutive skips)")
@@ -1774,5 +2062,46 @@ def main() -> None:
     summarize(logged, selected_coins, skip_counts=skip_counts)
 
 
+def _run_with_kill_switch() -> None:
+    """Entry point that wraps main() in a kill switch for graceful shutdown logging."""
+    try:
+        main()
+    except KeyboardInterrupt:
+        # User pressed Ctrl+C — graceful exit
+        print("\n\nShutdown: Ctrl+C received.")
+        # Try to log the shutdown (logfile may not exist if interrupted before scanning)
+        try:
+            logfiles = sorted(
+                [f for f in os.listdir(LOG_DIR) if f.startswith("arb_logs_market_")],
+                reverse=True
+            )
+            if logfiles:
+                logfile = os.path.join(LOG_DIR, logfiles[0])
+                log_kill_switch(logfile, "user_interrupt", {"signal": "KeyboardInterrupt"})
+        except Exception:
+            pass
+    except Exception as exc:
+        # Unexpected crash — log full context before re-raising
+        print(f"\n\nFATAL: {type(exc).__name__}: {exc}")
+        try:
+            logfiles = sorted(
+                [f for f in os.listdir(LOG_DIR) if f.startswith("arb_logs_market_")],
+                reverse=True
+            )
+            if logfiles:
+                logfile = os.path.join(LOG_DIR, logfiles[0])
+                log_kill_switch(logfile, "unhandled_exception", {
+                    "exception_type": type(exc).__name__,
+                    "exception_msg": str(exc)[:500],
+                })
+        except Exception:
+            pass
+        raise
+    finally:
+        # Clean up WebSocket
+        if _poly_ws is not None:
+            _poly_ws.stop()
+
+
 if __name__ == "__main__":
-    main()
+    _run_with_kill_switch()
