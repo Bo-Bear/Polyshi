@@ -1,9 +1,11 @@
+import base64
 import json
 import os
 import time
 import math
 import threading
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
@@ -18,6 +20,23 @@ try:
     _HAS_WS_CLIENT = True
 except ImportError:
     _HAS_WS_CLIENT = False
+
+# Kalshi RSA auth (needed for live trading)
+try:
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
+    _HAS_CRYPTO = True
+except ImportError:
+    _HAS_CRYPTO = False
+
+# Polymarket CLOB client (needed for live trading)
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY
+    _HAS_CLOB_CLIENT = True
+except ImportError:
+    _HAS_CLOB_CLIENT = False
 
 
 # -----------------------------
@@ -108,6 +127,26 @@ LOG_DIR = os.getenv("LOG_DIR", "logs")
 # Execution mode: "paper" (default) or "live"
 EXEC_MODE = os.getenv("EXEC_MODE", "paper").lower()  # "paper" or "live"
 
+# -----------------------------
+# Exchange credentials (live trading only)
+# -----------------------------
+# Kalshi: RSA key-based authentication
+#   Generate at https://kalshi.com/account/profile -> API Keys
+KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "")      # Key ID string
+KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")  # Path to RSA .pem file
+
+# Polymarket: Ethereum wallet + CLOB API
+#   Private key of your Polygon wallet that holds USDC.e
+POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")        # Hex private key (0x...)
+# Signature type: 0=EOA (MetaMask/hardware), 1=Magic/email wallet, 2=browser/Gnosis Safe
+POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
+# Funder address (required for signature_type 1 or 2; leave blank for type 0)
+POLY_FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "")
+
+# Order placement config
+ORDER_TIMEOUT_S = float(os.getenv("ORDER_TIMEOUT_S", "15"))  # max seconds to wait for fill
+ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "1"))  # polling interval
+
 
 # -----------------------------
 # HTTP session + caches
@@ -123,6 +162,99 @@ def _get_session() -> requests.Session:
 
 
 _clob_working_route_idx: Optional[int] = None
+
+# -----------------------------
+# Kalshi authenticated session (live mode)
+# -----------------------------
+_kalshi_private_key = None  # loaded RSA key object
+
+
+def _load_kalshi_private_key():
+    """Load RSA private key from PEM file for Kalshi API signing."""
+    global _kalshi_private_key
+    if _kalshi_private_key is not None:
+        return _kalshi_private_key
+    if not KALSHI_PRIVATE_KEY_PATH:
+        raise RuntimeError("KALSHI_PRIVATE_KEY_PATH not set — cannot authenticate with Kalshi")
+    if not _HAS_CRYPTO:
+        raise RuntimeError("'cryptography' package required for Kalshi live trading: pip install cryptography")
+    with open(KALSHI_PRIVATE_KEY_PATH, "rb") as f:
+        _kalshi_private_key = serialization.load_pem_private_key(f.read(), password=None)
+    return _kalshi_private_key
+
+
+def _kalshi_sign(method: str, path: str) -> dict:
+    """Build Kalshi auth headers with RSA-PSS signature."""
+    pk = _load_kalshi_private_key()
+    timestamp_ms = str(int(time.time() * 1000))
+    # Strip query params for signing
+    path_no_query = path.split("?")[0]
+    message = (timestamp_ms + method.upper() + path_no_query).encode("utf-8")
+    signature = pk.sign(
+        message,
+        rsa_padding.PSS(
+            mgf=rsa_padding.MGF1(hashes.SHA256()),
+            salt_length=rsa_padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    return {
+        "Content-Type": "application/json",
+        "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+    }
+
+
+def _kalshi_auth_get(path: str, timeout: int = 10) -> dict:
+    """Authenticated GET to Kalshi API."""
+    url = KALSHI_BASE + path
+    headers = _kalshi_sign("GET", path)
+    r = _get_session().get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def _kalshi_auth_post(path: str, body: dict, timeout: int = 10) -> dict:
+    """Authenticated POST to Kalshi API."""
+    url = KALSHI_BASE + path
+    headers = _kalshi_sign("POST", path)
+    r = _get_session().post(url, json=body, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+# -----------------------------
+# Polymarket CLOB client (live mode)
+# -----------------------------
+_poly_clob_client = None  # ClobClient instance
+
+
+def _get_poly_clob_client():
+    """Initialize and return the Polymarket CLOB client for order placement."""
+    global _poly_clob_client
+    if _poly_clob_client is not None:
+        return _poly_clob_client
+    if not _HAS_CLOB_CLIENT:
+        raise RuntimeError("'py-clob-client' package required for Poly live trading: pip install py-clob-client")
+    if not POLY_PRIVATE_KEY:
+        raise RuntimeError("POLY_PRIVATE_KEY not set — cannot authenticate with Polymarket")
+
+    kwargs = {
+        "host": POLY_CLOB_BASE,
+        "key": POLY_PRIVATE_KEY,
+        "chain_id": 137,  # Polygon mainnet
+        "signature_type": POLY_SIGNATURE_TYPE,
+    }
+    if POLY_SIGNATURE_TYPE in (1, 2) and POLY_FUNDER_ADDRESS:
+        kwargs["funder"] = POLY_FUNDER_ADDRESS
+
+    client = ClobClient(**kwargs)
+    # Derive L2 HMAC API credentials from wallet signature
+    client.set_api_creds(client.create_or_derive_api_creds())
+    _poly_clob_client = client
+    return _poly_clob_client
+
 
 # Spot price cache (one fetch per scan, shared across coins)
 _spot_prices: Dict[str, float] = {}
@@ -1390,32 +1522,34 @@ def check_balances(logfile: str) -> Dict[str, float]:
     """Check available balances on both exchanges. Returns {exchange: usd_balance}.
 
     In paper mode, returns configured PAPER_CONTRACTS * max_price as available.
-    In live mode, calls exchange APIs (TODO: wire up authenticated clients).
+    In live mode, calls Kalshi authenticated API and Polymarket CLOB client.
     """
     if EXEC_MODE == "paper":
         bal = {"poly": PAPER_CONTRACTS * 1.0, "kalshi": PAPER_CONTRACTS * 1.0}
         return bal
 
-    # --- LIVE MODE (placeholder) ---
-    # TODO: Replace with authenticated API calls:
-    #   Polymarket: GET /balances (py-clob-client)
-    #   Kalshi:     GET /portfolio/balance
+    # --- LIVE MODE ---
     bal: Dict[str, float] = {}
+
+    # Kalshi: authenticated GET /portfolio/balance
     try:
-        # Kalshi balance
-        r = _get_session().get(f"{KALSHI_BASE}/portfolio/balance", timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        bal["kalshi"] = float(data.get("balance", 0)) / 100.0  # cents -> dollars
+        data = _kalshi_auth_get("/trade-api/v2/portfolio/balance")
+        # Kalshi returns balance in cents
+        bal["kalshi"] = float(data.get("available_balance", 0)) / 100.0
     except Exception as e:
         bal["kalshi"] = -1.0
         print(f"  [balance] Kalshi balance check failed: {e}")
 
+    # Polymarket: CLOB client balance (USDC.e on Polygon)
     try:
-        # Polymarket balance (requires authenticated CLOB client)
-        # TODO: Implement with py-clob-client or direct API
-        bal["poly"] = -1.0
-        print("  [balance] Poly balance check not yet implemented for live mode")
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        client = _get_poly_clob_client()
+        resp = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        # Balance is in raw USDC units (6 decimals)
+        raw_balance = float(resp.get("balance", "0"))
+        bal["poly"] = raw_balance / 1e6
     except Exception as e:
         bal["poly"] = -1.0
         print(f"  [balance] Poly balance check failed: {e}")
@@ -1429,7 +1563,7 @@ def execute_leg(exchange: str, side: str, planned_price: float,
     """Execute a single leg on an exchange. Returns fill details.
 
     In paper mode, simulates an instant fill at planned_price.
-    In live mode, places the order and waits for confirmation (TODO).
+    In live mode, places a GTC limit order and polls until filled or timeout.
     """
     t0 = time.monotonic()
 
@@ -1443,14 +1577,7 @@ def execute_leg(exchange: str, side: str, planned_price: float,
             latency_ms=latency, status="filled", error=None,
         )
 
-    # --- LIVE MODE (placeholder) ---
-    # TODO: Replace with actual order placement:
-    #   Polymarket: POST order via py-clob-client (GTC limit at planned_price)
-    #   Kalshi:     POST /portfolio/orders (limit order)
-    #
-    # After placing, poll for fill status until filled/timeout.
-    # Return actual fill price, filled qty, order ID from exchange response.
-
+    # --- LIVE MODE ---
     order_id = None
     actual_price = None
     filled = 0.0
@@ -1459,22 +1586,13 @@ def execute_leg(exchange: str, side: str, planned_price: float,
 
     try:
         if exchange == "kalshi":
-            ticker = kwargs.get("ticker", "")
-            kalshi_side = "yes" if side == "UP" else "no"
-            # TODO: POST /portfolio/orders with authenticated session
-            # body = {"ticker": ticker, "action": "buy", "side": kalshi_side,
-            #         "type": "limit", "count": int(contracts),
-            #         "yes_price" or "no_price": int(planned_price * 100)}
-            error_msg = "live Kalshi order placement not yet implemented"
-
+            order_id, actual_price, filled, status, error_msg = _execute_kalshi_leg(
+                side, planned_price, contracts, kwargs.get("ticker", "")
+            )
         elif exchange == "poly":
-            token_id = kwargs.get("token_id", "")
-            # TODO: Use py-clob-client to create and sign order
-            # order = clob_client.create_and_post_order(
-            #     OrderArgs(token_id=token_id, price=planned_price,
-            #               size=contracts, side=BUY))
-            error_msg = "live Poly order placement not yet implemented"
-
+            order_id, actual_price, filled, status, error_msg = _execute_poly_leg(
+                side, planned_price, contracts, kwargs.get("token_id", "")
+            )
     except Exception as e:
         error_msg = str(e)
 
@@ -1486,6 +1604,140 @@ def execute_leg(exchange: str, side: str, planned_price: float,
         order_id=order_id, fill_ts=utc_ts() if filled > 0 else None,
         latency_ms=latency, status=status, error=error_msg,
     )
+
+
+def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
+                        ticker: str) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
+    """Place and poll a Kalshi limit order. Returns (order_id, actual_price, filled, status, error)."""
+    kalshi_side = "yes" if side == "UP" else "no"
+    price_cents = int(round(planned_price * 100))
+    client_order_id = f"polyshi-{uuid.uuid4().hex[:12]}"
+
+    # Build order body — use yes_price for YES side, no_price for NO side
+    body: dict = {
+        "ticker": ticker,
+        "action": "buy",
+        "side": kalshi_side,
+        "type": "limit",
+        "count": int(contracts),
+        "client_order_id": client_order_id,
+    }
+    if kalshi_side == "yes":
+        body["yes_price"] = price_cents
+    else:
+        body["no_price"] = price_cents
+
+    # Place the order
+    resp = _kalshi_auth_post("/trade-api/v2/portfolio/orders", body)
+    order = resp.get("order", resp)
+    order_id = order.get("order_id") or order.get("id")
+
+    if not order_id:
+        return None, None, 0.0, "rejected", f"No order_id in response: {resp}"
+
+    # Poll for fill
+    deadline = time.monotonic() + ORDER_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            poll = _kalshi_auth_get(f"/trade-api/v2/portfolio/orders/{order_id}")
+            o = poll.get("order", poll)
+            o_status = o.get("status", "")
+
+            if o_status == "executed":
+                fill_count = float(o.get("fill_count", o.get("count", contracts)))
+                # Kalshi doesn't return average fill price directly;
+                # for limit orders, fill price = planned price (exchange guarantees limit-or-better)
+                return order_id, planned_price, fill_count, "filled", None
+
+            if o_status == "canceled":
+                fill_count = float(o.get("fill_count", 0))
+                if fill_count > 0:
+                    return order_id, planned_price, fill_count, "partial", "order canceled after partial fill"
+                return order_id, None, 0.0, "rejected", "order was canceled"
+
+        except Exception:
+            pass
+        time.sleep(ORDER_POLL_INTERVAL_S)
+
+    # Timeout — check final state and cancel if still resting
+    try:
+        poll = _kalshi_auth_get(f"/trade-api/v2/portfolio/orders/{order_id}")
+        o = poll.get("order", poll)
+        fill_count = float(o.get("fill_count", 0))
+        if o.get("status") == "executed":
+            return order_id, planned_price, fill_count, "filled", None
+        # Cancel unfilled remainder
+        _kalshi_auth_post(f"/trade-api/v2/portfolio/orders/{order_id}/cancel", {})
+        if fill_count > 0:
+            return order_id, planned_price, fill_count, "partial", "timeout — canceled remainder"
+    except Exception as e:
+        return order_id, None, 0.0, "error", f"timeout + cancel failed: {e}"
+
+    return order_id, None, 0.0, "rejected", "order timed out with no fills"
+
+
+def _execute_poly_leg(side: str, planned_price: float, contracts: float,
+                      token_id: str) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
+    """Place and poll a Polymarket CLOB limit order. Returns (order_id, actual_price, filled, status, error)."""
+    client = _get_poly_clob_client()
+
+    # Round price to 2 decimal places (Poly CLOB tick size is $0.01)
+    price = round(planned_price, 2)
+
+    # Create and sign order
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=price,
+        size=contracts,
+        side=BUY,
+    )
+    signed_order = client.create_order(order_args)
+    resp = client.post_order(signed_order, OrderType.GTC)
+
+    # Response: {"success": bool, "orderID": "0x...", ...}
+    if not resp.get("success", False):
+        error_detail = resp.get("errorMsg") or resp.get("error") or str(resp)
+        return None, None, 0.0, "rejected", f"order rejected: {error_detail}"
+
+    order_id = resp.get("orderID") or resp.get("id")
+    if not order_id:
+        return None, None, 0.0, "rejected", f"no orderID in response: {resp}"
+
+    # Poll for fill status
+    deadline = time.monotonic() + ORDER_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            o = client.get_order(order_id)
+            o_status = (o.get("status") or "").lower()
+
+            if o_status == "matched" or o_status == "filled":
+                filled_size = float(o.get("size_matched", o.get("original_size", contracts)))
+                avg_price = float(o.get("price", planned_price))
+                return order_id, avg_price, filled_size, "filled", None
+
+            if o_status == "canceled" or o_status == "cancelled":
+                filled_size = float(o.get("size_matched", 0))
+                if filled_size > 0:
+                    return order_id, planned_price, filled_size, "partial", "order canceled after partial fill"
+                return order_id, None, 0.0, "rejected", "order was canceled"
+
+        except Exception:
+            pass
+        time.sleep(ORDER_POLL_INTERVAL_S)
+
+    # Timeout — cancel unfilled remainder
+    try:
+        o = client.get_order(order_id)
+        filled_size = float(o.get("size_matched", 0))
+        if (o.get("status") or "").lower() in ("matched", "filled"):
+            return order_id, planned_price, filled_size, "filled", None
+        client.cancel(order_id)
+        if filled_size > 0:
+            return order_id, planned_price, filled_size, "partial", "timeout — canceled remainder"
+    except Exception as e:
+        return order_id, None, 0.0, "error", f"timeout + cancel failed: {e}"
+
+    return order_id, None, 0.0, "rejected", "order timed out with no fills"
 
 
 def execute_hedge(candidate: HedgeCandidate,
@@ -1754,10 +2006,52 @@ def main() -> None:
     else:
         print("WebSocket: websocket-client not installed; using HTTP-only (pip install websocket-client)")
 
-    # Extra confirmation for live mode
+    # Live mode: validate credentials and confirm
     if EXEC_MODE == "live":
+        # Pre-flight credential check — fail fast if anything is missing
+        missing = []
+        if not KALSHI_API_KEY_ID:
+            missing.append("KALSHI_API_KEY_ID")
+        if not KALSHI_PRIVATE_KEY_PATH:
+            missing.append("KALSHI_PRIVATE_KEY_PATH")
+        elif not os.path.isfile(KALSHI_PRIVATE_KEY_PATH):
+            missing.append(f"KALSHI_PRIVATE_KEY_PATH (file not found: {KALSHI_PRIVATE_KEY_PATH})")
+        if not POLY_PRIVATE_KEY:
+            missing.append("POLY_PRIVATE_KEY")
+        if POLY_SIGNATURE_TYPE in (1, 2) and not POLY_FUNDER_ADDRESS:
+            missing.append("POLY_FUNDER_ADDRESS (required for signature_type 1 or 2)")
+        if not _HAS_CRYPTO:
+            missing.append("'cryptography' package (pip install cryptography)")
+        if not _HAS_CLOB_CLIENT:
+            missing.append("'py-clob-client' package (pip install py-clob-client)")
+
+        if missing:
+            print("\n*** LIVE MODE BLOCKED — missing credentials/dependencies: ***")
+            for m in missing:
+                print(f"  - {m}")
+            print("\nSet these in your .env file and retry.")
+            return
+
+        # Test Kalshi key loading
+        try:
+            _load_kalshi_private_key()
+            print("Kalshi:  RSA key loaded OK")
+        except Exception as e:
+            print(f"\n*** LIVE MODE BLOCKED — Kalshi key error: {e}")
+            return
+
+        # Test Poly CLOB client initialization
+        try:
+            _get_poly_clob_client()
+            print("Poly:    CLOB client initialized OK")
+        except Exception as e:
+            print(f"\n*** LIVE MODE BLOCKED — Poly CLOB client error: {e}")
+            return
+
         print("\n*** WARNING: LIVE TRADING MODE ***")
         print("Real orders will be placed on Polymarket and Kalshi.")
+        print(f"Contracts per trade: {int(PAPER_CONTRACTS)}")
+        print(f"Order timeout: {ORDER_TIMEOUT_S}s")
         if not prompt_yes_no("Are you sure you want to continue?", default=False):
             print("Aborted.")
             return
