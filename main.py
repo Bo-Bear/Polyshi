@@ -256,15 +256,19 @@ def _polygon_rpc(method: str, params: list) -> dict:
     return data.get("result")
 
 
-def _send_approval_tx(from_key: str, to_addr: str, calldata: str,
+def _send_approval_tx(from_addr: str, from_key: str, to_addr: str, calldata: str,
                       nonce: int, gas_price: str) -> str:
     """Sign and send a single approval tx, wait for receipt. Returns tx hash."""
     from eth_account import Account
 
+    # Simulate first to catch revert reasons
+    sim = _polygon_rpc("eth_call", [{"from": from_addr, "to": to_addr, "data": calldata}, "latest"])
+    # eth_call returns result or throws RPC error (caught above)
+
     tx = {
         "to": to_addr,
         "value": 0,
-        "gas": 65000,
+        "gas": 100000,
         "gasPrice": int(gas_price, 16),
         "nonce": nonce,
         "chainId": 137,
@@ -280,8 +284,12 @@ def _send_approval_tx(from_key: str, to_addr: str, calldata: str,
     for _ in range(60):
         receipt = _polygon_rpc("eth_getTransactionReceipt", [tx_hash])
         if receipt is not None:
-            if int(receipt.get("status", "0x0"), 16) != 1:
-                raise RuntimeError(f"tx reverted: {tx_hash}")
+            status = int(receipt.get("status", "0x0"), 16)
+            gas_used = int(receipt.get("gasUsed", "0x0"), 16)
+            if status != 1:
+                raise RuntimeError(
+                    f"tx reverted (gasUsed={gas_used}): {tx_hash} "
+                    f"| to={to_addr} | data={calldata[:20]}...")
             return tx_hash
         time.sleep(1)
     raise RuntimeError(f"tx not confirmed after 60s: {tx_hash}")
@@ -311,7 +319,7 @@ def _approve_poly_contracts():
 
         # ERC-20: approve(address spender, uint256 amount)
         calldata = "0x095ea7b3" + spender_padded + max_uint_hex
-        _send_approval_tx(POLY_PRIVATE_KEY, _POLY_USDC_E, calldata, nonce, gas_price)
+        _send_approval_tx(addr, POLY_PRIVATE_KEY, _POLY_USDC_E, calldata, nonce, gas_price)
         nonce += 1
         tx_count += 1
         print(f"         Approved USDC.e -> {labels[i]}")
@@ -319,7 +327,7 @@ def _approve_poly_contracts():
         # ERC-1155: setApprovalForAll(address operator, bool approved)
         true_padded = "0" * 63 + "1"
         calldata = "0xa22cb465" + spender_padded + true_padded
-        _send_approval_tx(POLY_PRIVATE_KEY, _POLY_CTF, calldata, nonce, gas_price)
+        _send_approval_tx(addr, POLY_PRIVATE_KEY, _POLY_CTF, calldata, nonce, gas_price)
         nonce += 1
         tx_count += 1
         print(f"         Approved CTF    -> {labels[i]}")
