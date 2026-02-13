@@ -646,6 +646,22 @@ def prompt_market_type() -> str:
         print("Invalid selection. Enter 1.")
 
 
+def prompt_execution_mode() -> str:
+    """Prompt user to choose between live trading and paper testing."""
+    print("\nSELECT EXECUTION MODE")
+    print("=" * 45)
+    print("1) Paper Testing   — simulated trades, no real money")
+    print("2) Live Trading    — real orders on Kalshi & Polymarket")
+
+    while True:
+        choice = input("\nSelect mode [1]: ").strip()
+        if choice == "" or choice == "1":
+            return "paper"
+        if choice == "2":
+            return "live"
+        print("Invalid selection. Enter 1 or 2.")
+
+
 def prompt_coin_selection(available: List[str]) -> List[str]:
     print("\nSELECT CRYPTOCURRENCIES TO TRADE")
     print("=" * 45)
@@ -1972,8 +1988,12 @@ def verify_trade_outcomes(trades: List[dict], logfile: str) -> List[dict]:
 # Main loop
 # -----------------------------
 def main() -> None:
+    global EXEC_MODE
     ensure_dir(LOG_DIR)
     logfile = os.path.join(LOG_DIR, f"arb_logs_market_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl")
+
+    # First choice: execution mode
+    EXEC_MODE = prompt_execution_mode()
 
     market_type = prompt_market_type()
     if market_type != "CRYPTO_15M_UPDOWN":
@@ -1983,8 +2003,8 @@ def main() -> None:
 
     print("\nConfirm settings")
     print("=" * 45)
-    mode_label = "*** LIVE TRADING ***" if EXEC_MODE == "live" else "Paper Trading"
-    print(f"Execution:  {mode_label} ({EXEC_MODE})")
+    mode_label = "*** LIVE TRADING ***" if EXEC_MODE == "live" else "Paper Testing"
+    print(f"Execution:  {mode_label}")
     print(f"Market Type: {market_type}")
     print(f"Coins: {', '.join(selected_coins)}")
     print(f"Contracts:  {int(PAPER_CONTRACTS)}")
