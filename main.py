@@ -240,63 +240,89 @@ _POLY_SPENDERS = [
     "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",   # Neg Risk Adapter
 ]
 
-_ERC20_APPROVE_ABI = [{"inputs": [{"name": "spender", "type": "address"},
-    {"name": "amount", "type": "uint256"}], "name": "approve",
-    "outputs": [{"name": "", "type": "bool"}], "type": "function"}]
+# ERC-20 approve(address,uint256) selector: 0x095ea7b3
+# ERC-1155 setApprovalForAll(address,bool) selector: 0xa22cb465
+_POLYGON_RPC = "https://polygon-rpc.com"
 
-_ERC1155_APPROVE_ABI = [{"inputs": [{"name": "operator", "type": "address"},
-    {"name": "approved", "type": "bool"}], "name": "setApprovalForAll",
-    "outputs": [], "type": "function"}]
+
+def _polygon_rpc(method: str, params: list) -> dict:
+    """Raw JSON-RPC call to Polygon."""
+    r = _get_session().post(_POLYGON_RPC, json={
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+    }, timeout=15)
+    data = r.json()
+    if "error" in data:
+        raise RuntimeError(f"RPC error: {data['error']}")
+    return data.get("result")
+
+
+def _send_approval_tx(from_key: str, to_addr: str, calldata: str,
+                      nonce: int, gas_price: str) -> str:
+    """Sign and send a single approval tx, wait for receipt. Returns tx hash."""
+    from eth_account import Account
+
+    tx = {
+        "to": to_addr,
+        "value": 0,
+        "gas": 65000,
+        "gasPrice": int(gas_price, 16),
+        "nonce": nonce,
+        "chainId": 137,
+        "data": calldata,
+    }
+    signed = Account.sign_transaction(tx, from_key)
+    raw = signed.raw_transaction.hex()
+    if not raw.startswith("0x"):
+        raw = "0x" + raw
+    tx_hash = _polygon_rpc("eth_sendRawTransaction", [raw])
+
+    # Poll for receipt (up to 60s)
+    for _ in range(60):
+        receipt = _polygon_rpc("eth_getTransactionReceipt", [tx_hash])
+        if receipt is not None:
+            if int(receipt.get("status", "0x0"), 16) != 1:
+                raise RuntimeError(f"tx reverted: {tx_hash}")
+            return tx_hash
+        time.sleep(1)
+    raise RuntimeError(f"tx not confirmed after 60s: {tx_hash}")
 
 
 def _approve_poly_contracts():
     """Submit on-chain approve() txns for Polymarket exchange contracts.
-    Approves USDC.e spending + CTF token transfers for all 3 spender contracts.
+    Uses eth_account + raw JSON-RPC (no web3 dependency).
     Requires POL for gas on Polygon."""
-    from web3 import Web3
+    from eth_account import Account
 
-    w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
-    if not w3.is_connected():
-        raise RuntimeError("Cannot connect to Polygon RPC")
+    acct = Account.from_key(POLY_PRIVATE_KEY)
+    addr = acct.address
 
-    account = w3.eth.account.from_key(POLY_PRIVATE_KEY)
-    nonce = w3.eth.get_transaction_count(account.address)
-    max_uint256 = 2**256 - 1
+    nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
+    nonce = int(nonce_hex, 16)
+    gas_price = _polygon_rpc("eth_gasPrice", [])
 
-    usdc_contract = w3.eth.contract(
-        address=Web3.to_checksum_address(_POLY_USDC_E), abi=_ERC20_APPROVE_ABI)
-    ctf_contract = w3.eth.contract(
-        address=Web3.to_checksum_address(_POLY_CTF), abi=_ERC1155_APPROVE_ABI)
+    max_uint256 = (2**256 - 1)
+    max_uint_hex = hex(max_uint256)[2:].zfill(64)
 
     labels = ["CTF Exchange", "Neg Risk Exchange", "Neg Risk Adapter"]
     tx_count = 0
 
     for i, spender in enumerate(_POLY_SPENDERS):
-        spender_cs = Web3.to_checksum_address(spender)
+        spender_padded = spender.lower().replace("0x", "").zfill(64)
 
-        # ERC-20: approve USDC.e spending
-        tx = usdc_contract.functions.approve(spender_cs, max_uint256).build_transaction({
-            "from": account.address, "nonce": nonce,
-            "gas": 60000, "gasPrice": w3.eth.gas_price, "chainId": 137,
-        })
-        signed = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        # ERC-20: approve(address spender, uint256 amount)
+        calldata = "0x095ea7b3" + spender_padded + max_uint_hex
+        _send_approval_tx(POLY_PRIVATE_KEY, _POLY_USDC_E, calldata, nonce, gas_price)
         nonce += 1
         tx_count += 1
-        print(f"         Approved USDC.e -> {labels[i]} ✓")
+        print(f"         Approved USDC.e -> {labels[i]}")
 
-        # ERC-1155: setApprovalForAll for CTF tokens
-        tx = ctf_contract.functions.setApprovalForAll(spender_cs, True).build_transaction({
-            "from": account.address, "nonce": nonce,
-            "gas": 60000, "gasPrice": w3.eth.gas_price, "chainId": 137,
-        })
-        signed = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        # ERC-1155: setApprovalForAll(address operator, bool approved)
+        true_padded = "0" * 63 + "1"
+        calldata = "0xa22cb465" + spender_padded + true_padded
+        _send_approval_tx(POLY_PRIVATE_KEY, _POLY_CTF, calldata, nonce, gas_price)
         nonce += 1
         tx_count += 1
-        print(f"         Approved CTF    -> {labels[i]} ✓")
+        print(f"         Approved CTF    -> {labels[i]}")
 
     return tx_count
 
