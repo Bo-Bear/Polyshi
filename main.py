@@ -1574,7 +1574,7 @@ def check_balances(logfile: str) -> Dict[str, float]:
 
     # Kalshi: authenticated GET /portfolio/balance
     try:
-        data = _kalshi_auth_get("/trade-api/v2/portfolio/balance")
+        data = _kalshi_auth_get("/portfolio/balance")
         # Kalshi returns balance in cents
         bal["kalshi"] = float(data.get("available_balance", 0)) / 100.0
     except Exception as e:
@@ -1669,7 +1669,7 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
         body["no_price"] = price_cents
 
     # Place the order
-    resp = _kalshi_auth_post("/trade-api/v2/portfolio/orders", body)
+    resp = _kalshi_auth_post("/portfolio/orders", body)
     order = resp.get("order", resp)
     order_id = order.get("order_id") or order.get("id")
 
@@ -1680,7 +1680,7 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
     deadline = time.monotonic() + ORDER_TIMEOUT_S
     while time.monotonic() < deadline:
         try:
-            poll = _kalshi_auth_get(f"/trade-api/v2/portfolio/orders/{order_id}")
+            poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
             o = poll.get("order", poll)
             o_status = o.get("status", "")
 
@@ -1702,13 +1702,13 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
 
     # Timeout — check final state and cancel if still resting
     try:
-        poll = _kalshi_auth_get(f"/trade-api/v2/portfolio/orders/{order_id}")
+        poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
         o = poll.get("order", poll)
         fill_count = float(o.get("fill_count", 0))
         if o.get("status") == "executed":
             return order_id, planned_price, fill_count, "filled", None
         # Cancel unfilled remainder
-        _kalshi_auth_post(f"/trade-api/v2/portfolio/orders/{order_id}/cancel", {})
+        _kalshi_auth_post(f"/portfolio/orders/{order_id}/cancel", {})
         if fill_count > 0:
             return order_id, planned_price, fill_count, "partial", "timeout — canceled remainder"
     except Exception as e:
@@ -1787,6 +1787,15 @@ def execute_hedge(candidate: HedgeCandidate,
                   logfile: str) -> ExecutionResult:
     """Execute both legs of a hedge and log full execution details."""
     contracts = PAPER_CONTRACTS
+
+    # Polymarket requires minimum $1 notional per order (size * price >= 1.0)
+    poly_price_rounded = round(candidate.poly_price, 2)
+    if poly_price_rounded > 0:
+        min_contracts = math.ceil(1.0 / poly_price_rounded)
+        if contracts < min_contracts:
+            print(f"  [exec] Bumping contracts {contracts:.0f} -> {min_contracts} "
+                  f"(Poly min $1 order at ${poly_price_rounded:.2f})")
+            contracts = float(min_contracts)
 
     # Determine Poly token ID for the leg we're buying
     if candidate.direction_on_poly == "UP":
@@ -1998,7 +2007,7 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
         else:
             body["no_price"] = sell_price_cents
 
-        resp = _kalshi_auth_post("/trade-api/v2/portfolio/orders", body)
+        resp = _kalshi_auth_post("/portfolio/orders", body)
         order = resp.get("order", resp)
         order_id = order.get("order_id") or order.get("id")
 
@@ -2012,7 +2021,7 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
         deadline = time.monotonic() + ORDER_TIMEOUT_S
         while time.monotonic() < deadline:
             try:
-                poll = _kalshi_auth_get(f"/trade-api/v2/portfolio/orders/{order_id}")
+                poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
                 o = poll.get("order", poll)
                 if o.get("status") == "executed":
                     msg = f"unwound {contracts:.0f} Kalshi contracts at ~${sell_price_cents/100:.2f} (order {order_id})"
@@ -2027,7 +2036,7 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
 
         # Timeout — cancel
         try:
-            _kalshi_auth_post(f"/trade-api/v2/portfolio/orders/{order_id}/cancel", {})
+            _kalshi_auth_post(f"/portfolio/orders/{order_id}/cancel", {})
         except Exception:
             pass
         msg = f"unwind timed out (order {order_id}) — may need manual close"
