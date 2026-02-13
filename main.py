@@ -1118,12 +1118,12 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
 def _is_15m_poly_event(e: dict) -> bool:
     """Check if a Polymarket event is a 15-minute window market (not 5m, hourly, etc.)."""
     slug = (e.get("slug") or "").lower()
-    # Explicit reject: 5-minute markets have "5m" in slug
-    if "5m" in slug:
-        return False
-    # Explicit accept: slug contains "15m"
+    # Explicit accept: slug contains "15m" (check first — "15m" also contains "5m")
     if "15m" in slug:
         return True
+    # Explicit reject: 5-minute markets have "5m" in slug (e.g., "btc-updown-5m-...")
+    if "5m" in slug:
+        return False
     # Check recurrence field
     rec = (e.get("recurrence") or "").upper()
     if rec in ("15M", "15MIN", "15MINUTES"):
