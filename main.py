@@ -229,8 +229,78 @@ def _kalshi_auth_post(path: str, body: dict, timeout: int = 10) -> dict:
 
 
 # -----------------------------
-# Polymarket CLOB client (live mode)
+# Polymarket on-chain approvals + CLOB client (live mode)
 # -----------------------------
+# Polymarket contract addresses on Polygon
+_POLY_USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+_POLY_CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+_POLY_SPENDERS = [
+    "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",   # CTF Exchange
+    "0xC5d563A36AE78145C45a50134d48A1215220f80a",   # Neg Risk CTF Exchange
+    "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",   # Neg Risk Adapter
+]
+
+_ERC20_APPROVE_ABI = [{"inputs": [{"name": "spender", "type": "address"},
+    {"name": "amount", "type": "uint256"}], "name": "approve",
+    "outputs": [{"name": "", "type": "bool"}], "type": "function"}]
+
+_ERC1155_APPROVE_ABI = [{"inputs": [{"name": "operator", "type": "address"},
+    {"name": "approved", "type": "bool"}], "name": "setApprovalForAll",
+    "outputs": [], "type": "function"}]
+
+
+def _approve_poly_contracts():
+    """Submit on-chain approve() txns for Polymarket exchange contracts.
+    Approves USDC.e spending + CTF token transfers for all 3 spender contracts.
+    Requires POL for gas on Polygon."""
+    from web3 import Web3
+
+    w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+    if not w3.is_connected():
+        raise RuntimeError("Cannot connect to Polygon RPC")
+
+    account = w3.eth.account.from_key(POLY_PRIVATE_KEY)
+    nonce = w3.eth.get_transaction_count(account.address)
+    max_uint256 = 2**256 - 1
+
+    usdc_contract = w3.eth.contract(
+        address=Web3.to_checksum_address(_POLY_USDC_E), abi=_ERC20_APPROVE_ABI)
+    ctf_contract = w3.eth.contract(
+        address=Web3.to_checksum_address(_POLY_CTF), abi=_ERC1155_APPROVE_ABI)
+
+    labels = ["CTF Exchange", "Neg Risk Exchange", "Neg Risk Adapter"]
+    tx_count = 0
+
+    for i, spender in enumerate(_POLY_SPENDERS):
+        spender_cs = Web3.to_checksum_address(spender)
+
+        # ERC-20: approve USDC.e spending
+        tx = usdc_contract.functions.approve(spender_cs, max_uint256).build_transaction({
+            "from": account.address, "nonce": nonce,
+            "gas": 60000, "gasPrice": w3.eth.gas_price, "chainId": 137,
+        })
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        nonce += 1
+        tx_count += 1
+        print(f"         Approved USDC.e -> {labels[i]} ✓")
+
+        # ERC-1155: setApprovalForAll for CTF tokens
+        tx = ctf_contract.functions.setApprovalForAll(spender_cs, True).build_transaction({
+            "from": account.address, "nonce": nonce,
+            "gas": 60000, "gasPrice": w3.eth.gas_price, "chainId": 137,
+        })
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        nonce += 1
+        tx_count += 1
+        print(f"         Approved CTF    -> {labels[i]} ✓")
+
+    return tx_count
+
+
 _poly_clob_client = None  # ClobClient instance
 
 
@@ -2294,7 +2364,19 @@ def main() -> None:
                 print(f"         USDC.e balance:   {raw_bal / 1e6:.4f} (raw: {raw_bal})")
                 print(f"         USDC.e allowance: {raw_allow / 1e6:.4f} (raw: {raw_allow})")
                 if raw_allow < 1e6:
-                    print("         *** ALLOWANCE TOO LOW — need on-chain approve() ***")
+                    print("         *** ALLOWANCE TOO LOW — submitting on-chain approvals ***")
+                    try:
+                        n = _approve_poly_contracts()
+                        print(f"         {n} approval txns confirmed on Polygon")
+                        # Re-check allowance
+                        ba2 = client.get_balance_allowance(
+                            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                        new_allow = float(ba2.get("allowance", "0"))
+                        print(f"         New allowance: {new_allow / 1e6:.4f}")
+                    except Exception as e2:
+                        print(f"         *** APPROVAL FAILED: {e2}")
+                        print("         You may need POL for gas or check your POLY_PRIVATE_KEY")
+                        return
             except Exception as e:
                 print(f"         Balance/allowance check failed: {e}")
         except Exception as e:
