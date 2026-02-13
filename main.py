@@ -209,7 +209,9 @@ def _kalshi_sign(method: str, path: str) -> dict:
 def _kalshi_auth_get(path: str, timeout: int = 10) -> dict:
     """Authenticated GET to Kalshi API."""
     url = KALSHI_BASE + path
-    headers = _kalshi_sign("GET", path)
+    # Sign with full URL path (Kalshi expects /trade-api/v2/... in signature)
+    full_path = "/trade-api/v2" + path
+    headers = _kalshi_sign("GET", full_path)
     r = _get_session().get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.json()
@@ -218,7 +220,9 @@ def _kalshi_auth_get(path: str, timeout: int = 10) -> dict:
 def _kalshi_auth_post(path: str, body: dict, timeout: int = 10) -> dict:
     """Authenticated POST to Kalshi API."""
     url = KALSHI_BASE + path
-    headers = _kalshi_sign("POST", path)
+    # Sign with full URL path (Kalshi expects /trade-api/v2/... in signature)
+    full_path = "/trade-api/v2" + path
+    headers = _kalshi_sign("POST", full_path)
     r = _get_session().post(url, json=body, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.json()
