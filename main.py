@@ -82,7 +82,7 @@ MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.155"))  # 15.5 p
 # Fees (paper-trade model)
 # -----------------------------
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
-PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "1"))
+PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "3"))
 
 # Toggle fee modeling
 INCLUDE_POLY_FEES = os.getenv("INCLUDE_POLY_FEES", "true").lower() == "true"
@@ -1787,15 +1787,6 @@ def execute_hedge(candidate: HedgeCandidate,
                   logfile: str) -> ExecutionResult:
     """Execute both legs of a hedge and log full execution details."""
     contracts = PAPER_CONTRACTS
-
-    # Polymarket requires minimum $1 notional per order (size * price >= 1.0)
-    poly_price_rounded = round(candidate.poly_price, 2)
-    if poly_price_rounded > 0:
-        min_contracts = math.ceil(1.0 / poly_price_rounded)
-        if contracts < min_contracts:
-            print(f"  [exec] Bumping contracts {contracts:.0f} -> {min_contracts} "
-                  f"(Poly min $1 order at ${poly_price_rounded:.2f})")
-            contracts = float(min_contracts)
 
     # Determine Poly token ID for the leg we're buying
     if candidate.direction_on_poly == "UP":
