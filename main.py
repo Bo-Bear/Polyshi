@@ -2571,8 +2571,12 @@ def main() -> None:
     print(f"\nDone scanning. Wrote logs to: {logfile}")
 
     # Outcome verification: wait for windows to close, then check actual results
-    if logged:
+    # Skip for single-trade diagnostic runs (long wait for little value);
+    # keep for multi-trade sessions where P&L tracking matters.
+    if logged and MAX_TEST_TRADES > 1:
         verify_trade_outcomes(logged, logfile)
+    elif logged:
+        print("(Skipping outcome verification for single-trade run)")
 
     summarize(logged, selected_coins, skip_counts=skip_counts)
 
