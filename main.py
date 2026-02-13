@@ -256,12 +256,6 @@ def _get_poly_clob_client():
     client = ClobClient(**kwargs)
     # Derive L2 HMAC API credentials from wallet signature
     client.set_api_creds(client.create_or_derive_api_creds())
-    # Ensure USDC.e spending allowance is set for the exchange contract
-    try:
-        client.set_allowances()
-        print("  [poly] Token allowances set OK")
-    except Exception as e:
-        print(f"  [poly] Warning: set_allowances failed: {e}")
     _poly_clob_client = client
     return _poly_clob_client
 
