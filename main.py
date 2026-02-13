@@ -63,7 +63,7 @@ MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "30"))  # 30 
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))  # 10%
 
 # Reject prices in extreme ranges where outcome is nearly decided (hedging is risky)
-PRICE_FLOOR = float(os.getenv("PRICE_FLOOR", "0.02"))   # skip legs priced below 2c
+PRICE_FLOOR = float(os.getenv("PRICE_FLOOR", "0.20"))   # skip legs below 20c (5 contracts * $0.20 = $1 Poly min notional)
 PRICE_CEILING = float(os.getenv("PRICE_CEILING", "0.98"))  # skip legs priced above 98c
 
 # Session-level circuit breaker: stop scanning after this many consecutive no-trade scans
