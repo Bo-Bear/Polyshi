@@ -2752,7 +2752,11 @@ def main() -> None:
     # Skip for single-trade diagnostic runs (long wait for little value);
     # keep for multi-trade sessions where P&L tracking matters.
     if logged and MAX_TEST_TRADES > 1:
-        verify_trade_outcomes(logged, logfile)
+        ans = input("\nWait for outcome verification? [y/N] ").strip().lower()
+        if ans == "y":
+            verify_trade_outcomes(logged, logfile)
+        else:
+            print("Skipping outcome verification.")
     elif logged:
         print("(Skipping outcome verification for single-trade run)")
 
