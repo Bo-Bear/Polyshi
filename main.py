@@ -57,18 +57,18 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.0004"))  # 0.04%
 
 # Minimum seconds remaining in the window before we'll trade (need time to fill both legs)
-MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "120"))  # 2 minutes
+MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "30"))  # 30 seconds
 
 # Maximum spread (ask_up + ask_down - 1) we'll accept; wider means unreliable pricing
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))  # 10%
 
 # Reject prices in extreme ranges where outcome is nearly decided (hedging is risky)
-PRICE_FLOOR = float(os.getenv("PRICE_FLOOR", "0.05"))   # skip legs priced below 5c
-PRICE_CEILING = float(os.getenv("PRICE_CEILING", "0.95"))  # skip legs priced above 95c
+PRICE_FLOOR = float(os.getenv("PRICE_FLOOR", "0.02"))   # skip legs priced below 2c
+PRICE_CEILING = float(os.getenv("PRICE_CEILING", "0.98"))  # skip legs priced above 98c
 
 # Session-level circuit breaker: stop scanning after this many consecutive no-trade scans
 # (may indicate stale data or broken feeds)
-MAX_CONSECUTIVE_SKIPS = int(os.getenv("MAX_CONSECUTIVE_SKIPS", "50"))
+MAX_CONSECUTIVE_SKIPS = int(os.getenv("MAX_CONSECUTIVE_SKIPS", "200"))
 
 # Maximum gross cost we'll accept (tighter than 1.0 to leave room for execution slippage)
 MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.995"))
@@ -76,7 +76,7 @@ MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.995"))
 # Maximum allowed divergence between implied probabilities across exchanges.
 # Large divergence signals mismatched strikes (Kalshi uses fixed $, Poly uses relative).
 # If |kalshi_up_prob - poly_up_prob| > this, skip the trade.
-MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.10"))  # 10 percentage points
+MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.15"))  # 15 percentage points
 
 # -----------------------------
 # Fees (paper-trade model)
