@@ -1150,10 +1150,20 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
     now = datetime.now(timezone.utc)
 
     # pick earliest-ending active event matching title prefix
-    all_matches = [e for e in events if isinstance(e.get("title"), str) and e["title"].startswith(prefix)]
+    title_matches = [e for e in events if isinstance(e.get("title"), str) and e["title"].startswith(prefix)]
+
+    # Debug: show what title-matched events exist and why they pass/fail the 15m filter
+    if not title_matches:
+        print(f"    [{coin}] debug: 0 events match title prefix '{prefix}'")
+    else:
+        for e in title_matches[:5]:
+            slug = (e.get("slug") or "")
+            is_15m = _is_15m_poly_event(e)
+            end_raw = e.get("endDate") or e.get("end_date") or ""
+            print(f"    [{coin}] debug: slug={slug} | 15m={is_15m} | end={end_raw} | title={e.get('title', '')[:60]}")
 
     # Filter to 15-minute markets only (skip hourly, daily, etc.)
-    all_matches = [e for e in all_matches if _is_15m_poly_event(e)]
+    all_matches = [e for e in title_matches if _is_15m_poly_event(e)]
 
     # Filter to events whose endDate is still in the future (skip expired windows)
     candidates = []
@@ -1167,6 +1177,8 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
         candidates.append(e)
 
     if not candidates:
+        if all_matches:
+            print(f"    [{coin}] debug: {len(all_matches)} passed 15m filter but {skipped} expired, {len(all_matches) - skipped} had no parseable endDate")
         return None
 
     for e in candidates:
