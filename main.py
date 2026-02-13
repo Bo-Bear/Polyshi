@@ -1804,9 +1804,20 @@ def execute_hedge(candidate: HedgeCandidate,
                        candidate.poly_price, contracts, token_id=poly_token)
     leg1_done = time.monotonic()
 
-    # Execute leg 2: Kalshi
-    leg2 = execute_leg("kalshi", candidate.direction_on_kalshi,
-                       candidate.kalshi_price, contracts, ticker=kalshi_quote.ticker)
+    # Guard: if Poly leg failed, do NOT send Kalshi order (avoid unhedged exposure)
+    if leg1.status in ("error", "rejected") and leg1.filled_contracts == 0:
+        print(f"  [exec] Poly leg failed — skipping Kalshi to avoid unhedged position")
+        leg2 = LegFill(
+            exchange="kalshi", side=candidate.direction_on_kalshi,
+            planned_price=candidate.kalshi_price, actual_price=None,
+            planned_contracts=contracts, filled_contracts=0.0,
+            order_id=None, fill_ts=None,
+            latency_ms=0.0, status="skipped", error="skipped: poly leg failed",
+        )
+    else:
+        # Execute leg 2: Kalshi
+        leg2 = execute_leg("kalshi", candidate.direction_on_kalshi,
+                           candidate.kalshi_price, contracts, ticker=kalshi_quote.ticker)
     total_ms = (time.monotonic() - t_total) * 1000
 
     # Compute slippage
@@ -2270,8 +2281,22 @@ def main() -> None:
 
         # Test Poly CLOB client initialization
         try:
-            _get_poly_clob_client()
+            client = _get_poly_clob_client()
             print("Poly:    CLOB client initialized OK")
+            # Diagnostic: check what the CLOB API sees for balance/allowance
+            try:
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                ba = client.get_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
+                raw_bal = float(ba.get("balance", "0"))
+                raw_allow = float(ba.get("allowance", "0"))
+                print(f"         USDC.e balance:   {raw_bal / 1e6:.4f} (raw: {raw_bal})")
+                print(f"         USDC.e allowance: {raw_allow / 1e6:.4f} (raw: {raw_allow})")
+                if raw_allow < 1e6:
+                    print("         *** ALLOWANCE TOO LOW — need on-chain approve() ***")
+            except Exception as e:
+                print(f"         Balance/allowance check failed: {e}")
         except Exception as e:
             print(f"\n*** LIVE MODE BLOCKED — Poly CLOB client error: {e}")
             return
