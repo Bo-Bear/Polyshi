@@ -76,7 +76,7 @@ MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.995"))
 # Maximum allowed divergence between implied probabilities across exchanges.
 # Large divergence signals mismatched strikes (Kalshi uses fixed $, Poly uses relative).
 # If |kalshi_up_prob - poly_up_prob| > this, skip the trade.
-MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.15"))  # 15 percentage points
+MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.155"))  # 15.5 percentage points
 
 # -----------------------------
 # Fees (paper-trade model)
@@ -1116,19 +1116,32 @@ def poly_clob_get_asks(token_id: str) -> List[Tuple[float, float]]:
 
 
 def _is_15m_poly_event(e: dict) -> bool:
-    """Check if a Polymarket event is a 15-minute window market (not hourly or other)."""
-    # Check slug for "15m" (e.g., "btc-updown-15m-1770702300")
+    """Check if a Polymarket event is a 15-minute window market (not 5m, hourly, etc.)."""
     slug = (e.get("slug") or "").lower()
+    # Explicit reject: 5-minute markets have "5m" in slug
+    if "5m" in slug:
+        return False
+    # Explicit accept: slug contains "15m"
     if "15m" in slug:
         return True
     # Check recurrence field
     rec = (e.get("recurrence") or "").upper()
     if rec in ("15M", "15MIN", "15MINUTES"):
         return True
-    # Check title for a time range with minutes (e.g., "12:45AM-1:00AM") — sub-hourly indicator
+    # Check title for a time range and verify the span is ~15 minutes
     title = e.get("title") or ""
-    if re.search(r'\d{1,2}:\d{2}\s*[AP]M\s*-\s*\d{1,2}:\d{2}\s*[AP]M', title, re.IGNORECASE):
-        return True
+    m = re.search(r'(\d{1,2}):(\d{2})\s*([AP]M)\s*-\s*(\d{1,2}):(\d{2})\s*([AP]M)', title, re.IGNORECASE)
+    if m:
+        def _to_min(h, mm, ap):
+            h = int(h) % 12
+            if ap.upper() == "PM":
+                h += 12
+            return h * 60 + int(mm)
+        start = _to_min(m.group(1), m.group(2), m.group(3))
+        end = _to_min(m.group(4), m.group(5), m.group(6))
+        span = (end - start) % (24 * 60)
+        if 14 <= span <= 16:  # allow 14-16 min to account for rounding
+            return True
     return False
 
 
