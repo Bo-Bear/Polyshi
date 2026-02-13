@@ -2315,6 +2315,24 @@ def main() -> None:
     ensure_dir(LOG_DIR)
     logfile = os.path.join(LOG_DIR, f"arb_logs_market_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl")
 
+    # VPN check: ensure IP is in Ireland
+    try:
+        r = _get_session().get("https://ipinfo.io/json", timeout=10)
+        geo = r.json()
+        country = geo.get("country", "??")
+        city = geo.get("city", "")
+        ip = geo.get("ip", "")
+        if country != "IE":
+            print(f"\n*** VPN CHECK FAILED ***")
+            print(f"  IP: {ip} | Location: {city}, {country}")
+            print(f"  Expected: Ireland (IE)")
+            print(f"  Please activate your VPN and retry.")
+            return
+        print(f"VPN check: OK ({city}, {country} | {ip})")
+    except Exception as e:
+        print(f"\n*** VPN CHECK FAILED — could not determine location: {e}")
+        return
+
     # First choice: execution mode
     EXEC_MODE = prompt_execution_mode()
 
