@@ -45,7 +45,7 @@ except ImportError:
 load_dotenv()
 
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "5"))
-MAX_TEST_TRADES = int(os.getenv("MAX_TEST_TRADES", "5"))
+MAX_TEST_TRADES = int(os.getenv("MAX_TEST_TRADES", "1"))
 WINDOW_ALIGN_TOLERANCE_SECONDS = int(os.getenv("WINDOW_ALIGN_TOLERANCE_SECONDS", "10"))
 MIN_LEG_NOTIONAL = float(os.getenv("MIN_LEG_NOTIONAL", "10"))  # $ minimum liquidity per leg
 USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
@@ -82,7 +82,7 @@ MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.10"))  # 10 perc
 # Fees (paper-trade model)
 # -----------------------------
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
-PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "10"))
+PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "1"))
 
 # Toggle fee modeling
 INCLUDE_POLY_FEES = os.getenv("INCLUDE_POLY_FEES", "true").lower() == "true"
@@ -1855,7 +1855,7 @@ def log_skip(logfile: str, skip_counts: Dict[str, int], scan_num: int,
              coin: str, reason: str, poly: Optional[PolyMarketQuote] = None,
              kalshi: Optional[KalshiMarketQuote] = None,
              remaining_s: Optional[float] = None) -> None:
-    """Log a trade skip with reason and prices."""
+    """Log a trade skip with full context for post-mortem analysis."""
     skip_counts[reason] = skip_counts.get(reason, 0) + 1
     row: dict = {
         "log_type": "skip", "ts": utc_ts(), "scan_num": scan_num,
@@ -1864,9 +1864,22 @@ def log_skip(logfile: str, skip_counts: Dict[str, int], scan_num: int,
     if poly:
         row["poly_up"] = poly.up_price
         row["poly_down"] = poly.down_price
+        row["poly_spread"] = round(poly.up_price + poly.down_price - 1.0, 6)
+        row["poly_slug"] = poly.event_slug
+        row["poly_end_ts"] = poly.end_ts.isoformat()
+        row["poly_up_token"] = poly.up_token_id
+        row["poly_down_token"] = poly.down_token_id
     if kalshi:
         row["kalshi_up"] = kalshi.yes_ask
         row["kalshi_down"] = kalshi.no_ask
+        row["kalshi_spread"] = round(kalshi.yes_ask + kalshi.no_ask - 1.0, 6)
+        row["kalshi_ticker"] = kalshi.ticker
+        row["kalshi_close_ts"] = kalshi.close_ts.isoformat()
+        row["kalshi_strike"] = kalshi.strike
+    if poly and kalshi:
+        row["total_cost_up_down"] = round(poly.up_price + kalshi.no_ask, 6)
+        row["total_cost_down_up"] = round(poly.down_price + kalshi.yes_ask, 6)
+        row["prob_div"] = round(abs((1.0 - kalshi.no_ask) - poly.up_price), 6)
     if remaining_s is not None:
         row["remaining_s"] = round(remaining_s, 1)
     append_log(logfile, row)
@@ -2350,6 +2363,175 @@ def main() -> None:
             row["exec_leg2_actual_price"] = exec_result.leg2.actual_price
             row["exec_leg2_latency_ms"] = round(exec_result.leg2.latency_ms, 1)
 
+            # --- Comprehensive diagnostic snapshot ---
+            # Captures full context for every trade so Claude can reconstruct
+            # the exact state at trade time during post-mortem analysis.
+            diag: dict = {
+                "log_type": "diagnostic",
+                "ts": utc_ts(),
+                "scan_num": scan_i,
+                "exec_mode": EXEC_MODE,
+                # Config snapshot
+                "config": {
+                    "PAPER_CONTRACTS": PAPER_CONTRACTS,
+                    "MAX_TEST_TRADES": MAX_TEST_TRADES,
+                    "MIN_NET_EDGE": MIN_NET_EDGE,
+                    "MAX_TOTAL_COST": MAX_TOTAL_COST,
+                    "MIN_WINDOW_REMAINING_S": MIN_WINDOW_REMAINING_S,
+                    "MAX_SPREAD": MAX_SPREAD,
+                    "PRICE_FLOOR": PRICE_FLOOR,
+                    "PRICE_CEILING": PRICE_CEILING,
+                    "MAX_PROB_DIVERGENCE": MAX_PROB_DIVERGENCE,
+                    "INCLUDE_POLY_FEES": INCLUDE_POLY_FEES,
+                    "INCLUDE_KALSHI_FEES": INCLUDE_KALSHI_FEES,
+                    "USE_VWAP_DEPTH": USE_VWAP_DEPTH,
+                    "MIN_LEG_NOTIONAL": MIN_LEG_NOTIONAL,
+                    "ORDER_TIMEOUT_S": ORDER_TIMEOUT_S,
+                },
+                # Winning trade details (duplicated from row for self-contained diagnostic)
+                "trade": {
+                    "coin": best_global.coin,
+                    "poly_side": best_global.direction_on_poly,
+                    "kalshi_side": best_global.direction_on_kalshi,
+                    "poly_price": best_global.poly_price,
+                    "kalshi_price": best_global.kalshi_price,
+                    "total_cost": best_global.total_cost,
+                    "gross_edge": best_global.gross_edge,
+                    "net_edge": best_global.net_edge,
+                    "poly_fee": best_global.poly_fee,
+                    "kalshi_fee": best_global.kalshi_fee,
+                    "extras": best_global.extras,
+                },
+                # Execution result
+                "execution": {
+                    "both_filled": exec_result.both_filled,
+                    "total_latency_ms": round(exec_result.total_latency_ms, 1),
+                    "slippage_poly": round(exec_result.slippage_poly, 6),
+                    "slippage_kalshi": round(exec_result.slippage_kalshi, 6),
+                    "leg1": {
+                        "exchange": exec_result.leg1.exchange,
+                        "side": exec_result.leg1.side,
+                        "planned_price": exec_result.leg1.planned_price,
+                        "actual_price": exec_result.leg1.actual_price,
+                        "planned_contracts": exec_result.leg1.planned_contracts,
+                        "filled_contracts": exec_result.leg1.filled_contracts,
+                        "order_id": exec_result.leg1.order_id,
+                        "fill_ts": exec_result.leg1.fill_ts,
+                        "latency_ms": round(exec_result.leg1.latency_ms, 1),
+                        "status": exec_result.leg1.status,
+                        "error": exec_result.leg1.error,
+                    },
+                    "leg2": {
+                        "exchange": exec_result.leg2.exchange,
+                        "side": exec_result.leg2.side,
+                        "planned_price": exec_result.leg2.planned_price,
+                        "actual_price": exec_result.leg2.actual_price,
+                        "planned_contracts": exec_result.leg2.planned_contracts,
+                        "filled_contracts": exec_result.leg2.filled_contracts,
+                        "order_id": exec_result.leg2.order_id,
+                        "fill_ts": exec_result.leg2.fill_ts,
+                        "latency_ms": round(exec_result.leg2.latency_ms, 1),
+                        "status": exec_result.leg2.status,
+                        "error": exec_result.leg2.error,
+                    },
+                },
+                # All quotes from every coin this scan (not just the winner)
+                "all_coin_quotes": {},
+                # All hedge combos evaluated (including rejected ones)
+                "all_hedge_combos": [],
+                # Orderbook snapshots
+                "orderbook_snapshots": {},
+                # Timing breakdown
+                "timing": {
+                    "scan_ms": round(scan_ms, 1),
+                    "gamma_ms": round(gamma_ms, 1),
+                    "fetch_ms": round(fetch_ms, 1),
+                    "process_ms": round(process_ms, 1),
+                },
+                # Spot prices
+                "spot_prices": dict(spot_prices),
+                # Skip reasons accumulated so far
+                "skip_counts": dict(skip_counts),
+            }
+
+            # Populate all coin quotes
+            for c in selected_coins:
+                cd_c = coin_data[c]
+                cq: dict = {
+                    "kalshi_ms": round(cd_c["kalshi_ms"], 1),
+                    "poly_ms": round(cd_c["poly_ms"], 1),
+                    "kalshi_err": cd_c["kalshi_err"],
+                    "poly_err": cd_c["poly_err"],
+                }
+                k = cd_c["kalshi"]
+                if k:
+                    cq["kalshi"] = {
+                        "ticker": k.ticker, "title": k.title,
+                        "yes_ask": k.yes_ask, "no_ask": k.no_ask,
+                        "close_ts": k.close_ts.isoformat(),
+                        "strike": k.strike,
+                    }
+                p = cd_c["poly"]
+                if p:
+                    cq["poly"] = {
+                        "event_slug": p.event_slug, "market_slug": p.market_slug,
+                        "title": p.title,
+                        "up_price": p.up_price, "down_price": p.down_price,
+                        "end_ts": p.end_ts.isoformat(),
+                        "up_token_id": p.up_token_id, "down_token_id": p.down_token_id,
+                    }
+                diag["all_coin_quotes"][c] = cq
+
+            # Populate hedge combos for winning coin (both directions)
+            winning_poly = best_global_poly
+            winning_kalshi = best_global_kalshi
+            _, all_combos = best_hedge_for_coin(best_global.coin, winning_poly, winning_kalshi)
+            for combo in all_combos:
+                diag["all_hedge_combos"].append({
+                    "poly_dir": combo.direction_on_poly,
+                    "kalshi_dir": combo.direction_on_kalshi,
+                    "poly_price": combo.poly_price,
+                    "kalshi_price": combo.kalshi_price,
+                    "total_cost": combo.total_cost,
+                    "gross_edge": combo.gross_edge,
+                    "net_edge": combo.net_edge,
+                    "poly_fee": combo.poly_fee,
+                    "kalshi_fee": combo.kalshi_fee,
+                    "extras": combo.extras,
+                    "viable": combo.total_cost < MAX_TOTAL_COST and combo.net_edge >= MIN_NET_EDGE,
+                })
+
+            # Poly orderbook depth snapshots for both sides of traded coin
+            if _poly_ws and winning_poly:
+                for side_label, tid in [("up", winning_poly.up_token_id), ("down", winning_poly.down_token_id)]:
+                    depth = _poly_ws.get_book_depth(tid)
+                    stale = _poly_ws.get_staleness_s(tid)
+                    raw_asks = _poly_ws.get_asks(tid)
+                    diag["orderbook_snapshots"][f"poly_{side_label}"] = {
+                        "token_id": tid,
+                        "depth": depth,
+                        "staleness_s": round(stale, 1) if stale is not None else None,
+                        "ask_levels": [(p, s) for p, s in (raw_asks or [])][:20],  # top 20 levels
+                    }
+
+            # Kalshi orderbook snapshot for traded ticker
+            try:
+                k_ob = kalshi_get_orderbook(winning_kalshi.ticker)
+                k_up_asks, k_down_asks = kalshi_asks_from_orderbook(k_ob)
+                diag["orderbook_snapshots"]["kalshi_up"] = {
+                    "ticker": winning_kalshi.ticker,
+                    "ask_levels": [(p, s) for p, s in k_up_asks[:20]],
+                }
+                diag["orderbook_snapshots"]["kalshi_down"] = {
+                    "ticker": winning_kalshi.ticker,
+                    "ask_levels": [(p, s) for p, s in k_down_asks[:20]],
+                }
+            except Exception as e:
+                diag["orderbook_snapshots"]["kalshi_err"] = str(e)
+
+            append_log(logfile, diag)
+            # --- End diagnostic snapshot ---
+
             append_log(logfile, row)
             logged.append(row)
             consecutive_skips = 0
@@ -2357,6 +2539,12 @@ def main() -> None:
             fill_tag = "FILLED" if exec_result.both_filled else "INCOMPLETE"
             print(f"[{mode_tag}] Logged trade #{len(logged)} -> {best_global.coin} | net {pct(best_global.net_edge)} "
                   f"(gross {pct(best_global.gross_edge)}) | exec: {fill_tag}")
+
+            # Print full diagnostic to console for easy copy-paste
+            print("\n" + "=" * 60)
+            print("  DIAGNOSTIC DUMP (copy everything below for analysis)")
+            print("=" * 60)
+            print(json.dumps(diag, indent=2, default=str))
         else:
             consecutive_skips += 1
             print(f"No viable paper trades found in this scan. ({consecutive_skips} consecutive skips)")
