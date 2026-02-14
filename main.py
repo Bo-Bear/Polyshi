@@ -45,7 +45,7 @@ except ImportError:
 load_dotenv()
 
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "5"))
-MAX_TEST_TRADES = int(os.getenv("MAX_TEST_TRADES", "1"))
+MAX_TEST_TRADES = int(os.getenv("MAX_TEST_TRADES", "5"))
 WINDOW_ALIGN_TOLERANCE_SECONDS = int(os.getenv("WINDOW_ALIGN_TOLERANCE_SECONDS", "10"))
 MIN_LEG_NOTIONAL = float(os.getenv("MIN_LEG_NOTIONAL", "10"))  # $ minimum liquidity per leg
 USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
