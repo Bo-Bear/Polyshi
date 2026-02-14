@@ -496,9 +496,10 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Opt
     cid_hex = condition_id.lower().replace("0x", "").zfill(64)
 
     # ABI encode: redeemPositions(bytes32 _conditionId, uint256[] _amounts)
-    # Layout: selector + conditionId + offset_to_array + array_length + amounts[0] + amounts[1]
-    offset = "0" * 63 + "40"  # offset = 64 bytes (0x40) to start of dynamic array
-    arr_len = "0" * 63 + "2"  # array length = 2
+    # Layout: selector(4B) + conditionId(32B) + offset(32B) + length(32B) + amt[0](32B) + amt[1](32B)
+    # Each word = 32 bytes = 64 hex chars
+    offset = hex(0x40)[2:].zfill(64)    # 64 bytes to dynamic array start
+    arr_len = hex(2)[2:].zfill(64)      # array length = 2
     amt_yes = hex(yes_amount)[2:].zfill(64)
     amt_no = hex(no_amount)[2:].zfill(64)
     calldata = _REDEEM_SELECTOR + cid_hex + offset + arr_len + amt_yes + amt_no
