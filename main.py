@@ -2065,8 +2065,28 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
 # -----------------------------
 # Logging + display
 # -----------------------------
+# Box-drawing helpers
+BOX_W = 60  # inner width for boxes
+
+def _box_top(label: str = "", w: int = BOX_W) -> str:
+    if label:
+        pad = w - len(label) - 2
+        return "┌─ " + label + " " + "─" * max(pad, 0) + "┐"
+    return "┌" + "─" * (w + 2) + "┐"
+
+def _box_mid(w: int = BOX_W) -> str:
+    return "├" + "─" * (w + 2) + "┤"
+
+def _box_bot(w: int = BOX_W) -> str:
+    return "└" + "─" * (w + 2) + "┘"
+
+def _box_line(text: str, w: int = BOX_W) -> str:
+    return "│ " + text.ljust(w) + " │"
+
+
 def print_scan_header(scan_i: int) -> None:
-    print(f"\n--- SCAN #{scan_i} | {utc_ts()} ---")
+    label = f" Scan #{scan_i} "
+    print(f"\n{'—' * 3}{label}{'—' * 3}")
 
 
 def fmt_money(x: float) -> str:
@@ -2089,47 +2109,107 @@ def _parse_price_from_description(desc: str) -> Optional[float]:
     return None
 
 
-def display_market_block(market_type: str, coin: str, kalshi: Optional[KalshiMarketQuote],
-                         poly: Optional[PolyMarketQuote], spot_price: Optional[float] = None) -> None:
-    label = MARKET_TYPE_LABELS.get(market_type, market_type)
-    print(f"\n[MARKET] {coin} ({label})")
+def display_coin_box(coin: str, kalshi: Optional[KalshiMarketQuote],
+                     poly: Optional[PolyMarketQuote],
+                     edge_str: str = "", skip_reason: str = "") -> None:
+    """Compact per-coin box matching the screenshot style."""
+    print(f"\n{_box_top(coin)}")
 
-    # Spot price reference line
-    if spot_price is not None:
-        print(f"  Spot:    ${spot_price:,.2f} (CoinGecko)")
-
+    # Kalshi line
     if kalshi is None:
-        print("  Kalshi:  (no open market found)")
+        print(_box_line("KALSHI:     (no market found)"))
     else:
-        spread = (kalshi.yes_ask + kalshi.no_ask) - 1.0
-        if kalshi.strike is not None:
-            try:
-                strike_val = float(kalshi.strike)
-                strike_txt = f" | Strike: ${strike_val:,.2f}"
-            except (ValueError, TypeError):
-                strike_txt = f" | Strike: {kalshi.strike}"
-        else:
-            strike_txt = " | Strike: UNKNOWN"
-        print(f"  Kalshi:  {kalshi.title}{strike_txt}")
-        print(f"          Up/Down (asks): {fmt_price_pair(kalshi.yes_ask, kalshi.no_ask)}")
-        print(f"          Close (UTC): {kalshi.close_ts.strftime('%H:%M:%S')}")
-        print(f"          Spread (ask sum - 1): {pct(spread)}")
+        # Get depth from orderbook if available
+        k_yes = f"YES=${kalshi.yes_ask:.2f}"
+        k_no = f"NO=${kalshi.no_ask:.2f}"
+        print(_box_line(f"KALSHI:     {k_yes}   {k_no}"))
 
+    # Polymarket line
     if poly is None:
-        print("  Poly:    (no active 15M event found)")
+        print(_box_line("POLYMARKET: (no market found)"))
     else:
-        spread = (poly.up_price + poly.down_price) - 1.0
-        # Try to extract reference price from description
-        desc_price = _parse_price_from_description(poly.description)
-        if desc_price is not None:
-            ref_txt = f"${desc_price:,.2f} (from description)"
-        else:
-            ref_txt = "start-of-window (not in API)"
-        print(f"  Poly:    {poly.title}  ({poly.event_slug}/{poly.market_slug})")
-        print(f"          Up/Down:        {fmt_price_pair(poly.up_price, poly.down_price)}")
-        print(f"          End   (UTC): {poly.end_ts.strftime('%H:%M:%S')}")
-        print(f"          Spread (sum - 1): {pct(spread)}")
-        print(f"          Price to beat: {ref_txt}")
+        p_up = f"UP=${poly.up_price:.2f}"
+        p_dn = f"DOWN=${poly.down_price:.2f}"
+        print(_box_line(f"POLYMARKET: {p_up}   {p_dn}"))
+
+    # Edge line
+    if edge_str:
+        print(_box_line(f"EDGE: {edge_str}"))
+
+    print(_box_bot())
+
+    # Skip reason below box
+    if skip_reason:
+        print(f"  → {skip_reason}")
+
+
+def print_trade_complete(candidate, exec_result, contracts: float,
+                        kalshi_quote=None, poly_quote=None) -> None:
+    """Print a box-drawn trade summary matching the screenshot style."""
+    leg1 = exec_result.leg1
+    leg2 = exec_result.leg2
+    slip_poly = exec_result.slippage_poly
+    slip_kalshi = exec_result.slippage_kalshi
+
+    strategy = f"K_{candidate.direction_on_kalshi}+P_{candidate.direction_on_poly}"
+    actual_p = leg1.actual_price or leg1.planned_price
+    actual_k = leg2.actual_price or leg2.planned_price
+    actual_total = (actual_p or 0) + (actual_k or 0)
+    filled = int(min(leg1.filled_contracts, leg2.filled_contracts))
+    total_outlay = actual_total * filled
+
+    # Compute actual edge after fills + fees
+    actual_gross = 1.0 - actual_total if actual_total else 0
+    actual_net = actual_gross - candidate.poly_fee - candidate.kalshi_fee - candidate.extras
+    total_fees = candidate.poly_fee + candidate.kalshi_fee + candidate.extras
+
+    print(f"\n{_box_top('✓ TRADE COMPLETE')}")
+    print(_box_line(f"Time:     {utc_ts()[:19].replace('T', ' ')}"))
+    print(_box_line(f"Crypto:   {candidate.coin}"))
+    print(_box_line(f"Strategy: {strategy}"))
+    print(_box_line(f"Qty:      {filled} contracts"))
+    print(_box_mid())
+
+    # PRICES SEEN from the original quotes
+    print(_box_line("PRICES SEEN:"))
+    if kalshi_quote:
+        print(_box_line(f"  Kalshi:  YES=${kalshi_quote.yes_ask:.2f}   NO=${kalshi_quote.no_ask:.2f}"))
+    else:
+        k_price = candidate.kalshi_price
+        print(_box_line(f"  Kalshi:  {candidate.direction_on_kalshi}=${k_price:.2f}"))
+    if poly_quote:
+        print(_box_line(f"  Poly:    UP=${poly_quote.up_price:.2f}    DOWN=${poly_quote.down_price:.2f}"))
+    else:
+        p_price = candidate.poly_price
+        print(_box_line(f"  Poly:    {candidate.direction_on_poly}=${p_price:.2f}"))
+    print(_box_mid())
+
+    print(_box_line("FILL PRICES:"))
+    print(_box_line(f"  Kalshi:  ${actual_k:.2f}"))
+    print(_box_line(f"  Poly:    ${actual_p:.2f}"))
+    print(_box_line(f"  Total:   ${actual_total:.2f} x {filled} = ${total_outlay:.2f}"))
+    print(_box_mid())
+
+    print(_box_line("FEES:"))
+    print(_box_line(f"  Kalshi:  ${candidate.kalshi_fee:.2f}"))
+    print(_box_line(f"  Poly:    ${candidate.poly_fee:.2f}"))
+    if candidate.extras > 0:
+        print(_box_line(f"  Gas:     ${candidate.extras:.2f}"))
+    print(_box_line(f"  Total:   ${total_fees:.2f}"))
+    print(_box_mid())
+
+    print(_box_line("EDGE:"))
+    print(_box_line(f"  Expected (scan): {candidate.net_edge * 100:.1f}%"))
+    print(_box_line(f"  Actual (fills+fees): {actual_net * 100:.1f}%"))
+    if abs(slip_poly) > 0.001 or abs(slip_kalshi) > 0.001:
+        print(_box_line(f"  Slippage: Poly {slip_poly:+.3f}, Kalshi {slip_kalshi:+.3f}"))
+    print(_box_mid())
+
+    # Profit estimate: (1 - actual_total - fees) * contracts
+    profit_per = 1.0 - actual_total - total_fees
+    profit_total = profit_per * filled
+    print(_box_line(f"PROFIT: ${profit_total:.2f} ({actual_net * 100:.1f}%)"))
+    print(_box_bot())
 
 
 def append_log(path: str, row: dict) -> None:
@@ -3111,14 +3191,17 @@ def main() -> None:
     # Pre-flight balance check
     balances = check_balances(logfile)
     session_start_total = 0.0
+    print(f"\n{_box_top('BALANCES')}")
     for exch, bal in balances.items():
         if bal < 0:
-            print(f"  [balance] {exch}: UNAVAILABLE")
+            print(_box_line(f"{exch.upper():12s} UNAVAILABLE"))
         else:
-            print(f"  [balance] {exch}: ${bal:.2f}")
+            print(_box_line(f"{exch.upper():12s} ${bal:.2f}"))
             session_start_total += bal
     if session_start_total > 0:
-        print(f"  [balance] Session start total: ${session_start_total:.2f}")
+        print(_box_mid())
+        print(_box_line(f"{'TOTAL':12s} ${session_start_total:.2f}"))
+    print(_box_bot())
 
     crypto_tag_id = poly_get_crypto_tag_id()
     if crypto_tag_id is None:
@@ -3154,9 +3237,6 @@ def main() -> None:
                 filtered.append(e)
 
         poly_events = filtered
-        print(f"  [timing] Poly Gamma: {gamma_ms:.0f}ms ({pre_filter_count} events, {len(poly_events)} after filter)")
-
-
         # Fetch all coin quotes in parallel (Kalshi + Poly CLOB calls concurrently)
         fetch_t0 = time.monotonic()
         coin_data: Dict[str, dict] = {}
@@ -3169,17 +3249,6 @@ def main() -> None:
                 result = future.result()
                 coin_data[result["coin"]] = result
         fetch_ms = (time.monotonic() - fetch_t0) * 1000
-
-        # Per-coin timing breakdown
-        print(f"  [timing] Parallel coin fetch: {fetch_ms:.0f}ms")
-        for coin in selected_coins:
-            cd = coin_data[coin]
-            parts = [f"Kalshi {cd['kalshi_ms']:.0f}ms", f"Poly CLOB {cd['poly_ms']:.0f}ms"]
-            if cd["kalshi_err"]:
-                parts.append(f"ERR kalshi: {cd['kalshi_err'][:80]}")
-            if cd["poly_err"]:
-                parts.append(f"ERR poly: {cd['poly_err'][:80]}")
-            print(f"    {coin}: {' | '.join(parts)}")
 
         best_global: Optional[HedgeCandidate] = None
         best_global_poly: Optional[PolyMarketQuote] = None
@@ -3195,7 +3264,105 @@ def main() -> None:
             kalshi, poly = cd["kalshi"], cd["poly"]
             _scan_poly_quotes[coin] = poly
 
-            display_market_block(market_type, coin, kalshi, poly, spot_price=spot_prices.get(coin))
+            # --- Determine skip reason (if any) before printing ---
+            skip = None  # (reason_key, display_text) or None
+
+            if kalshi is None or poly is None:
+                skip = ("no_kalshi_market" if kalshi is None else "no_poly_market",
+                        f"No {'Kalshi' if kalshi is None else 'Poly'} market found")
+                if cd["kalshi_err"]:
+                    skip = (skip[0], f"Kalshi fetch failed: {cd['kalshi_err'][:60]}")
+                elif cd["poly_err"]:
+                    skip = (skip[0], f"Poly fetch failed: {cd['poly_err'][:60]}")
+
+            remaining_s = 0
+            edge_str = ""
+            best_for_coin = None
+            all_combos = []
+
+            if skip is None:
+                delta_s = abs((kalshi.close_ts - poly.end_ts).total_seconds())
+                now = datetime.now(timezone.utc)
+                remaining_s = (kalshi.close_ts - now).total_seconds()
+
+                if delta_s > WINDOW_ALIGN_TOLERANCE_SECONDS:
+                    skip = ("alignment", f"Window alignment off by {delta_s:.1f}s (max {WINDOW_ALIGN_TOLERANCE_SECONDS}s)")
+                elif remaining_s < MIN_WINDOW_REMAINING_S:
+                    remaining_str = f"{int(remaining_s // 60)}m {int(remaining_s % 60)}s"
+                    skip = ("window_time", f"Only {remaining_str} left (need {MIN_WINDOW_REMAINING_S:.0f}s)")
+
+            if skip is None:
+                kalshi_spread = (kalshi.yes_ask + kalshi.no_ask) - 1.0
+                poly_spread = (poly.up_price + poly.down_price) - 1.0
+                if kalshi_spread > MAX_SPREAD:
+                    skip = ("kalshi_spread", f"Kalshi spread {pct(kalshi_spread)} > {pct(MAX_SPREAD)}")
+                elif poly_spread > MAX_SPREAD:
+                    skip = ("poly_spread", f"Poly spread {pct(poly_spread)} > {pct(MAX_SPREAD)}")
+
+            if skip is None:
+                prices = [poly.up_price, poly.down_price, kalshi.yes_ask, kalshi.no_ask]
+                extreme = [p for p in prices if p < PRICE_FLOOR or p > PRICE_CEILING]
+                if extreme:
+                    skip = ("extreme_price", f"Extreme prices ({', '.join(f'{p:.2f}' for p in extreme)})")
+
+            strike_divergence = None
+            if skip is None and kalshi.strike is not None:
+                try:
+                    strike_val = float(kalshi.strike)
+                    spot = spot_prices.get(coin)
+                    if spot and spot > 0:
+                        strike_divergence = abs(strike_val - spot) / spot
+                        if strike_divergence > MAX_STRIKE_SPOT_DIVERGENCE:
+                            skip = ("strike_spot_divergence",
+                                    f"cross-strike (K${strike_val:,.2f}<>P${spot:,.2f})")
+                except (ValueError, TypeError):
+                    pass
+
+            if skip is None:
+                kalshi_up_prob = 1.0 - kalshi.no_ask
+                poly_up_prob = poly.up_price
+                prob_div = abs(kalshi_up_prob - poly_up_prob)
+                if prob_div > MAX_PROB_DIVERGENCE:
+                    skip = ("prob_divergence",
+                            f"Prob divergence {pct(prob_div)} > {pct(MAX_PROB_DIVERGENCE)}")
+
+            # Compute edge if no safeguard skip
+            if skip is None:
+                best_for_coin, all_combos = best_hedge_for_coin(coin, poly, kalshi)
+                if best_for_coin is None:
+                    # Find best combo to show its edge even when skipping
+                    best_combo_edge = max((c.net_edge for c in all_combos), default=0) if all_combos else 0
+                    best_combo = max(all_combos, key=lambda c: c.net_edge) if all_combos else None
+                    if best_combo:
+                        strategy = f"K_{best_combo.direction_on_kalshi}+P_{best_combo.direction_on_poly}"
+                        edge_str = f"{best_combo.net_edge * 100:+.1f}% via {strategy}"
+                    skip = ("no_viable_edge",
+                            f"Edge too low ({edge_str or 'none'} < {pct(MIN_NET_EDGE)} for {coin})")
+                else:
+                    strategy = f"K_{best_for_coin.direction_on_kalshi}+P_{best_for_coin.direction_on_poly}"
+                    safe_tag = ""
+                    if strike_divergence is not None:
+                        safe_tag = f" *SAFE(cross-strike (K${float(kalshi.strike):,.2f}<P${spot_prices.get(coin, 0):,.2f}))"
+                    edge_str = f"{best_for_coin.net_edge * 100:+.1f}% via {strategy}{safe_tag}"
+
+            # --- Print compact coin box ---
+            # Build edge display for the box
+            box_edge = edge_str
+            if not box_edge and skip and skip[0] not in ("no_kalshi_market", "no_poly_market"):
+                # Show edge from best combo even on skip
+                if all_combos:
+                    bc = max(all_combos, key=lambda c: c.net_edge)
+                    strat = f"K_{bc.direction_on_kalshi}+P_{bc.direction_on_poly}"
+                    box_edge = f"{bc.net_edge * 100:+.1f}% via {strat}"
+
+            skip_text = ""
+            if skip:
+                log_skip(logfile, skip_counts, scan_i, coin, skip[0],
+                         poly=poly, kalshi=kalshi,
+                         remaining_s=remaining_s if remaining_s else None)
+                skip_text = skip[1]
+
+            display_coin_box(coin, kalshi, poly, edge_str=box_edge, skip_reason=skip_text)
 
             # Staleness warning for Poly WS data
             if poly and _poly_ws:
@@ -3207,112 +3374,10 @@ def main() -> None:
                 if dn_stale is not None and dn_stale > 30:
                     stale_parts.append(f"DOWN {dn_stale:.0f}s")
                 if stale_parts:
-                    print(f"  -> Staleness: ⚠ Poly WS data stale ({', '.join(stale_parts)} since last update)")
+                    print(f"  ⚠ WS stale: {', '.join(stale_parts)}")
 
-            if kalshi is None or poly is None:
-                reason = "no_kalshi_market" if kalshi is None else "no_poly_market"
-                log_skip(logfile, skip_counts, scan_i, coin, reason, poly=poly, kalshi=kalshi)
-                if cd["kalshi_err"]:
-                    print(f"  -> Error: Kalshi fetch failed: {cd['kalshi_err']}")
-                if cd["poly_err"]:
-                    print(f"  -> Error: Poly fetch failed: {cd['poly_err']}")
+            if skip:
                 continue
-
-            # Window alignment: require Kalshi close_ts ~ Polymarket end_ts
-            delta_s = abs((kalshi.close_ts - poly.end_ts).total_seconds())
-            now = datetime.now(timezone.utc)
-            remaining_s = (kalshi.close_ts - now).total_seconds()
-            remaining_str = f"{int(remaining_s // 60)}m {int(remaining_s % 60)}s" if remaining_s > 0 else "CLOSED"
-
-            if delta_s > WINDOW_ALIGN_TOLERANCE_SECONDS:
-                print(f"  -> Alignment: ❌ SKIP (Kalshi close vs Poly end differ by {delta_s:.1f}s; tol={WINDOW_ALIGN_TOLERANCE_SECONDS}s)")
-                log_skip(logfile, skip_counts, scan_i, coin, "alignment", poly, kalshi, remaining_s)
-                continue
-            else:
-                print(f"  -> Alignment: ✅ OK (Δ {delta_s:.1f}s) | Window closes in: {remaining_str}")
-
-            # Safeguard: minimum time remaining in window
-            if remaining_s < MIN_WINDOW_REMAINING_S:
-                print(f"  -> Window: ❌ SKIP (only {remaining_str} left; need {MIN_WINDOW_REMAINING_S:.0f}s to fill both legs)")
-                log_skip(logfile, skip_counts, scan_i, coin, "window_time", poly, kalshi, remaining_s)
-                continue
-
-            # Safeguard: spread sanity — reject if either exchange has abnormally wide spread
-            kalshi_spread = (kalshi.yes_ask + kalshi.no_ask) - 1.0
-            poly_spread = (poly.up_price + poly.down_price) - 1.0
-            if kalshi_spread > MAX_SPREAD:
-                print(f"  -> Spread: ❌ SKIP Kalshi spread {pct(kalshi_spread)} exceeds {pct(MAX_SPREAD)} max")
-                log_skip(logfile, skip_counts, scan_i, coin, "kalshi_spread", poly, kalshi, remaining_s)
-                continue
-            if poly_spread > MAX_SPREAD:
-                print(f"  -> Spread: ❌ SKIP Poly spread {pct(poly_spread)} exceeds {pct(MAX_SPREAD)} max")
-                log_skip(logfile, skip_counts, scan_i, coin, "poly_spread", poly, kalshi, remaining_s)
-                continue
-
-            # Safeguard: extreme prices — outcome nearly decided, hedging is unreliable
-            prices = [poly.up_price, poly.down_price, kalshi.yes_ask, kalshi.no_ask]
-            extreme = [p for p in prices if p < PRICE_FLOOR or p > PRICE_CEILING]
-            if extreme:
-                print(f"  -> Price: ❌ SKIP extreme prices detected ({', '.join(f'{p:.3f}' for p in extreme)}); "
-                      f"outside [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}] range")
-                log_skip(logfile, skip_counts, scan_i, coin, "extreme_price", poly, kalshi, remaining_s)
-                continue
-
-            # Safeguard: strike-to-spot alignment — Kalshi fixed strike must be close to
-            # current spot so "above strike" ≈ "up from window start" (Poly's question).
-            # When they differ, both hedge legs can lose simultaneously.
-            strike_divergence = None
-            if kalshi.strike is not None:
-                try:
-                    strike_val = float(kalshi.strike)
-                    spot = spot_prices.get(coin)
-                    if spot and spot > 0:
-                        strike_divergence = abs(strike_val - spot) / spot
-                        if strike_divergence > MAX_STRIKE_SPOT_DIVERGENCE:
-                            print(f"  -> Strike: ❌ SKIP Kalshi strike ${strike_val:,.2f} vs spot ${spot:,.2f} "
-                                  f"(Δ{strike_divergence*100:.3f}% > {MAX_STRIKE_SPOT_DIVERGENCE*100:.2f}% max)")
-                            log_skip(logfile, skip_counts, scan_i, coin, "strike_spot_divergence", poly, kalshi, remaining_s)
-                            continue
-                except (ValueError, TypeError):
-                    pass
-
-            # Safeguard: probability divergence — large disagreement signals mismatched strikes.
-            kalshi_up_prob = 1.0 - kalshi.no_ask
-            poly_up_prob = poly.up_price
-            prob_div = abs(kalshi_up_prob - poly_up_prob)
-            if prob_div > MAX_PROB_DIVERGENCE:
-                print(f"  -> Divergence: ❌ SKIP implied P(up) Kalshi={kalshi_up_prob:.2f} vs Poly={poly_up_prob:.2f} "
-                      f"(Δ{pct(prob_div)} > {pct(MAX_PROB_DIVERGENCE)} max — likely different strikes)")
-                log_skip(logfile, skip_counts, scan_i, coin, "prob_divergence", poly, kalshi, remaining_s)
-                continue
-
-            strike_info = f", strike Δ{strike_divergence*100:.3f}%" if strike_divergence is not None else ""
-            print(f"          Safeguards: ✅ all passed (Δprob {pct(prob_div)}{strike_info}, min edge {pct(MIN_NET_EDGE)}, min window {MIN_WINDOW_REMAINING_S:.0f}s)")
-
-            best_for_coin, all_combos = best_hedge_for_coin(coin, poly, kalshi)
-
-            # Show both hedge combos for visibility
-            print(f"  -> Hedge combos:")
-            for c in all_combos:
-                tag = "VIABLE" if c.total_cost < MAX_TOTAL_COST and c.net_edge >= MIN_NET_EDGE and c.net_edge <= MAX_NET_EDGE else "skip"
-                print(
-                    f"       Poly {c.direction_on_poly} {c.poly_price:.3f} + Kalshi {c.direction_on_kalshi} {c.kalshi_price:.3f} "
-                    f"= {c.total_cost:.3f} | gross {pct(c.gross_edge)} | net {pct(c.net_edge)} "
-                    f"| fees ${c.poly_fee:.4f}+${c.kalshi_fee:.4f} [{tag}]"
-                )
-
-            if best_for_coin is None:
-                print(f"  -> Candidate: ❌ SKIP (no combo with net edge >= {pct(MIN_NET_EDGE)} and cost < {MAX_TOTAL_COST:.3f})")
-                log_skip(logfile, skip_counts, scan_i, coin, "no_viable_edge", poly, kalshi, remaining_s)
-                continue
-
-            print(
-                f"  -> Candidate: ✅ BEST | Poly {best_for_coin.direction_on_poly} {best_for_coin.poly_price:.3f} "
-                f"+ Kalshi {best_for_coin.direction_on_kalshi} {best_for_coin.kalshi_price:.3f} "
-                f"= {best_for_coin.total_cost:.3f} | gross {pct(best_for_coin.gross_edge)} | "
-                f"fees poly {fmt_money(best_for_coin.poly_fee)} + kalshi {fmt_money(best_for_coin.kalshi_fee)} "
-                f"+ extras {fmt_money(best_for_coin.extras)} = net {pct(best_for_coin.net_edge)}"
-            )
 
             if best_global is None or best_for_coin.net_edge > best_global.net_edge:
                 best_global = best_for_coin
@@ -3322,12 +3387,6 @@ def main() -> None:
 
         # Scan timing summary
         scan_ms = (time.monotonic() - scan_t0) * 1000
-        process_ms = scan_ms - gamma_ms - fetch_ms
-        timing_parts = f"Gamma {gamma_ms:.0f}ms + fetch {fetch_ms:.0f}ms + process {process_ms:.0f}ms"
-        if _poly_ws is not None:
-            ws_hits, ws_misses = _poly_ws.get_and_reset_stats()
-            timing_parts += f" | WS cache: {ws_hits} hits, {ws_misses} misses"
-        print(f"\n  [timing] Scan #{scan_i} total: {scan_ms:.0f}ms ({timing_parts})")
         # Log at most one paper trade per scan (the best across BTC/ETH/SOL)
         if best_global is not None and best_global_poly is not None and best_global_kalshi is not None:
             # Gather per-coin latency for the winning coin
@@ -3404,6 +3463,11 @@ def main() -> None:
             row["exec_leg2_status"] = exec_result.leg2.status
             row["exec_leg2_actual_price"] = exec_result.leg2.actual_price
             row["exec_leg2_latency_ms"] = round(exec_result.leg2.latency_ms, 1)
+
+            # Print trade complete box
+            if exec_result.both_filled:
+                print_trade_complete(best_global, exec_result, PAPER_CONTRACTS,
+                                     kalshi_quote=best_global_kalshi, poly_quote=best_global_poly)
 
             # --- Comprehensive diagnostic snapshot ---
             # Captures full context for every trade so Claude can reconstruct
@@ -3579,14 +3643,10 @@ def main() -> None:
             consecutive_skips = 0
             mode_tag = "LIVE" if EXEC_MODE == "live" else "paper"
             fill_tag = "FILLED" if exec_result.both_filled else "INCOMPLETE"
-            print(f"[{mode_tag}] Logged trade #{len(logged)} -> {best_global.coin} | net {pct(best_global.net_edge)} "
-                  f"(gross {pct(best_global.gross_edge)}) | exec: {fill_tag}")
-
-            # Print full diagnostic to console for easy copy-paste
-            print("\n" + "=" * 60)
-            print("  DIAGNOSTIC DUMP (copy everything below for analysis)")
-            print("=" * 60)
-            print(json.dumps(diag, indent=2, default=str))
+            active_str = f"BTC({sum(1 for r in logged if r['coin']=='BTC')} trades), " \
+                         f"ETH({sum(1 for r in logged if r['coin']=='ETH')} trades), " \
+                         f"SOL({sum(1 for r in logged if r['coin']=='SOL')} trades)"
+            print(f"[{mode_tag}] Trade #{len(logged)} {fill_tag} | {active_str}")
 
             # Session drawdown check (live mode only)
             if EXEC_MODE == "live" and session_start_total > 0 and MAX_SESSION_DRAWDOWN > 0:
