@@ -2305,6 +2305,25 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
         for reason, count in sorted(skip_counts.items(), key=lambda x: -x[1]):
             print(f"  {reason}: {count}")
 
+    # Slippage analysis
+    slip_rows = [r for r in log_rows if r.get("exec_slippage_poly") is not None]
+    if slip_rows:
+        poly_slips = [r["exec_slippage_poly"] for r in slip_rows]
+        kalshi_slips = [r["exec_slippage_kalshi"] for r in slip_rows]
+        contracts = int(PAPER_CONTRACTS)
+        print(f"\n--- Slippage Analysis ({len(slip_rows)} trades) ---")
+        print(f"  Poly:    avg {sum(poly_slips)/len(poly_slips):+.4f}/contract"
+              f"  max {max(poly_slips):+.4f}  total ${sum(s * contracts for s in poly_slips):+.2f}")
+        print(f"  Kalshi:  avg {sum(kalshi_slips)/len(kalshi_slips):+.4f}/contract"
+              f"  max {max(kalshi_slips):+.4f}  total ${sum(s * contracts for s in kalshi_slips):+.2f}")
+        total_slip_cost = sum((s1 + s2) * contracts for s1, s2 in zip(poly_slips, kalshi_slips))
+        print(f"  Combined cost:  ${total_slip_cost:+.2f}")
+        # Compare slippage to expected edge
+        edge_eaten = [r for r in slip_rows
+                      if (r["exec_slippage_poly"] + r["exec_slippage_kalshi"]) > r["net_edge"]]
+        if edge_eaten:
+            print(f"  ⚠ {len(edge_eaten)}/{len(slip_rows)} trades had slippage > expected edge")
+
     print(f"\n--- Recent Trades ---")
     for r in log_rows[-5:]:
         pnl_str = ""
