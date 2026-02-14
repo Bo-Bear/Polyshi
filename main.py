@@ -392,12 +392,18 @@ def _approve_poly_contracts():
     return tx_count
 
 
-# NegRiskAdapter address (for redeeming resolved positions)
+# NegRiskAdapter address (kept for reference)
 _POLY_NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 
+# WrappedCollateral (WCOL) — NegRisk markets use this as collateral, not USDC.e directly
+_POLY_WCOL = "0x3A3BD7bb9528E159577F7C2e685CC81A765002E2"
+
 # Function selectors (keccak256 of signature, first 4 bytes)
-_REDEEM_SELECTOR = "0xdbeccb23"   # redeemPositions(bytes32,uint256[])
-_BALANCE_OF_SELECTOR = "0x00fdd58e"  # balanceOf(address,uint256)
+_CTF_REDEEM_SELECTOR = "0x01b7037c"    # redeemPositions(address,bytes32,bytes32,uint256[])
+_WCOL_UNWRAP_SELECTOR = "0x39f47693"   # unwrap(address,uint256)
+_ERC20_BALANCE_SELECTOR = "0x70a08231" # balanceOf(address)
+_PAYOUT_DENOM_SELECTOR = "0xdd34de67"  # payoutDenominator(bytes32)
+_BALANCE_OF_SELECTOR = "0x00fdd58e"    # balanceOf(address,uint256) — ERC-1155
 
 
 def _get_condition_id_for_token(token_id: str) -> Optional[str]:
@@ -478,44 +484,27 @@ def _get_ctf_balances_batch(owner: str, token_ids: List[str], batch_size: int = 
     return results
 
 
-def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Optional[str]:
-    """Call NegRiskAdapter.redeemPositions(bytes32, uint256[]) to convert
-    resolved CTF tokens back to USDC.e. Returns tx hash or None."""
+def _is_condition_resolved(condition_id: str) -> bool:
+    """Check if a condition has been resolved on the CTF contract."""
+    cid_hex = condition_id.lower().replace("0x", "").zfill(64)
+    calldata = _PAYOUT_DENOM_SELECTOR + cid_hex
+    try:
+        result = _polygon_rpc("eth_call", [{"to": _POLY_CTF, "data": calldata}, "latest"])
+        return int(result, 16) > 0 if result else False
+    except Exception:
+        return False
+
+
+def _sign_and_send_tx(addr: str, to: str, calldata: str, nonce: int,
+                      gas_price_int: int, gas: int = 200000) -> Optional[str]:
+    """Sign, send, and wait for a transaction. Returns tx hash or None."""
     from eth_account import Account
 
-    acct = Account.from_key(POLY_PRIVATE_KEY)
-    addr = acct.address
-
-    nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
-    nonce = int(nonce_hex, 16)
-    raw_gas = _polygon_rpc("eth_gasPrice", [])
-    gas_price_int = int(int(raw_gas, 16) * 1.2)
-    gas_price = hex(gas_price_int)
-
-    # Ensure conditionId is bytes32 (0x-prefixed, 64 hex chars)
-    cid_hex = condition_id.lower().replace("0x", "").zfill(64)
-
-    # ABI encode: redeemPositions(bytes32 _conditionId, uint256[] _amounts)
-    # Layout: selector(4B) + conditionId(32B) + offset(32B) + length(32B) + amt[0](32B) + amt[1](32B)
-    # Each word = 32 bytes = 64 hex chars
-    offset = hex(0x40)[2:].zfill(64)    # 64 bytes to dynamic array start
-    arr_len = hex(2)[2:].zfill(64)      # array length = 2
-    amt_yes = hex(yes_amount)[2:].zfill(64)
-    amt_no = hex(no_amount)[2:].zfill(64)
-    calldata = _REDEEM_SELECTOR + cid_hex + offset + arr_len + amt_yes + amt_no
-
-    # Simulate first
-    try:
-        _polygon_rpc("eth_call", [{"from": addr, "to": _POLY_NEG_RISK_ADAPTER, "data": calldata}, "latest"])
-    except Exception as e:
-        print(f"  [redeem] Simulation failed: {e}")
-        return None
-
     tx = {
-        "to": _POLY_NEG_RISK_ADAPTER,
+        "to": to,
         "value": 0,
-        "gas": 200000,
-        "gasPrice": int(gas_price, 16),
+        "gas": gas,
+        "gasPrice": gas_price_int,
         "nonce": nonce,
         "chainId": 137,
         "data": calldata,
@@ -538,6 +527,91 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Opt
         time.sleep(1)
     print(f"  [redeem] Tx not confirmed after 120s: {tx_hash}")
     return None
+
+
+def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Optional[str]:
+    """Two-step redemption for NegRisk CTF tokens:
+    1. Call CTF.redeemPositions(WCOL, 0x0, conditionId, [1,2]) — burns winning tokens, receive WCOL
+    2. Call WCOL.unwrap(addr, amount) — converts WCOL to USDC.e
+    Returns tx hash of the redeem step, or None on failure."""
+    from eth_account import Account
+
+    acct = Account.from_key(POLY_PRIVATE_KEY)
+    addr = acct.address
+
+    # Check if condition is resolved first
+    if not _is_condition_resolved(condition_id):
+        print(f"  [redeem] Market not yet resolved — skipping")
+        return None
+
+    nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
+    nonce = int(nonce_hex, 16)
+    raw_gas = _polygon_rpc("eth_gasPrice", [])
+    gas_price_int = int(int(raw_gas, 16) * 1.2)
+
+    # --- Step 1: CTF.redeemPositions(address collateralToken, bytes32 parentCollectionId,
+    #                                  bytes32 conditionId, uint256[] indexSets) ---
+    cid_hex = condition_id.lower().replace("0x", "").zfill(64)
+    wcol_padded = _POLY_WCOL.lower().replace("0x", "").zfill(64)
+    parent_coll_id = "00" * 32  # bytes32(0) — Polymarket doesn't use nested conditions
+    # Dynamic array offset: 4 static words × 32 bytes = 128 = 0x80
+    array_offset = hex(0x80)[2:].zfill(64)
+    array_length = hex(2)[2:].zfill(64)
+    index_set_1 = hex(1)[2:].zfill(64)  # outcome 0 (YES/UP)
+    index_set_2 = hex(2)[2:].zfill(64)  # outcome 1 (NO/DOWN)
+
+    calldata = (_CTF_REDEEM_SELECTOR + wcol_padded + parent_coll_id +
+                cid_hex + array_offset + array_length + index_set_1 + index_set_2)
+
+    # Simulate step 1
+    try:
+        _polygon_rpc("eth_call", [{"from": addr, "to": _POLY_CTF, "data": calldata}, "latest"])
+    except Exception as e:
+        print(f"  [redeem] Step 1 simulation failed: {e}")
+        return None
+
+    # Send step 1
+    tx_hash = _sign_and_send_tx(addr, _POLY_CTF, calldata, nonce, gas_price_int, gas=300000)
+    if not tx_hash:
+        return None
+    print(f"  [redeem] Step 1 OK (CTF redeem) → tx={tx_hash}")
+
+    # --- Step 2: WCOL.unwrap(address _to, uint256 _amount) ---
+    # Check WCOL balance received
+    time.sleep(1)
+    bal_calldata = _ERC20_BALANCE_SELECTOR + addr.lower().replace("0x", "").zfill(64)
+    try:
+        bal_result = _polygon_rpc("eth_call", [{"to": _POLY_WCOL, "data": bal_calldata}, "latest"])
+        wcol_balance = int(bal_result, 16) if bal_result else 0
+    except Exception:
+        wcol_balance = 0
+
+    if wcol_balance == 0:
+        print(f"  [redeem] No WCOL received (losing side tokens burned for $0)")
+        return tx_hash  # Still a success — tokens were redeemed, just worthless
+
+    print(f"  [redeem] WCOL balance: {wcol_balance} ({wcol_balance / 1e6:.4f} USDC.e equivalent)")
+
+    # Unwrap WCOL to USDC.e
+    to_padded = addr.lower().replace("0x", "").zfill(64)
+    amount_padded = hex(wcol_balance)[2:].zfill(64)
+    unwrap_calldata = _WCOL_UNWRAP_SELECTOR + to_padded + amount_padded
+
+    nonce += 1  # increment nonce for second tx
+    try:
+        _polygon_rpc("eth_call", [{"from": addr, "to": _POLY_WCOL, "data": unwrap_calldata}, "latest"])
+    except Exception as e:
+        print(f"  [redeem] Step 2 simulation failed (unwrap): {e}")
+        print(f"  [redeem] WCOL tokens are still in your wallet — can retry later")
+        return tx_hash
+
+    unwrap_hash = _sign_and_send_tx(addr, _POLY_WCOL, unwrap_calldata, nonce, gas_price_int)
+    if unwrap_hash:
+        print(f"  [redeem] Step 2 OK (unwrap) → tx={unwrap_hash} → +${wcol_balance / 1e6:.4f} USDC.e")
+    else:
+        print(f"  [redeem] Unwrap tx failed — WCOL still in wallet, retry later")
+
+    return tx_hash
 
 
 def redeem_poly_positions(trade_rows: List[dict]) -> int:
