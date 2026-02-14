@@ -54,7 +54,7 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 # Execution safeguards
 # -----------------------------
 # Minimum net edge to accept a trade (protects against slippage/rounding eating thin edges)
-MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.0004"))  # 0.04%
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.03"))  # 3%
 
 # Minimum seconds remaining in the window before we'll trade (need time to fill both legs)
 MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "30"))  # 30 seconds
