@@ -56,6 +56,15 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 # Minimum net edge to accept a trade (must exceed typical slippage of ~3c from fill buffer)
 MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.05"))  # 5%
 
+# Maximum net edge — skip outliers that are likely stale/bad data, not real opportunities
+MAX_NET_EDGE = float(os.getenv("MAX_NET_EDGE", "0.15"))  # 15%
+
+# Session drawdown limit — auto-stop if portfolio drops this much from session start ($)
+MAX_SESSION_DRAWDOWN = float(os.getenv("MAX_SESSION_DRAWDOWN", "10.0"))  # $10
+
+# Maximum seconds to remain unhedged — if Poly fills but Kalshi fails, unwind Poly after this
+MAX_UNHEDGED_SECONDS = float(os.getenv("MAX_UNHEDGED_SECONDS", "5.0"))  # 5 seconds
+
 # Minimum seconds remaining in the window before we'll trade (need time to fill both legs)
 MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "30"))  # 30 seconds
 
@@ -1480,7 +1489,9 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
     )
 
     # Fee-aware viability with execution safeguards:
-    viable = [c for c in cands if c.total_cost < MAX_TOTAL_COST and c.net_edge >= MIN_NET_EDGE]
+    viable = [c for c in cands if c.total_cost < MAX_TOTAL_COST
+              and c.net_edge >= MIN_NET_EDGE
+              and c.net_edge <= MAX_NET_EDGE]  # skip outliers (likely stale data)
     if not viable:
         return None, cands
 
@@ -1756,7 +1767,7 @@ def check_balances(logfile: str) -> Dict[str, float]:
 
 
 def execute_leg(exchange: str, side: str, planned_price: float,
-                contracts: float, **kwargs) -> LegFill:
+                contracts: float, timeout: float = None, **kwargs) -> LegFill:
     """Execute a single leg on an exchange. Returns fill details.
 
     In paper mode, simulates an instant fill at planned_price.
@@ -1781,14 +1792,18 @@ def execute_leg(exchange: str, side: str, planned_price: float,
     status = "error"
     error_msg = None
 
+    leg_timeout = timeout or ORDER_TIMEOUT_S
+
     try:
         if exchange == "kalshi":
             order_id, actual_price, filled, status, error_msg = _execute_kalshi_leg(
-                side, planned_price, contracts, kwargs.get("ticker", "")
+                side, planned_price, contracts, kwargs.get("ticker", ""),
+                timeout=leg_timeout,
             )
         elif exchange == "poly":
             order_id, actual_price, filled, status, error_msg = _execute_poly_leg(
-                side, planned_price, contracts, kwargs.get("token_id", "")
+                side, planned_price, contracts, kwargs.get("token_id", ""),
+                timeout=leg_timeout,
             )
     except Exception as e:
         error_msg = str(e)
@@ -1804,8 +1819,9 @@ def execute_leg(exchange: str, side: str, planned_price: float,
 
 
 def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
-                        ticker: str) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
+                        ticker: str, timeout: float = None) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
     """Place and poll a Kalshi limit order. Returns (order_id, actual_price, filled, status, error)."""
+    fill_timeout = timeout or ORDER_TIMEOUT_S
     kalshi_side = "yes" if side == "UP" else "no"
     # Add buffer to limit price for better fill probability
     buffered = min(planned_price + LIVE_PRICE_BUFFER, 0.99)
@@ -1835,7 +1851,7 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
         return None, None, 0.0, "rejected", f"No order_id in response: {resp}"
 
     # Poll for fill
-    deadline = time.monotonic() + ORDER_TIMEOUT_S
+    deadline = time.monotonic() + fill_timeout
     while time.monotonic() < deadline:
         try:
             poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
@@ -1876,8 +1892,9 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
 
 
 def _execute_poly_leg(side: str, planned_price: float, contracts: float,
-                      token_id: str) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
+                      token_id: str, timeout: float = None) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
     """Place and poll a Polymarket CLOB limit order. Returns (order_id, actual_price, filled, status, error)."""
+    fill_timeout = timeout or ORDER_TIMEOUT_S
     client = _get_poly_clob_client()
 
     # Add buffer to limit price for better fill probability.
@@ -1906,7 +1923,7 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
         return None, None, 0.0, "rejected", f"no orderID in response: {resp}"
 
     # Poll for fill status
-    deadline = time.monotonic() + ORDER_TIMEOUT_S
+    deadline = time.monotonic() + fill_timeout
     while time.monotonic() < deadline:
         try:
             o = client.get_order(order_id)
@@ -1972,9 +1989,11 @@ def execute_hedge(candidate: HedgeCandidate,
             latency_ms=0.0, status="skipped", error="skipped: poly leg failed",
         )
     else:
-        # Execute leg 2: Kalshi
+        # Execute leg 2: Kalshi (use shorter timeout to limit unhedged exposure)
         leg2 = execute_leg("kalshi", candidate.direction_on_kalshi,
-                           candidate.kalshi_price, contracts, ticker=kalshi_quote.ticker)
+                           candidate.kalshi_price, contracts,
+                           timeout=MAX_UNHEDGED_SECONDS,
+                           ticker=kalshi_quote.ticker)
     total_ms = (time.monotonic() - t_total) * 1000
 
     # Compute slippage
@@ -2410,6 +2429,7 @@ def main() -> None:
     print(f"Contracts:  {int(PAPER_CONTRACTS)}")
     print(f"\nExecution safeguards:")
     print(f"  Min net edge:       {pct(MIN_NET_EDGE)}")
+    print(f"  Max net edge:       {pct(MAX_NET_EDGE)} (stale data filter)")
     print(f"  Max total cost:     {MAX_TOTAL_COST:.3f}")
     print(f"  Min window time:    {MIN_WINDOW_REMAINING_S:.0f}s")
     print(f"  Max spread:         {pct(MAX_SPREAD)}")
@@ -2417,6 +2437,8 @@ def main() -> None:
     print(f"  Max prob diverge:   {pct(MAX_PROB_DIVERGENCE)} (strike mismatch detector)")
     print(f"  Max strike-spot Δ:  {MAX_STRIKE_SPOT_DIVERGENCE*100:.2f}% (hedge validity guard)")
     print(f"  Fill price buffer:  ${LIVE_PRICE_BUFFER:.2f} (limit order cushion)")
+    print(f"  Session drawdown:   ${MAX_SESSION_DRAWDOWN:.2f} max loss before auto-stop")
+    print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s (forced unwind)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
 
     # Start Polymarket CLOB WebSocket for real-time orderbook data
@@ -2513,11 +2535,15 @@ def main() -> None:
 
     # Pre-flight balance check
     balances = check_balances(logfile)
+    session_start_total = 0.0
     for exch, bal in balances.items():
         if bal < 0:
             print(f"  [balance] {exch}: UNAVAILABLE")
         else:
             print(f"  [balance] {exch}: ${bal:.2f}")
+            session_start_total += bal
+    if session_start_total > 0:
+        print(f"  [balance] Session start total: ${session_start_total:.2f}")
 
     crypto_tag_id = poly_get_crypto_tag_id()
     if crypto_tag_id is None:
@@ -2693,7 +2719,7 @@ def main() -> None:
             # Show both hedge combos for visibility
             print(f"  -> Hedge combos:")
             for c in all_combos:
-                tag = "VIABLE" if c.total_cost < MAX_TOTAL_COST and c.net_edge >= MIN_NET_EDGE else "skip"
+                tag = "VIABLE" if c.total_cost < MAX_TOTAL_COST and c.net_edge >= MIN_NET_EDGE and c.net_edge <= MAX_NET_EDGE else "skip"
                 print(
                     f"       Poly {c.direction_on_poly} {c.poly_price:.3f} + Kalshi {c.direction_on_kalshi} {c.kalshi_price:.3f} "
                     f"= {c.total_cost:.3f} | gross {pct(c.gross_edge)} | net {pct(c.net_edge)} "
@@ -2937,7 +2963,7 @@ def main() -> None:
                     "poly_fee": combo.poly_fee,
                     "kalshi_fee": combo.kalshi_fee,
                     "extras": combo.extras,
-                    "viable": combo.total_cost < MAX_TOTAL_COST and combo.net_edge >= MIN_NET_EDGE,
+                    "viable": combo.total_cost < MAX_TOTAL_COST and combo.net_edge >= MIN_NET_EDGE and combo.net_edge <= MAX_NET_EDGE,
                 })
 
             # Poly orderbook depth snapshots for both sides of traded coin
@@ -2984,6 +3010,21 @@ def main() -> None:
             print("  DIAGNOSTIC DUMP (copy everything below for analysis)")
             print("=" * 60)
             print(json.dumps(diag, indent=2, default=str))
+
+            # Session drawdown check (live mode only)
+            if EXEC_MODE == "live" and session_start_total > 0 and MAX_SESSION_DRAWDOWN > 0:
+                try:
+                    current_bal = check_balances(logfile)
+                    current_total = sum(v for v in current_bal.values() if v >= 0)
+                    drawdown = session_start_total - current_total
+                    print(f"\n  [drawdown] Session P&L: ${-drawdown:+.2f} "
+                          f"(start: ${session_start_total:.2f}, now: ${current_total:.2f})")
+                    if drawdown >= MAX_SESSION_DRAWDOWN:
+                        print(f"\n*** DRAWDOWN LIMIT HIT: ${drawdown:.2f} >= ${MAX_SESSION_DRAWDOWN:.2f} — stopping session ***")
+                        break
+                except Exception as e:
+                    print(f"  [drawdown] Balance check failed: {e}")
+
         else:
             consecutive_skips += 1
             print(f"No viable paper trades found in this scan. ({consecutive_skips} consecutive skips)")
