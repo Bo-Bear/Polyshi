@@ -78,6 +78,11 @@ MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.995"))
 # If |kalshi_up_prob - poly_up_prob| > this, skip the trade.
 MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.155"))  # 15.5 percentage points
 
+# Maximum allowed divergence between Kalshi strike and spot price (as a fraction).
+# Kalshi uses a fixed $ strike; Polymarket uses "up/down from window start."
+# When strike ≠ spot, both hedge legs can lose. 0.15% = ~$100 on BTC.
+MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.0015"))
+
 # -----------------------------
 # Fees (paper-trade model)
 # -----------------------------
@@ -2356,6 +2361,7 @@ def main() -> None:
     print(f"  Max spread:         {pct(MAX_SPREAD)}")
     print(f"  Price range:        [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}]")
     print(f"  Max prob diverge:   {pct(MAX_PROB_DIVERGENCE)} (strike mismatch detector)")
+    print(f"  Max strike-spot Δ:  {MAX_STRIKE_SPOT_DIVERGENCE*100:.2f}% (hedge validity guard)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
 
     # Start Polymarket CLOB WebSocket for real-time orderbook data
@@ -2596,6 +2602,24 @@ def main() -> None:
                 log_skip(logfile, skip_counts, scan_i, coin, "extreme_price", poly, kalshi, remaining_s)
                 continue
 
+            # Safeguard: strike-to-spot alignment — Kalshi fixed strike must be close to
+            # current spot so "above strike" ≈ "up from window start" (Poly's question).
+            # When they differ, both hedge legs can lose simultaneously.
+            strike_divergence = None
+            if kalshi.strike is not None:
+                try:
+                    strike_val = float(kalshi.strike)
+                    spot = spot_prices.get(coin)
+                    if spot and spot > 0:
+                        strike_divergence = abs(strike_val - spot) / spot
+                        if strike_divergence > MAX_STRIKE_SPOT_DIVERGENCE:
+                            print(f"  -> Strike: ❌ SKIP Kalshi strike ${strike_val:,.2f} vs spot ${spot:,.2f} "
+                                  f"(Δ{strike_divergence*100:.3f}% > {MAX_STRIKE_SPOT_DIVERGENCE*100:.2f}% max)")
+                            log_skip(logfile, skip_counts, scan_i, coin, "strike_spot_divergence", poly, kalshi, remaining_s)
+                            continue
+                except (ValueError, TypeError):
+                    pass
+
             # Safeguard: probability divergence — large disagreement signals mismatched strikes.
             kalshi_up_prob = 1.0 - kalshi.no_ask
             poly_up_prob = poly.up_price
@@ -2606,7 +2630,8 @@ def main() -> None:
                 log_skip(logfile, skip_counts, scan_i, coin, "prob_divergence", poly, kalshi, remaining_s)
                 continue
 
-            print(f"          Safeguards: ✅ all passed (Δprob {pct(prob_div)}, min edge {pct(MIN_NET_EDGE)}, min window {MIN_WINDOW_REMAINING_S:.0f}s)")
+            strike_info = f", strike Δ{strike_divergence*100:.3f}%" if strike_divergence is not None else ""
+            print(f"          Safeguards: ✅ all passed (Δprob {pct(prob_div)}{strike_info}, min edge {pct(MIN_NET_EDGE)}, min window {MIN_WINDOW_REMAINING_S:.0f}s)")
 
             best_for_coin, all_combos = best_hedge_for_coin(coin, poly, kalshi)
 
@@ -2680,6 +2705,7 @@ def main() -> None:
                 "window_close_ts": best_global_kalshi.close_ts.isoformat(),
                 "spot_price": spot_prices.get(best_global.coin),
                 "kalshi_strike": best_global_kalshi.strike,
+                "strike_spot_divergence_pct": round(abs(float(best_global_kalshi.strike) - spot_prices.get(best_global.coin, 0)) / spot_prices.get(best_global.coin, 1) * 100, 4) if best_global_kalshi.strike else None,
                 # Poly book depth snapshot
                 "poly_book_levels": poly_depth["levels"] if poly_depth else None,
                 "poly_book_size": poly_depth["total_size"] if poly_depth else None,
