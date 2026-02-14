@@ -1871,16 +1871,6 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
     # pick earliest-ending active event matching title prefix
     title_matches = [e for e in events if isinstance(e.get("title"), str) and e["title"].startswith(prefix)]
 
-    # Debug: show what title-matched events exist and why they pass/fail the 15m filter
-    if not title_matches:
-        print(f"    [{coin}] debug: 0 events match title prefix '{prefix}'")
-    else:
-        for e in title_matches[:5]:
-            slug = (e.get("slug") or "")
-            is_15m = _is_15m_poly_event(e)
-            end_raw = e.get("endDate") or e.get("end_date") or ""
-            print(f"    [{coin}] debug: slug={slug} | 15m={is_15m} | end={end_raw} | title={e.get('title', '')[:60]}")
-
     # Filter to 15-minute markets only (skip hourly, daily, etc.)
     all_matches = [e for e in title_matches if _is_15m_poly_event(e)]
 
