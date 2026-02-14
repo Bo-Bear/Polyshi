@@ -529,11 +529,12 @@ def _sign_and_send_tx(addr: str, to: str, calldata: str, nonce: int,
     return None
 
 
-def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Optional[str]:
+def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
+                      nonce: int = -1) -> Tuple[Optional[str], int]:
     """Two-step redemption for NegRisk CTF tokens:
     1. Call CTF.redeemPositions(WCOL, 0x0, conditionId, [1,2]) — burns winning tokens, receive WCOL
     2. Call WCOL.unwrap(addr, amount) — converts WCOL to USDC.e
-    Returns tx hash of the redeem step, or None on failure."""
+    Returns (tx_hash_or_None, nonces_consumed)."""
     from eth_account import Account
 
     acct = Account.from_key(POLY_PRIVATE_KEY)
@@ -542,12 +543,16 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Opt
     # Check if condition is resolved first
     if not _is_condition_resolved(condition_id):
         print(f"  [redeem] Market not yet resolved — skipping")
-        return None
+        return None, 0
 
-    nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
-    nonce = int(nonce_hex, 16)
+    if nonce < 0:
+        nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
+        nonce = int(nonce_hex, 16)
     raw_gas = _polygon_rpc("eth_gasPrice", [])
     gas_price_int = int(int(raw_gas, 16) * 1.2)
+    # Cap gas price to avoid "tx fee exceeds cap" (max ~0.1 POL per tx)
+    max_gas_price = int(300e9)  # 300 gwei
+    gas_price_int = min(gas_price_int, max_gas_price)
 
     # --- Step 1: CTF.redeemPositions(address collateralToken, bytes32 parentCollectionId,
     #                                  bytes32 conditionId, uint256[] indexSets) ---
@@ -568,12 +573,13 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Opt
         _polygon_rpc("eth_call", [{"from": addr, "to": _POLY_CTF, "data": calldata}, "latest"])
     except Exception as e:
         print(f"  [redeem] Step 1 simulation failed: {e}")
-        return None
+        return None, 0
 
     # Send step 1
     tx_hash = _sign_and_send_tx(addr, _POLY_CTF, calldata, nonce, gas_price_int, gas=300000)
     if not tx_hash:
-        return None
+        return None, 0
+    nonces_used = 1
     print(f"  [redeem] Step 1 OK (CTF redeem) → tx={tx_hash}")
 
     # --- Step 2: WCOL.unwrap(address _to, uint256 _amount) ---
@@ -588,7 +594,7 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Opt
 
     if wcol_balance == 0:
         print(f"  [redeem] No WCOL received (losing side tokens burned for $0)")
-        return tx_hash  # Still a success — tokens were redeemed, just worthless
+        return tx_hash, nonces_used  # Still a success — tokens were redeemed, just worthless
 
     print(f"  [redeem] WCOL balance: {wcol_balance} ({wcol_balance / 1e6:.4f} USDC.e equivalent)")
 
@@ -597,21 +603,21 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Opt
     amount_padded = hex(wcol_balance)[2:].zfill(64)
     unwrap_calldata = _WCOL_UNWRAP_SELECTOR + to_padded + amount_padded
 
-    nonce += 1  # increment nonce for second tx
     try:
         _polygon_rpc("eth_call", [{"from": addr, "to": _POLY_WCOL, "data": unwrap_calldata}, "latest"])
     except Exception as e:
         print(f"  [redeem] Step 2 simulation failed (unwrap): {e}")
         print(f"  [redeem] WCOL tokens are still in your wallet — can retry later")
-        return tx_hash
+        return tx_hash, nonces_used
 
-    unwrap_hash = _sign_and_send_tx(addr, _POLY_WCOL, unwrap_calldata, nonce, gas_price_int)
+    unwrap_hash = _sign_and_send_tx(addr, _POLY_WCOL, unwrap_calldata, nonce + 1, gas_price_int)
     if unwrap_hash:
         print(f"  [redeem] Step 2 OK (unwrap) → tx={unwrap_hash} → +${wcol_balance / 1e6:.4f} USDC.e")
+        nonces_used += 1
     else:
         print(f"  [redeem] Unwrap tx failed — WCOL still in wallet, retry later")
 
-    return tx_hash
+    return tx_hash, nonces_used
 
 
 def redeem_poly_positions(trade_rows: List[dict]) -> int:
@@ -662,7 +668,7 @@ def redeem_poly_positions(trade_rows: List[dict]) -> int:
             continue
 
         print(f"  [redeem] Found {up_bal} UP + {down_bal} DOWN tokens, conditionId={condition_id[:16]}...")
-        tx_hash = _redeem_positions(condition_id, up_bal, down_bal)
+        tx_hash, _ = _redeem_positions(condition_id, up_bal, down_bal)
         if tx_hash:
             print(f"  [redeem] Redeemed! tx={tx_hash}")
             redeemed += 1
@@ -1176,7 +1182,12 @@ def redeem_all_old_positions() -> int:
         print(f"\n  [redeem] Done: nothing to redeem")
         return 0
 
-    # Redeem each non-zero position (paced to avoid rate limits)
+    # Fetch nonce once and manage it across all redemptions
+    nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
+    nonce = int(nonce_hex, 16)
+    print(f"  [redeem] Starting nonce: {nonce}")
+
+    # Redeem each non-zero position
     redeemed = 0
     errors = 0
     for i, (up_tid, down_tid, up_bal, down_bal) in enumerate(non_zero):
@@ -1190,11 +1201,11 @@ def redeem_all_old_positions() -> int:
 
         print(f"  [redeem] [{i+1}/{len(non_zero)}] Market {condition_id[:16]}...: {up_bal} UP + {down_bal} DOWN tokens")
         try:
-            time.sleep(3)  # pace before each redemption txn
-            tx_hash = _redeem_positions(condition_id, up_bal, down_bal)
+            tx_hash, nonces_used = _redeem_positions(condition_id, up_bal, down_bal, nonce=nonce)
             if tx_hash:
                 print(f"  [redeem] ✓ Redeemed → tx={tx_hash}")
                 redeemed += 1
+                nonce += nonces_used
             else:
                 print(f"  [redeem] ✗ Redemption failed")
                 errors += 1
