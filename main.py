@@ -53,8 +53,8 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 # -----------------------------
 # Execution safeguards
 # -----------------------------
-# Minimum net edge to accept a trade (protects against slippage/rounding eating thin edges)
-MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.03"))  # 3%
+# Minimum net edge to accept a trade (must exceed typical slippage of ~3c from fill buffer)
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.05"))  # 5%
 
 # Minimum seconds remaining in the window before we'll trade (need time to fill both legs)
 MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "30"))  # 30 seconds
@@ -1667,10 +1667,18 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
         depth_str = ""
         if r.get("poly_book_levels") is not None:
             depth_str = f" | depth={r['poly_book_levels']}lvl/${r.get('poly_book_notional_usd', 0):.0f}$"
+        # Show actual fill prices if slippage occurred
+        slip_str = ""
+        actual_p = r.get("exec_leg1_actual_price")
+        actual_k = r.get("exec_leg2_actual_price")
+        if actual_p is not None and actual_k is not None:
+            actual_total = actual_p + actual_k
+            if abs(actual_total - r['total_cost']) > 0.001:
+                slip_str = f" (actual {actual_total:.3f})"
         print(
             f"  [{r['ts']}] {r['coin']} | Poly {r['poly_side']} {r['poly_price']:.3f} "
             f"+ Kalshi {r['kalshi_side']} {r['kalshi_price']:.3f} "
-            f"= total {r['total_cost']:.3f} | net {pct(r['net_edge'])} (gross {pct(r['gross_edge'])}) "
+            f"= total {r['total_cost']:.3f}{slip_str} | net {pct(r['net_edge'])} (gross {pct(r['gross_edge'])}) "
             f"| fees {r['poly_fee']:.4f}+{r['kalshi_fee']:.4f}+{r['extras']:.4f}"
             f"{depth_str}{pnl_str}"
         )
@@ -2323,7 +2331,13 @@ def verify_trade_outcomes(trades: List[dict], logfile: str) -> List[dict]:
                          (row["kalshi_side"] == "DOWN" and not price_went_up)
 
             payout = (1.0 if poly_won else 0.0) + (1.0 if kalshi_won else 0.0)
-            cost = row["total_cost"]
+            # Use actual fill prices for live trades (accounts for slippage)
+            actual_poly = row.get("exec_leg1_actual_price")
+            actual_kalshi = row.get("exec_leg2_actual_price")
+            if actual_poly is not None and actual_kalshi is not None:
+                cost = actual_poly + actual_kalshi
+            else:
+                cost = row["total_cost"]
             fees_pc = (row["poly_fee"] + row["kalshi_fee"] + row["extras"]) / PAPER_CONTRACTS
             actual_pnl_pc = payout - cost - fees_pc
             actual_pnl_total = actual_pnl_pc * PAPER_CONTRACTS
