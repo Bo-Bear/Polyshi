@@ -1230,7 +1230,54 @@ def redeem_all_old_positions() -> int:
         print(f"\n  [redeem] Done: nothing to redeem")
         return 0
 
-    # Fetch nonce using "pending" to skip past any stuck mempool txs
+    # Detect and clear stuck pending nonces
+    # Nonces are sequential — if nonce 52 is stuck, nonces 53+ can't mine
+    confirmed_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
+    confirmed_nonce = int(confirmed_hex, 16)
+    pending_hex = _polygon_rpc("eth_getTransactionCount", [addr, "pending"])
+    pending_nonce = int(pending_hex, 16)
+
+    if pending_nonce > confirmed_nonce:
+        stuck_count = pending_nonce - confirmed_nonce
+        print(f"  [redeem] ⚠ {stuck_count} stuck pending tx(s) blocking nonces {confirmed_nonce}-{pending_nonce - 1}")
+        print(f"  [redeem] Clearing stuck nonces with self-transfers...")
+        raw_gas = _polygon_rpc("eth_gasPrice", [])
+        clear_gas = int(int(raw_gas, 16) * 3)  # 3x gas to replace stuck txs
+
+        from eth_account import Account as _Acct
+        for stuck_n in range(confirmed_nonce, pending_nonce):
+            # Send 0-value tx to self to clear the nonce
+            tx = {
+                "to": addr,
+                "value": 0,
+                "gas": 21000,
+                "gasPrice": clear_gas,
+                "nonce": stuck_n,
+                "chainId": 137,
+                "data": "0x",
+            }
+            signed = _Acct.sign_transaction(tx, POLY_PRIVATE_KEY)
+            raw = signed.raw_transaction.hex()
+            if not raw.startswith("0x"):
+                raw = "0x" + raw
+            try:
+                tx_hash = _polygon_rpc("eth_sendRawTransaction", [raw])
+                print(f"  [redeem] Clearing nonce {stuck_n} → {tx_hash[:20]}...")
+            except Exception as e:
+                print(f"  [redeem] Nonce {stuck_n} clear failed: {e}")
+
+        # Wait for clearance txs to confirm
+        print(f"  [redeem] Waiting for stuck nonces to clear...")
+        for _ in range(60):
+            new_confirmed = int(_polygon_rpc("eth_getTransactionCount", [addr, "latest"]), 16)
+            if new_confirmed >= pending_nonce:
+                print(f"  [redeem] ✓ All stuck nonces cleared (confirmed: {new_confirmed})")
+                break
+            time.sleep(2)
+        else:
+            print(f"  [redeem] ⚠ Some nonces still pending — proceeding anyway")
+
+    # Fetch fresh nonce after clearing
     nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "pending"])
     nonce = int(nonce_hex, 16)
     print(f"  [redeem] Starting nonce: {nonce} (pending)")
