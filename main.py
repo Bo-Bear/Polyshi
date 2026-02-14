@@ -384,6 +384,161 @@ def _approve_poly_contracts():
     return tx_count
 
 
+# NegRiskAdapter address (for redeeming resolved positions)
+_POLY_NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+
+# Function selectors (keccak256 of signature, first 4 bytes)
+_REDEEM_SELECTOR = "0xdbeccb23"   # redeemPositions(bytes32,uint256[])
+_BALANCE_OF_SELECTOR = "0x00fdd58e"  # balanceOf(address,uint256)
+
+
+def _get_condition_id_for_token(token_id: str) -> Optional[str]:
+    """Get conditionId for a Polymarket token_id via Gamma API."""
+    try:
+        url = f"https://gamma-api.polymarket.com/markets"
+        r = _get_session().get(url, params={"clob_token_ids": str(token_id)}, timeout=10)
+        r.raise_for_status()
+        markets = r.json()
+        if markets and len(markets) > 0:
+            cid = markets[0].get("condition_id") or markets[0].get("conditionId")
+            if cid:
+                return cid
+    except Exception as e:
+        print(f"  [redeem] Failed to get conditionId for token {str(token_id)[:20]}...: {e}")
+    return None
+
+
+def _get_ctf_balance(owner: str, token_id: str) -> int:
+    """Check ERC-1155 CTF token balance on-chain. Returns raw balance."""
+    owner_padded = owner.lower().replace("0x", "").zfill(64)
+    id_hex = hex(int(token_id))[2:].zfill(64)
+    calldata = _BALANCE_OF_SELECTOR + owner_padded + id_hex
+    try:
+        result = _polygon_rpc("eth_call", [{"to": _POLY_CTF, "data": calldata}, "latest"])
+        return int(result, 16) if result else 0
+    except Exception:
+        return 0
+
+
+def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Optional[str]:
+    """Call NegRiskAdapter.redeemPositions(bytes32, uint256[]) to convert
+    resolved CTF tokens back to USDC.e. Returns tx hash or None."""
+    from eth_account import Account
+
+    acct = Account.from_key(POLY_PRIVATE_KEY)
+    addr = acct.address
+
+    nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
+    nonce = int(nonce_hex, 16)
+    raw_gas = _polygon_rpc("eth_gasPrice", [])
+    gas_price_int = int(int(raw_gas, 16) * 1.2)
+    gas_price = hex(gas_price_int)
+
+    # Ensure conditionId is bytes32 (0x-prefixed, 64 hex chars)
+    cid_hex = condition_id.lower().replace("0x", "").zfill(64)
+
+    # ABI encode: redeemPositions(bytes32 _conditionId, uint256[] _amounts)
+    # Layout: selector + conditionId + offset_to_array + array_length + amounts[0] + amounts[1]
+    offset = "0" * 63 + "40"  # offset = 64 bytes (0x40) to start of dynamic array
+    arr_len = "0" * 63 + "2"  # array length = 2
+    amt_yes = hex(yes_amount)[2:].zfill(64)
+    amt_no = hex(no_amount)[2:].zfill(64)
+    calldata = _REDEEM_SELECTOR + cid_hex + offset + arr_len + amt_yes + amt_no
+
+    # Simulate first
+    try:
+        _polygon_rpc("eth_call", [{"from": addr, "to": _POLY_NEG_RISK_ADAPTER, "data": calldata}, "latest"])
+    except Exception as e:
+        print(f"  [redeem] Simulation failed: {e}")
+        return None
+
+    tx = {
+        "to": _POLY_NEG_RISK_ADAPTER,
+        "value": 0,
+        "gas": 200000,
+        "gasPrice": int(gas_price, 16),
+        "nonce": nonce,
+        "chainId": 137,
+        "data": calldata,
+    }
+    signed = Account.sign_transaction(tx, POLY_PRIVATE_KEY)
+    raw = signed.raw_transaction.hex()
+    if not raw.startswith("0x"):
+        raw = "0x" + raw
+    tx_hash = _polygon_rpc("eth_sendRawTransaction", [raw])
+
+    # Poll for receipt (up to 120s)
+    for _ in range(120):
+        receipt = _polygon_rpc("eth_getTransactionReceipt", [tx_hash])
+        if receipt is not None:
+            status = int(receipt.get("status", "0x0"), 16)
+            if status != 1:
+                print(f"  [redeem] Tx reverted: {tx_hash}")
+                return None
+            return tx_hash
+        time.sleep(1)
+    print(f"  [redeem] Tx not confirmed after 120s: {tx_hash}")
+    return None
+
+
+def redeem_poly_positions(trade_rows: List[dict]) -> int:
+    """Redeem resolved Polymarket positions from completed trades.
+    Looks up conditionId, checks token balances, and calls NegRiskAdapter.
+    Returns number of successful redemptions."""
+    from eth_account import Account
+
+    if POLY_SIGNATURE_TYPE != 0:
+        return 0  # Only EOA mode needs manual redemption
+
+    if not POLY_PRIVATE_KEY:
+        return 0
+
+    acct = Account.from_key(POLY_PRIVATE_KEY)
+    addr = acct.address
+
+    # Collect unique (up_token_id, down_token_id) pairs from trades
+    seen_tokens: set = set()
+    token_pairs: List[Tuple[str, str]] = []
+    for row in trade_rows:
+        up_tid = row.get("poly_up_token_id") or ""
+        down_tid = row.get("poly_down_token_id") or ""
+        if up_tid and down_tid and up_tid not in seen_tokens:
+            seen_tokens.add(up_tid)
+            token_pairs.append((up_tid, down_tid))
+
+    if not token_pairs:
+        return 0
+
+    print(f"\n  [redeem] Checking {len(token_pairs)} market(s) for unredeemed positions...")
+    redeemed = 0
+
+    for up_tid, down_tid in token_pairs:
+        # Check balances
+        up_bal = _get_ctf_balance(addr, up_tid)
+        down_bal = _get_ctf_balance(addr, down_tid)
+
+        if up_bal == 0 and down_bal == 0:
+            continue  # No tokens to redeem
+
+        # Get conditionId from Gamma API
+        condition_id = _get_condition_id_for_token(up_tid)
+        if not condition_id:
+            condition_id = _get_condition_id_for_token(down_tid)
+        if not condition_id:
+            print(f"  [redeem] Could not find conditionId — skipping")
+            continue
+
+        print(f"  [redeem] Found {up_bal} UP + {down_bal} DOWN tokens, conditionId={condition_id[:16]}...")
+        tx_hash = _redeem_positions(condition_id, up_bal, down_bal)
+        if tx_hash:
+            print(f"  [redeem] Redeemed! tx={tx_hash}")
+            redeemed += 1
+        else:
+            print(f"  [redeem] Redemption failed")
+
+    return redeemed
+
+
 _poly_clob_client = None  # ClobClient instance
 
 
@@ -2783,6 +2938,8 @@ def main() -> None:
                 "extras": best_global.extras,
                 "poly_ref": best_global.poly_ref,
                 "kalshi_ref": best_global.kalshi_ref,
+                "poly_up_token_id": best_global_poly.up_token_id,
+                "poly_down_token_id": best_global_poly.down_token_id,
                 "window_close_ts": best_global_kalshi.close_ts.isoformat(),
                 "spot_price": spot_prices.get(best_global.coin),
                 "kalshi_strike": best_global_kalshi.strike,
@@ -3048,6 +3205,17 @@ def main() -> None:
             print("Skipping outcome verification.")
     elif logged:
         print("(Skipping outcome verification for single-trade run)")
+
+    # Auto-redeem resolved Polymarket positions (EOA mode only)
+    if logged and EXEC_MODE == "live" and POLY_SIGNATURE_TYPE == 0:
+        try:
+            n = redeem_poly_positions(logged)
+            if n > 0:
+                print(f"\n  [redeem] Successfully redeemed {n} position(s)")
+            elif n == 0:
+                print(f"\n  [redeem] No positions to redeem (tokens may not have settled yet)")
+        except Exception as e:
+            print(f"\n  [redeem] Auto-redemption failed: {e}")
 
     summarize(logged, selected_coins, skip_counts=skip_counts)
 
