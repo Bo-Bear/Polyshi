@@ -3387,6 +3387,7 @@ def main() -> None:
 
         # Scan timing summary
         scan_ms = (time.monotonic() - scan_t0) * 1000
+        process_ms = scan_ms - gamma_ms - fetch_ms
         # Log at most one paper trade per scan (the best across BTC/ETH/SOL)
         if best_global is not None and best_global_poly is not None and best_global_kalshi is not None:
             # Gather per-coin latency for the winning coin
