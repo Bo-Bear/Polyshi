@@ -262,15 +262,23 @@ _POLY_SPENDERS = [
 _POLYGON_RPC = "https://polygon-rpc.com"
 
 
-def _polygon_rpc(method: str, params: list) -> dict:
-    """Raw JSON-RPC call to Polygon."""
-    r = _get_session().post(_POLYGON_RPC, json={
-        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
-    }, timeout=15)
-    data = r.json()
-    if "error" in data:
-        raise RuntimeError(f"RPC error: {data['error']}")
-    return data.get("result")
+def _polygon_rpc(method: str, params: list, _retries: int = 3) -> dict:
+    """Raw JSON-RPC call to Polygon with retry on rate limits."""
+    for attempt in range(_retries + 1):
+        r = _get_session().post(_POLYGON_RPC, json={
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+        }, timeout=15)
+        data = r.json()
+        if "error" in data:
+            err_msg = str(data["error"].get("message", ""))
+            if "rate limit" in err_msg.lower() and attempt < _retries:
+                wait = 2 ** attempt * 5  # 5s, 10s, 20s
+                print(f"  [rpc] Rate limited, retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"RPC error: {data['error']}")
+        return data.get("result")
+    raise RuntimeError("RPC retries exhausted")
 
 
 def _send_approval_tx(from_addr: str, from_key: str, to_addr: str, calldata: str,
@@ -1020,9 +1028,13 @@ def redeem_all_old_positions() -> int:
     print(f"  [redeem] Found {len(token_pairs)} unique market(s) across all sessions")
 
     # Check balances and redeem non-zero positions
+    # Pace RPC calls to avoid Polygon rate limits (~2 calls per market for balance check)
     redeemed = 0
     skipped = 0
-    for up_tid, down_tid in token_pairs:
+    errors = 0
+    for i, (up_tid, down_tid) in enumerate(token_pairs):
+        if i > 0 and i % 5 == 0:
+            time.sleep(2)  # pause every 5 markets to stay under rate limit
         up_bal = _get_ctf_balance(addr, up_tid)
         down_bal = _get_ctf_balance(addr, down_tid)
 
@@ -1035,17 +1047,24 @@ def redeem_all_old_positions() -> int:
             condition_id = _get_condition_id_for_token(down_tid)
         if not condition_id:
             print(f"  [redeem] Could not find conditionId for token {up_tid[:20]}... — skipping")
+            errors += 1
             continue
 
         print(f"  [redeem] Market {condition_id[:16]}...: {up_bal} UP + {down_bal} DOWN tokens")
-        tx_hash = _redeem_positions(condition_id, up_bal, down_bal)
-        if tx_hash:
-            print(f"  [redeem] ✓ Redeemed → tx={tx_hash}")
-            redeemed += 1
-        else:
-            print(f"  [redeem] ✗ Redemption failed")
+        try:
+            tx_hash = _redeem_positions(condition_id, up_bal, down_bal)
+            if tx_hash:
+                print(f"  [redeem] ✓ Redeemed → tx={tx_hash}")
+                redeemed += 1
+                time.sleep(3)  # wait between redemption txns
+            else:
+                print(f"  [redeem] ✗ Redemption failed")
+                errors += 1
+        except Exception as e:
+            print(f"  [redeem] ✗ Error: {e}")
+            errors += 1
 
-    print(f"\n  [redeem] Done: {redeemed} redeemed, {skipped} already empty")
+    print(f"\n  [redeem] Done: {redeemed} redeemed, {skipped} already empty, {errors} errors")
     return redeemed
 
 
