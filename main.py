@@ -60,7 +60,7 @@ MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.05"))  # 5%
 MAX_NET_EDGE = float(os.getenv("MAX_NET_EDGE", "0.15"))  # 15%
 
 # Session drawdown limit — auto-stop if portfolio drops this much from session start ($)
-MAX_SESSION_DRAWDOWN = float(os.getenv("MAX_SESSION_DRAWDOWN", "10.0"))  # $10
+MAX_SESSION_DRAWDOWN = float(os.getenv("MAX_SESSION_DRAWDOWN", "50.0"))  # $50
 
 # Maximum seconds to remain unhedged — if Poly fills but Kalshi fails, unwind Poly after this
 MAX_UNHEDGED_SECONDS = float(os.getenv("MAX_UNHEDGED_SECONDS", "5.0"))  # 5 seconds
