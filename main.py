@@ -285,8 +285,8 @@ def _send_approval_tx(from_addr: str, from_key: str, to_addr: str, calldata: str
         raw = "0x" + raw
     tx_hash = _polygon_rpc("eth_sendRawTransaction", [raw])
 
-    # Poll for receipt (up to 60s)
-    for _ in range(60):
+    # Poll for receipt (up to 120s)
+    for _ in range(120):
         receipt = _polygon_rpc("eth_getTransactionReceipt", [tx_hash])
         if receipt is not None:
             status = int(receipt.get("status", "0x0"), 16)
@@ -297,13 +297,32 @@ def _send_approval_tx(from_addr: str, from_key: str, to_addr: str, calldata: str
                     f"| to={to_addr} | data={calldata[:20]}...")
             return tx_hash
         time.sleep(1)
-    raise RuntimeError(f"tx not confirmed after 60s: {tx_hash}")
+    raise RuntimeError(f"tx not confirmed after 120s: {tx_hash}")
+
+
+def _check_erc20_allowance(owner: str, spender: str, token: str) -> int:
+    """Check ERC-20 allowance on-chain. Returns raw allowance as int."""
+    owner_padded = owner.lower().replace("0x", "").zfill(64)
+    spender_padded = spender.lower().replace("0x", "").zfill(64)
+    calldata = "0xdd62ed3e" + owner_padded + spender_padded  # allowance(address,address)
+    result = _polygon_rpc("eth_call", [{"to": token, "data": calldata}, "latest"])
+    return int(result, 16) if result else 0
+
+
+def _check_erc1155_approval(owner: str, operator: str, token: str) -> bool:
+    """Check ERC-1155 isApprovedForAll on-chain."""
+    owner_padded = owner.lower().replace("0x", "").zfill(64)
+    operator_padded = operator.lower().replace("0x", "").zfill(64)
+    calldata = "0xe985e9c5" + owner_padded + operator_padded  # isApprovedForAll(address,address)
+    result = _polygon_rpc("eth_call", [{"to": token, "data": calldata}, "latest"])
+    return int(result, 16) != 0 if result else False
 
 
 def _approve_poly_contracts():
     """Submit on-chain approve() txns for Polymarket exchange contracts.
     Uses eth_account + raw JSON-RPC (no web3 dependency).
-    Requires POL for gas on Polygon."""
+    Requires POL for gas on Polygon.
+    Skips contracts that already have sufficient allowance."""
     from eth_account import Account
 
     acct = Account.from_key(POLY_PRIVATE_KEY)
@@ -311,10 +330,15 @@ def _approve_poly_contracts():
 
     nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
     nonce = int(nonce_hex, 16)
-    gas_price = _polygon_rpc("eth_gasPrice", [])
+    raw_gas = _polygon_rpc("eth_gasPrice", [])
+    # Add 20% buffer for faster inclusion during congestion
+    gas_price_int = int(int(raw_gas, 16) * 1.2)
+    gas_price = hex(gas_price_int)
 
     max_uint256 = (2**256 - 1)
     max_uint_hex = hex(max_uint256)[2:].zfill(64)
+    # Threshold: consider "approved" if allowance >= 1000 USDC.e (1e9 raw)
+    MIN_ALLOWANCE = 1_000_000_000
 
     labels = ["CTF Exchange", "Neg Risk Exchange", "Neg Risk Adapter"]
     tx_count = 0
@@ -322,20 +346,28 @@ def _approve_poly_contracts():
     for i, spender in enumerate(_POLY_SPENDERS):
         spender_padded = spender.lower().replace("0x", "").zfill(64)
 
-        # ERC-20: approve(address spender, uint256 amount)
-        calldata = "0x095ea7b3" + spender_padded + max_uint_hex
-        _send_approval_tx(addr, POLY_PRIVATE_KEY, _POLY_USDC_E, calldata, nonce, gas_price)
-        nonce += 1
-        tx_count += 1
-        print(f"         Approved USDC.e -> {labels[i]}")
+        # ERC-20: check existing allowance before approving
+        existing_allowance = _check_erc20_allowance(addr, spender, _POLY_USDC_E)
+        if existing_allowance >= MIN_ALLOWANCE:
+            print(f"         USDC.e -> {labels[i]}: already approved (skipped)")
+        else:
+            calldata = "0x095ea7b3" + spender_padded + max_uint_hex
+            _send_approval_tx(addr, POLY_PRIVATE_KEY, _POLY_USDC_E, calldata, nonce, gas_price)
+            nonce += 1
+            tx_count += 1
+            print(f"         Approved USDC.e -> {labels[i]}")
 
-        # ERC-1155: setApprovalForAll(address operator, bool approved)
-        true_padded = "0" * 63 + "1"
-        calldata = "0xa22cb465" + spender_padded + true_padded
-        _send_approval_tx(addr, POLY_PRIVATE_KEY, _POLY_CTF, calldata, nonce, gas_price)
-        nonce += 1
-        tx_count += 1
-        print(f"         Approved CTF    -> {labels[i]}")
+        # ERC-1155: check existing approval before approving
+        already_approved = _check_erc1155_approval(addr, spender, _POLY_CTF)
+        if already_approved:
+            print(f"         CTF    -> {labels[i]}: already approved (skipped)")
+        else:
+            true_padded = "0" * 63 + "1"
+            calldata = "0xa22cb465" + spender_padded + true_padded
+            _send_approval_tx(addr, POLY_PRIVATE_KEY, _POLY_CTF, calldata, nonce, gas_price)
+            nonce += 1
+            tx_count += 1
+            print(f"         Approved CTF    -> {labels[i]}")
 
     return tx_count
 
