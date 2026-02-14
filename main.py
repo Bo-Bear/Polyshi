@@ -63,7 +63,7 @@ MAX_NET_EDGE = float(os.getenv("MAX_NET_EDGE", "0.15"))  # 15%
 MAX_SESSION_DRAWDOWN = float(os.getenv("MAX_SESSION_DRAWDOWN", "60.0"))  # $60
 
 # Maximum seconds to remain unhedged — if Poly fills but Kalshi fails, unwind Poly after this
-MAX_UNHEDGED_SECONDS = float(os.getenv("MAX_UNHEDGED_SECONDS", "5.0"))  # 5 seconds
+MAX_UNHEDGED_SECONDS = float(os.getenv("MAX_UNHEDGED_SECONDS", "10.0"))  # 10 seconds
 
 # Minimum seconds remaining in the window before we'll trade (need time to fill both legs)
 MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "30"))  # 30 seconds
@@ -159,10 +159,10 @@ POLY_FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "")
 
 # Order placement config
 ORDER_TIMEOUT_S = float(os.getenv("ORDER_TIMEOUT_S", "15"))  # max seconds to wait for fill
-ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "1"))  # polling interval
+ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "0.5"))  # polling interval
 # Price buffer added to limit orders in live mode to improve fill rate.
 # CLOB gives price improvement, so actual fill price may be lower than limit.
-LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.01"))  # 1 cent
+LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.02"))  # 2 cents
 
 
 # -----------------------------
