@@ -540,16 +540,19 @@ def _sign_and_send_tx(addr: str, to: str, calldata: str, nonce: int,
                 continue
             raise
 
-        # Poll for receipt (up to 120s)
-        for _ in range(120):
-            receipt = _polygon_rpc("eth_getTransactionReceipt", [tx_hash])
+        # Poll for receipt (up to 60s — Polygon blocks are ~2s)
+        for _ in range(60):
+            try:
+                receipt = _polygon_rpc("eth_getTransactionReceipt", [tx_hash])
+            except Exception:
+                receipt = None
             if receipt is not None:
                 status = int(receipt.get("status", "0x0"), 16)
                 if status != 1:
                     print(f"  [redeem] Tx reverted: {tx_hash}")
                     return None
                 return tx_hash
-            time.sleep(1)
+            time.sleep(2)
         print(f"  [redeem] Tx not confirmed after 120s: {tx_hash}")
         return None  # Don't retry timeouts — tx may still confirm later
 
@@ -576,10 +579,14 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
         nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "pending"])
         nonce = int(nonce_hex, 16)
     raw_gas = _polygon_rpc("eth_gasPrice", [])
-    gas_price_int = int(int(raw_gas, 16) * 1.2)
-    # Cap gas price to avoid "tx fee exceeds cap" (max ~0.1 POL per tx)
-    max_gas_price = int(300e9)  # 300 gwei
+    base_gas = int(raw_gas, 16)
+    gas_price_int = int(base_gas * 2)  # 2x multiplier for fast inclusion
+    # Cap at 2000 gwei (keeps tx fee under ~0.6 POL with 300k gas)
+    max_gas_price = int(2000e9)
     gas_price_int = min(gas_price_int, max_gas_price)
+    # Floor at 30 gwei (minimum for Polygon)
+    gas_price_int = max(gas_price_int, int(30e9))
+    print(f"  [redeem] Gas: base={base_gas/1e9:.0f} gwei, using={gas_price_int/1e9:.0f} gwei, nonce={nonce}")
 
     # Choose collateral token based on market type
     if neg_risk:
