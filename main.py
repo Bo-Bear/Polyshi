@@ -506,35 +506,53 @@ def _is_condition_resolved(condition_id: str) -> bool:
 
 def _sign_and_send_tx(addr: str, to: str, calldata: str, nonce: int,
                       gas_price_int: int, gas: int = 200000) -> Optional[str]:
-    """Sign, send, and wait for a transaction. Returns tx hash or None."""
+    """Sign, send, and wait for a transaction. Retries with higher gas on
+    'replacement transaction underpriced'. Returns tx hash or None."""
     from eth_account import Account
 
-    tx = {
-        "to": to,
-        "value": 0,
-        "gas": gas,
-        "gasPrice": gas_price_int,
-        "nonce": nonce,
-        "chainId": 137,
-        "data": calldata,
-    }
-    signed = Account.sign_transaction(tx, POLY_PRIVATE_KEY)
-    raw = signed.raw_transaction.hex()
-    if not raw.startswith("0x"):
-        raw = "0x" + raw
-    tx_hash = _polygon_rpc("eth_sendRawTransaction", [raw])
+    for attempt in range(3):
+        # Bump gas 50% on each retry to replace stuck pending txs
+        effective_gas_price = int(gas_price_int * (1.5 ** attempt))
 
-    # Poll for receipt (up to 120s)
-    for _ in range(120):
-        receipt = _polygon_rpc("eth_getTransactionReceipt", [tx_hash])
-        if receipt is not None:
-            status = int(receipt.get("status", "0x0"), 16)
-            if status != 1:
-                print(f"  [redeem] Tx reverted: {tx_hash}")
-                return None
-            return tx_hash
-        time.sleep(1)
-    print(f"  [redeem] Tx not confirmed after 120s: {tx_hash}")
+        tx = {
+            "to": to,
+            "value": 0,
+            "gas": gas,
+            "gasPrice": effective_gas_price,
+            "nonce": nonce,
+            "chainId": 137,
+            "data": calldata,
+        }
+        signed = Account.sign_transaction(tx, POLY_PRIVATE_KEY)
+        raw = signed.raw_transaction.hex()
+        if not raw.startswith("0x"):
+            raw = "0x" + raw
+
+        try:
+            tx_hash = _polygon_rpc("eth_sendRawTransaction", [raw])
+        except RuntimeError as e:
+            err = str(e)
+            if "replacement transaction underpriced" in err and attempt < 2:
+                print(f"  [tx] Pending tx at nonce {nonce}, bumping gas ({attempt+1}/3)...")
+                continue
+            elif "already known" in err.lower() and attempt < 2:
+                # Tx was already submitted — just wait for it
+                continue
+            raise
+
+        # Poll for receipt (up to 120s)
+        for _ in range(120):
+            receipt = _polygon_rpc("eth_getTransactionReceipt", [tx_hash])
+            if receipt is not None:
+                status = int(receipt.get("status", "0x0"), 16)
+                if status != 1:
+                    print(f"  [redeem] Tx reverted: {tx_hash}")
+                    return None
+                return tx_hash
+            time.sleep(1)
+        print(f"  [redeem] Tx not confirmed after 120s: {tx_hash}")
+        return None  # Don't retry timeouts — tx may still confirm later
+
     return None
 
 
@@ -555,7 +573,7 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
         return None, 0
 
     if nonce < 0:
-        nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
+        nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "pending"])
         nonce = int(nonce_hex, 16)
     raw_gas = _polygon_rpc("eth_gasPrice", [])
     gas_price_int = int(int(raw_gas, 16) * 1.2)
@@ -1204,10 +1222,10 @@ def redeem_all_old_positions() -> int:
         print(f"\n  [redeem] Done: nothing to redeem")
         return 0
 
-    # Fetch nonce once and manage it across all redemptions
-    nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
+    # Fetch nonce using "pending" to skip past any stuck mempool txs
+    nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "pending"])
     nonce = int(nonce_hex, 16)
-    print(f"  [redeem] Starting nonce: {nonce}")
+    print(f"  [redeem] Starting nonce: {nonce} (pending)")
 
     # Redeem each non-zero position
     redeemed = 0
