@@ -560,11 +560,11 @@ def _sign_and_send_tx(addr: str, to: str, calldata: str, nonce: int,
 
 
 def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
-                      nonce: int = -1, neg_risk: bool = False) -> Tuple[Optional[str], int]:
+                      nonce: int = -1, neg_risk: bool = False) -> Tuple[Optional[str], int, int]:
     """Redeem resolved CTF positions. Handles both standard and NegRisk markets.
     Standard: CTF.redeemPositions(USDC.e, 0x0, conditionId, [1,2]) → USDC.e directly
     NegRisk:  CTF.redeemPositions(WCOL, 0x0, conditionId, [1,2]) → WCOL → unwrap to USDC.e
-    Returns (tx_hash_or_None, nonces_consumed)."""
+    Returns (tx_hash_or_None, nonces_consumed, payout_micro_usdc)."""
     from eth_account import Account
 
     acct = Account.from_key(POLY_PRIVATE_KEY)
@@ -573,7 +573,7 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
     # Check if condition is resolved first
     if not _is_condition_resolved(condition_id):
         print(f"  [redeem] Market not yet resolved — skipping")
-        return None, 0
+        return None, 0, 0
 
     if nonce < 0:
         nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "pending"])
@@ -617,38 +617,67 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
         _polygon_rpc("eth_call", [{"from": addr, "to": _POLY_CTF, "data": calldata}, "latest"])
     except Exception as e:
         print(f"  [redeem] Simulation failed: {e}")
-        return None, 0
+        return None, 0, 0
+
+    # Snapshot balance before redeem to detect payout
+    bal_calldata = _ERC20_BALANCE_SELECTOR + addr.lower().replace("0x", "").zfill(64)
+    pre_usdc = 0
+    pre_wcol = 0
+    if not neg_risk:
+        try:
+            pre_bal_data = _polygon_rpc("eth_call", [{"to": _POLY_USDC_E, "data": bal_calldata}, "latest"])
+            pre_usdc = int(pre_bal_data, 16) if pre_bal_data else 0
+        except Exception:
+            pass
+    else:
+        try:
+            pre_wcol_data = _polygon_rpc("eth_call", [{"to": _POLY_WCOL, "data": bal_calldata}, "latest"])
+            pre_wcol = int(pre_wcol_data, 16) if pre_wcol_data else 0
+        except Exception:
+            pass
 
     # Send step 1
     tx_hash = _sign_and_send_tx(addr, _POLY_CTF, calldata, nonce, gas_price_int, gas=300000)
     if not tx_hash:
-        return None, 0
+        return None, 0, 0
     nonces_used = 1
 
     if not neg_risk:
         # Standard market: USDC.e is received directly, no unwrap needed
-        print(f"  [redeem] CTF redeem OK → tx={tx_hash}")
-        return tx_hash, nonces_used
+        # Check USDC.e balance change to report payout
+        time.sleep(1)
+        try:
+            post_bal_data = _polygon_rpc("eth_call", [{"to": _POLY_USDC_E, "data": bal_calldata}, "latest"])
+            post_usdc = int(post_bal_data, 16) if post_bal_data else 0
+        except Exception:
+            post_usdc = pre_usdc
+        payout = max(0, post_usdc - pre_usdc)
+        if payout > 0:
+            print(f"  [redeem] CTF redeem OK → tx={tx_hash} → +${payout / 1e6:.4f} USDC.e")
+        else:
+            print(f"  [redeem] CTF redeem OK → tx={tx_hash} (losing side burned for $0)")
+        return tx_hash, nonces_used, payout
 
     # --- NegRisk only: Step 2 — WCOL.unwrap(address _to, uint256 _amount) ---
     print(f"  [redeem] Step 1 OK (CTF redeem) → tx={tx_hash}")
     time.sleep(1)
-    bal_calldata = _ERC20_BALANCE_SELECTOR + addr.lower().replace("0x", "").zfill(64)
+    # Check WCOL balance change to detect winning payout
     try:
-        bal_result = _polygon_rpc("eth_call", [{"to": _POLY_WCOL, "data": bal_calldata}, "latest"])
-        wcol_balance = int(bal_result, 16) if bal_result else 0
+        post_wcol_data = _polygon_rpc("eth_call", [{"to": _POLY_WCOL, "data": bal_calldata}, "latest"])
+        post_wcol = int(post_wcol_data, 16) if post_wcol_data else 0
     except Exception:
-        wcol_balance = 0
+        post_wcol = 0
 
-    if wcol_balance == 0:
+    wcol_gained = max(0, post_wcol - pre_wcol)
+    if wcol_gained <= 0:
         print(f"  [redeem] No WCOL received (losing side tokens burned for $0)")
-        return tx_hash, nonces_used
+        return tx_hash, nonces_used, 0
 
-    print(f"  [redeem] WCOL balance: {wcol_balance} ({wcol_balance / 1e6:.4f} USDC.e equivalent)")
+    print(f"  [redeem] WCOL gained: +${wcol_gained / 1e6:.4f} USDC.e equivalent")
 
     # Unwrap WCOL to USDC.e
     to_padded = addr.lower().replace("0x", "").zfill(64)
-    amount_padded = hex(wcol_balance)[2:].zfill(64)
+    amount_padded = hex(wcol_gained)[2:].zfill(64)
     unwrap_calldata = _WCOL_UNWRAP_SELECTOR + to_padded + amount_padded
 
     try:
@@ -656,16 +685,16 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
     except Exception as e:
         print(f"  [redeem] Step 2 simulation failed (unwrap): {e}")
         print(f"  [redeem] WCOL tokens are still in your wallet — can retry later")
-        return tx_hash, nonces_used
+        return tx_hash, nonces_used, 0
 
     unwrap_hash = _sign_and_send_tx(addr, _POLY_WCOL, unwrap_calldata, nonce + 1, gas_price_int)
     if unwrap_hash:
-        print(f"  [redeem] Step 2 OK (unwrap) → tx={unwrap_hash} → +${wcol_balance / 1e6:.4f} USDC.e")
+        print(f"  [redeem] Step 2 OK (unwrap) → tx={unwrap_hash} → +${wcol_gained / 1e6:.4f} USDC.e")
         nonces_used += 1
     else:
         print(f"  [redeem] Unwrap tx failed — WCOL still in wallet, retry later")
 
-    return tx_hash, nonces_used
+    return tx_hash, nonces_used, wcol_gained
 
 
 def redeem_poly_positions(trade_rows: List[dict]) -> int:
@@ -716,7 +745,7 @@ def redeem_poly_positions(trade_rows: List[dict]) -> int:
             continue
 
         print(f"  [redeem] Found {up_bal} UP + {down_bal} DOWN tokens, conditionId={condition_id[:16]}...")
-        tx_hash, _ = _redeem_positions(condition_id, up_bal, down_bal, neg_risk=neg_risk)
+        tx_hash, _, _payout = _redeem_positions(condition_id, up_bal, down_bal, neg_risk=neg_risk)
         if tx_hash:
             print(f"  [redeem] Redeemed! tx={tx_hash}")
             redeemed += 1
@@ -1285,6 +1314,7 @@ def redeem_all_old_positions() -> int:
     # Redeem each non-zero position
     redeemed = 0
     errors = 0
+    total_payout = 0  # micro-USDC
     for i, (up_tid, down_tid, up_bal, down_bal) in enumerate(non_zero):
         # Get conditionId AND market type from Gamma API
         condition_id, neg_risk = _get_market_info_for_token(up_tid)
@@ -1303,7 +1333,7 @@ def redeem_all_old_positions() -> int:
         pre_down = _get_ctf_balance(addr, down_tid) if down_bal > 0 else 0
 
         try:
-            tx_hash, nonces_used = _redeem_positions(
+            tx_hash, nonces_used, payout = _redeem_positions(
                 condition_id, up_bal, down_bal, nonce=nonce, neg_risk=neg_risk)
             if tx_hash:
                 # Verify tokens were actually burned
@@ -1314,6 +1344,7 @@ def redeem_all_old_positions() -> int:
                 if burned > 0:
                     print(f"  [redeem] ✓ Burned {burned} tokens → tx={tx_hash}")
                     redeemed += 1
+                    total_payout += payout
                 else:
                     print(f"  [redeem] ⚠ Tx succeeded but NO tokens burned — wrong collateral?")
                     print(f"  [redeem]   pre: {pre_up} UP + {pre_down} DOWN → post: {post_up} UP + {post_down} DOWN")
@@ -1326,7 +1357,8 @@ def redeem_all_old_positions() -> int:
             print(f"  [redeem] ✗ Error: {e}")
             errors += 1
 
-    print(f"\n  [redeem] Done: {redeemed} redeemed, {skipped} already empty, {errors} errors")
+    payout_str = f", +${total_payout / 1e6:.2f} USDC.e recovered" if total_payout > 0 else ""
+    print(f"\n  [redeem] Done: {redeemed} redeemed{payout_str}, {skipped} already empty, {errors} errors")
     return redeemed
 
 
