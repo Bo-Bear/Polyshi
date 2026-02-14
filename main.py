@@ -2416,19 +2416,23 @@ def main() -> None:
                 print(f"         USDC.e balance:   {raw_bal / 1e6:.4f} (raw: {raw_bal})")
                 print(f"         USDC.e allowance: {raw_allow / 1e6:.4f} (raw: {raw_allow})")
                 if raw_allow < 1e6:
-                    print("         *** ALLOWANCE TOO LOW — submitting on-chain approvals ***")
-                    try:
-                        n = _approve_poly_contracts()
-                        print(f"         {n} approval txns confirmed on Polygon")
-                        # Re-check allowance
-                        ba2 = client.get_balance_allowance(
-                            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-                        new_allow = float(ba2.get("allowance", "0"))
-                        print(f"         New allowance: {new_allow / 1e6:.4f}")
-                    except Exception as e2:
-                        print(f"         *** APPROVAL FAILED: {e2}")
-                        print("         You may need POL for gas or check your POLY_PRIVATE_KEY")
-                        return
+                    if POLY_SIGNATURE_TYPE == 0:
+                        print("         *** ALLOWANCE TOO LOW — submitting on-chain approvals ***")
+                        try:
+                            n = _approve_poly_contracts()
+                            print(f"         {n} approval txns confirmed on Polygon")
+                            # Re-check allowance
+                            ba2 = client.get_balance_allowance(
+                                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                            new_allow = float(ba2.get("allowance", "0"))
+                            print(f"         New allowance: {new_allow / 1e6:.4f}")
+                        except Exception as e2:
+                            print(f"         *** APPROVAL FAILED: {e2}")
+                            print("         You may need POL for gas or check your POLY_PRIVATE_KEY")
+                            return
+                    else:
+                        print("         Allowance low — proxy mode: approvals managed by Polymarket website")
+                        print("         (Make sure you've deposited USDC.e through polymarket.com)")
             except Exception as e:
                 print(f"         Balance/allowance check failed: {e}")
         except Exception as e:
