@@ -2305,7 +2305,7 @@ def check_balances(logfile: str) -> Dict[str, float]:
     try:
         data = _kalshi_auth_get("/portfolio/balance")
         # Kalshi returns balance in cents
-        bal["kalshi"] = float(data.get("available_balance", 0)) / 100.0
+        bal["kalshi"] = float(data.get("balance", 0)) / 100.0
     except Exception as e:
         bal["kalshi"] = -1.0
         print(f"  [balance] Kalshi balance check failed: {e}")
