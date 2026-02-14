@@ -406,20 +406,29 @@ _PAYOUT_DENOM_SELECTOR = "0xdd34de67"  # payoutDenominator(bytes32)
 _BALANCE_OF_SELECTOR = "0x00fdd58e"    # balanceOf(address,uint256) — ERC-1155
 
 
-def _get_condition_id_for_token(token_id: str) -> Optional[str]:
-    """Get conditionId for a Polymarket token_id via Gamma API."""
+def _get_market_info_for_token(token_id: str) -> Tuple[Optional[str], bool]:
+    """Get conditionId and negRisk flag for a Polymarket token_id via Gamma API.
+    Returns (conditionId, is_neg_risk)."""
     try:
         url = f"https://gamma-api.polymarket.com/markets"
         r = _get_session().get(url, params={"clob_token_ids": str(token_id)}, timeout=10)
         r.raise_for_status()
         markets = r.json()
         if markets and len(markets) > 0:
-            cid = markets[0].get("condition_id") or markets[0].get("conditionId")
+            m = markets[0]
+            cid = m.get("condition_id") or m.get("conditionId")
+            neg_risk = bool(m.get("negRisk", False))
             if cid:
-                return cid
+                return cid, neg_risk
     except Exception as e:
-        print(f"  [redeem] Failed to get conditionId for token {str(token_id)[:20]}...: {e}")
-    return None
+        print(f"  [redeem] Failed to get market info for token {str(token_id)[:20]}...: {e}")
+    return None, False
+
+
+def _get_condition_id_for_token(token_id: str) -> Optional[str]:
+    """Get conditionId for a Polymarket token_id via Gamma API."""
+    cid, _ = _get_market_info_for_token(token_id)
+    return cid
 
 
 def _get_ctf_balance(owner: str, token_id: str) -> int:
@@ -530,10 +539,10 @@ def _sign_and_send_tx(addr: str, to: str, calldata: str, nonce: int,
 
 
 def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
-                      nonce: int = -1) -> Tuple[Optional[str], int]:
-    """Two-step redemption for NegRisk CTF tokens:
-    1. Call CTF.redeemPositions(WCOL, 0x0, conditionId, [1,2]) — burns winning tokens, receive WCOL
-    2. Call WCOL.unwrap(addr, amount) — converts WCOL to USDC.e
+                      nonce: int = -1, neg_risk: bool = False) -> Tuple[Optional[str], int]:
+    """Redeem resolved CTF positions. Handles both standard and NegRisk markets.
+    Standard: CTF.redeemPositions(USDC.e, 0x0, conditionId, [1,2]) → USDC.e directly
+    NegRisk:  CTF.redeemPositions(WCOL, 0x0, conditionId, [1,2]) → WCOL → unwrap to USDC.e
     Returns (tx_hash_or_None, nonces_consumed)."""
     from eth_account import Account
 
@@ -554,10 +563,19 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
     max_gas_price = int(300e9)  # 300 gwei
     gas_price_int = min(gas_price_int, max_gas_price)
 
+    # Choose collateral token based on market type
+    if neg_risk:
+        collateral_addr = _POLY_WCOL
+        collateral_label = "WCOL (NegRisk)"
+    else:
+        collateral_addr = _POLY_USDC_E
+        collateral_label = "USDC.e (standard)"
+    print(f"  [redeem] Using collateral: {collateral_label}")
+
     # --- Step 1: CTF.redeemPositions(address collateralToken, bytes32 parentCollectionId,
     #                                  bytes32 conditionId, uint256[] indexSets) ---
     cid_hex = condition_id.lower().replace("0x", "").zfill(64)
-    wcol_padded = _POLY_WCOL.lower().replace("0x", "").zfill(64)
+    collateral_padded = collateral_addr.lower().replace("0x", "").zfill(64)
     parent_coll_id = "00" * 32  # bytes32(0) — Polymarket doesn't use nested conditions
     # Dynamic array offset: 4 static words × 32 bytes = 128 = 0x80
     array_offset = hex(0x80)[2:].zfill(64)
@@ -565,14 +583,14 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
     index_set_1 = hex(1)[2:].zfill(64)  # outcome 0 (YES/UP)
     index_set_2 = hex(2)[2:].zfill(64)  # outcome 1 (NO/DOWN)
 
-    calldata = (_CTF_REDEEM_SELECTOR + wcol_padded + parent_coll_id +
+    calldata = (_CTF_REDEEM_SELECTOR + collateral_padded + parent_coll_id +
                 cid_hex + array_offset + array_length + index_set_1 + index_set_2)
 
     # Simulate step 1
     try:
         _polygon_rpc("eth_call", [{"from": addr, "to": _POLY_CTF, "data": calldata}, "latest"])
     except Exception as e:
-        print(f"  [redeem] Step 1 simulation failed: {e}")
+        print(f"  [redeem] Simulation failed: {e}")
         return None, 0
 
     # Send step 1
@@ -580,10 +598,14 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
     if not tx_hash:
         return None, 0
     nonces_used = 1
-    print(f"  [redeem] Step 1 OK (CTF redeem) → tx={tx_hash}")
 
-    # --- Step 2: WCOL.unwrap(address _to, uint256 _amount) ---
-    # Check WCOL balance received
+    if not neg_risk:
+        # Standard market: USDC.e is received directly, no unwrap needed
+        print(f"  [redeem] CTF redeem OK → tx={tx_hash}")
+        return tx_hash, nonces_used
+
+    # --- NegRisk only: Step 2 — WCOL.unwrap(address _to, uint256 _amount) ---
+    print(f"  [redeem] Step 1 OK (CTF redeem) → tx={tx_hash}")
     time.sleep(1)
     bal_calldata = _ERC20_BALANCE_SELECTOR + addr.lower().replace("0x", "").zfill(64)
     try:
@@ -594,7 +616,7 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
 
     if wcol_balance == 0:
         print(f"  [redeem] No WCOL received (losing side tokens burned for $0)")
-        return tx_hash, nonces_used  # Still a success — tokens were redeemed, just worthless
+        return tx_hash, nonces_used
 
     print(f"  [redeem] WCOL balance: {wcol_balance} ({wcol_balance / 1e6:.4f} USDC.e equivalent)")
 
@@ -659,16 +681,16 @@ def redeem_poly_positions(trade_rows: List[dict]) -> int:
         if up_bal == 0 and down_bal == 0:
             continue  # No tokens to redeem
 
-        # Get conditionId from Gamma API
-        condition_id = _get_condition_id_for_token(up_tid)
+        # Get conditionId and market type from Gamma API
+        condition_id, neg_risk = _get_market_info_for_token(up_tid)
         if not condition_id:
-            condition_id = _get_condition_id_for_token(down_tid)
+            condition_id, neg_risk = _get_market_info_for_token(down_tid)
         if not condition_id:
             print(f"  [redeem] Could not find conditionId — skipping")
             continue
 
         print(f"  [redeem] Found {up_bal} UP + {down_bal} DOWN tokens, conditionId={condition_id[:16]}...")
-        tx_hash, _ = _redeem_positions(condition_id, up_bal, down_bal)
+        tx_hash, _ = _redeem_positions(condition_id, up_bal, down_bal, neg_risk=neg_risk)
         if tx_hash:
             print(f"  [redeem] Redeemed! tx={tx_hash}")
             redeemed += 1
@@ -1191,20 +1213,38 @@ def redeem_all_old_positions() -> int:
     redeemed = 0
     errors = 0
     for i, (up_tid, down_tid, up_bal, down_bal) in enumerate(non_zero):
-        condition_id = _get_condition_id_for_token(up_tid)
+        # Get conditionId AND market type from Gamma API
+        condition_id, neg_risk = _get_market_info_for_token(up_tid)
         if not condition_id:
-            condition_id = _get_condition_id_for_token(down_tid)
+            condition_id, neg_risk = _get_market_info_for_token(down_tid)
         if not condition_id:
             print(f"  [redeem] Could not find conditionId for token {up_tid[:20]}... — skipping")
             errors += 1
             continue
 
-        print(f"  [redeem] [{i+1}/{len(non_zero)}] Market {condition_id[:16]}...: {up_bal} UP + {down_bal} DOWN tokens")
+        mtype = "NegRisk" if neg_risk else "standard"
+        print(f"  [redeem] [{i+1}/{len(non_zero)}] Market {condition_id[:16]}... ({mtype}): {up_bal} UP + {down_bal} DOWN tokens")
+
+        # Check balance before to verify redemption actually burns tokens
+        pre_up = _get_ctf_balance(addr, up_tid) if up_bal > 0 else 0
+        pre_down = _get_ctf_balance(addr, down_tid) if down_bal > 0 else 0
+
         try:
-            tx_hash, nonces_used = _redeem_positions(condition_id, up_bal, down_bal, nonce=nonce)
+            tx_hash, nonces_used = _redeem_positions(
+                condition_id, up_bal, down_bal, nonce=nonce, neg_risk=neg_risk)
             if tx_hash:
-                print(f"  [redeem] ✓ Redeemed → tx={tx_hash}")
-                redeemed += 1
+                # Verify tokens were actually burned
+                time.sleep(1)
+                post_up = _get_ctf_balance(addr, up_tid) if pre_up > 0 else 0
+                post_down = _get_ctf_balance(addr, down_tid) if pre_down > 0 else 0
+                burned = (pre_up - post_up) + (pre_down - post_down)
+                if burned > 0:
+                    print(f"  [redeem] ✓ Burned {burned} tokens → tx={tx_hash}")
+                    redeemed += 1
+                else:
+                    print(f"  [redeem] ⚠ Tx succeeded but NO tokens burned — wrong collateral?")
+                    print(f"  [redeem]   pre: {pre_up} UP + {pre_down} DOWN → post: {post_up} UP + {post_down} DOWN")
+                    errors += 1
                 nonce += nonces_used
             else:
                 print(f"  [redeem] ✗ Redemption failed")
