@@ -162,7 +162,7 @@ ORDER_TIMEOUT_S = float(os.getenv("ORDER_TIMEOUT_S", "15"))  # max seconds to wa
 ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "1"))  # polling interval
 # Price buffer added to limit orders in live mode to improve fill rate.
 # CLOB gives price improvement, so actual fill price may be lower than limit.
-LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.03"))  # 3 cents
+LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.01"))  # 1 cent
 
 
 # -----------------------------
