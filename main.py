@@ -96,7 +96,7 @@ MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.00
 # Fees (paper-trade model)
 # -----------------------------
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
-PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "5"))
+PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "10"))
 
 # Toggle fee modeling
 INCLUDE_POLY_FEES = os.getenv("INCLUDE_POLY_FEES", "true").lower() == "true"
