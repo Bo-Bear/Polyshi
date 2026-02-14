@@ -2207,9 +2207,10 @@ def append_log(path: str, row: dict) -> None:
         f.write(json.dumps(row) + "\n")
 
 
-def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict[str, int]] = None) -> None:
+def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict[str, int]] = None,
+              start_balances: Optional[Dict[str, float]] = None, logfile: Optional[str] = None) -> None:
     if not log_rows:
-        print("\nNo test trades were logged.")
+        print("\nNo trades were logged.")
         if skip_counts:
             print("\nSkip reasons:")
             for reason, count in sorted(skip_counts.items(), key=lambda x: -x[1]):
@@ -2220,8 +2221,9 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
     for r in log_rows:
         by_coin.setdefault(r["coin"], []).append(r)
 
-    print("\n" + "=" * 60)
-    print("  TEST TRADE SUMMARY")
+    title = "TRADE SUMMARY" if EXEC_MODE == "live" else "TEST TRADE SUMMARY"
+    print(f"\n{'=' * 60}")
+    print(f"  {title}")
     print("=" * 60)
 
     total_edge = sum(r["net_edge"] for r in log_rows)
@@ -2270,7 +2272,8 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
         else:
             print(f"Hedge mismatches:  0 (all hedges consistent)")
 
-        print(f"\n--- Paper P&L ({int(PAPER_CONTRACTS)} contracts/trade) ---")
+        pnl_label = "P&L" if EXEC_MODE == "live" else "Paper P&L"
+        print(f"\n--- {pnl_label} ({int(PAPER_CONTRACTS)} contracts/trade) ---")
         print(f"Total P&L:         ${total_pnl:+.4f}")
         print(f"Avg P&L/trade:     ${total_pnl / len(verified):+.4f}")
         if wins:
@@ -2325,6 +2328,32 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
             f"| fees {r['poly_fee']:.4f}+{r['kalshi_fee']:.4f}+{r['extras']:.4f}"
             f"{depth_str}{pnl_str}"
         )
+
+    # Balance summary (live mode)
+    if start_balances:
+        end_balances = {}
+        if logfile:
+            try:
+                end_balances = check_balances(logfile)
+            except Exception:
+                pass
+
+        print(f"\n--- Balances ---")
+        start_total = sum(v for v in start_balances.values() if v >= 0)
+        end_total = sum(v for v in end_balances.values() if v >= 0) if end_balances else 0
+        for exch in ("kalshi", "poly"):
+            s = start_balances.get(exch, -1)
+            e = end_balances.get(exch, -1)
+            s_str = f"${s:.2f}" if s >= 0 else "N/A"
+            e_str = f"${e:.2f}" if e >= 0 else "N/A"
+            delta = ""
+            if s >= 0 and e >= 0:
+                d = e - s
+                delta = f"  ({d:+.2f})"
+            print(f"  {exch.upper():8s} {s_str:>10s} -> {e_str:>10s}{delta}")
+        if end_total > 0:
+            d_total = end_total - start_total
+            print(f"  {'TOTAL':8s} ${start_total:>9.2f} -> ${end_total:>9.2f}  ({d_total:+.2f})")
 
 
 # -----------------------------
@@ -3688,7 +3717,8 @@ def main() -> None:
         except Exception as e:
             print(f"\n  [redeem] Auto-redemption failed: {e}")
 
-    summarize(logged, selected_coins, skip_counts=skip_counts)
+    summarize(logged, selected_coins, skip_counts=skip_counts,
+             start_balances=balances, logfile=logfile)
 
 
 def _run_with_kill_switch() -> None:
