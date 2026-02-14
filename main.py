@@ -151,6 +151,9 @@ POLY_FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "")
 # Order placement config
 ORDER_TIMEOUT_S = float(os.getenv("ORDER_TIMEOUT_S", "15"))  # max seconds to wait for fill
 ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "1"))  # polling interval
+# Price buffer added to limit orders in live mode to improve fill rate.
+# CLOB gives price improvement, so actual fill price may be lower than limit.
+LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.03"))  # 3 cents
 
 
 # -----------------------------
@@ -1796,7 +1799,9 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
                         ticker: str) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
     """Place and poll a Kalshi limit order. Returns (order_id, actual_price, filled, status, error)."""
     kalshi_side = "yes" if side == "UP" else "no"
-    price_cents = int(round(planned_price * 100))
+    # Add buffer to limit price for better fill probability
+    buffered = min(planned_price + LIVE_PRICE_BUFFER, 0.99)
+    price_cents = int(round(buffered * 100))
     client_order_id = f"polyshi-{uuid.uuid4().hex[:12]}"
 
     # Build order body — use yes_price for YES side, no_price for NO side
@@ -1867,8 +1872,11 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
     """Place and poll a Polymarket CLOB limit order. Returns (order_id, actual_price, filled, status, error)."""
     client = _get_poly_clob_client()
 
-    # Round price to 2 decimal places (Poly CLOB tick size is $0.01)
-    price = round(planned_price, 2)
+    # Add buffer to limit price for better fill probability.
+    # CLOB gives price improvement: if best ask < limit, you fill at best ask.
+    buffered = planned_price + LIVE_PRICE_BUFFER
+    # Round price to 2 decimal places (Poly CLOB tick size is $0.01), cap at 0.99
+    price = min(round(buffered, 2), 0.99)
 
     # Create and sign order
     order_args = OrderArgs(
@@ -2394,6 +2402,7 @@ def main() -> None:
     print(f"  Price range:        [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}]")
     print(f"  Max prob diverge:   {pct(MAX_PROB_DIVERGENCE)} (strike mismatch detector)")
     print(f"  Max strike-spot Δ:  {MAX_STRIKE_SPOT_DIVERGENCE*100:.2f}% (hedge validity guard)")
+    print(f"  Fill price buffer:  ${LIVE_PRICE_BUFFER:.2f} (limit order cushion)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
 
     # Start Polymarket CLOB WebSocket for real-time orderbook data
