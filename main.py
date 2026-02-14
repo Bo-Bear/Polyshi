@@ -428,6 +428,56 @@ def _get_ctf_balance(owner: str, token_id: str) -> int:
         return 0
 
 
+_BALANCE_OF_BATCH_SELECTOR = "0x4e1273f4"  # balanceOfBatch(address[],uint256[])
+
+
+def _get_ctf_balances_batch(owner: str, token_ids: List[str], batch_size: int = 40) -> Dict[str, int]:
+    """Check multiple ERC-1155 balances in minimal RPC calls using balanceOfBatch.
+    Returns {token_id: balance}. Falls back to individual calls on error."""
+    results: Dict[str, int] = {}
+    owner_hex = owner.lower().replace("0x", "").zfill(64)
+
+    for batch_start in range(0, len(token_ids), batch_size):
+        batch = token_ids[batch_start:batch_start + batch_size]
+        n = len(batch)
+
+        # ABI encode: balanceOfBatch(address[] accounts, uint256[] ids)
+        # Dynamic arrays: offset_accounts(0x40) + offset_ids + accounts_array + ids_array
+        accounts_offset = hex(64)[2:].zfill(64)  # 0x40 = 64 bytes
+        ids_offset = hex(64 + 32 + n * 32)[2:].zfill(64)  # past accounts array
+        accounts_len = hex(n)[2:].zfill(64)
+        accounts_data = "".join(owner_hex for _ in batch)
+        ids_len = hex(n)[2:].zfill(64)
+        ids_data = "".join(hex(int(tid))[2:].zfill(64) for tid in batch)
+
+        calldata = (_BALANCE_OF_BATCH_SELECTOR + accounts_offset + ids_offset +
+                    accounts_len + accounts_data + ids_len + ids_data)
+
+        try:
+            result = _polygon_rpc("eth_call", [{"to": _POLY_CTF, "data": calldata}, "latest"])
+            if result and result != "0x":
+                # Decode: offset(32) + length(32) + n × uint256
+                raw = result.replace("0x", "")
+                # First 64 chars = offset to array, next 64 = array length, then values
+                data_start = 128  # skip offset + length (64+64 hex chars)
+                for i, tid in enumerate(batch):
+                    val_hex = raw[data_start + i * 64: data_start + (i + 1) * 64]
+                    results[tid] = int(val_hex, 16) if val_hex else 0
+            else:
+                for tid in batch:
+                    results[tid] = 0
+        except Exception as e:
+            print(f"  [redeem] Batch balance check failed, falling back to individual: {e}")
+            for tid in batch:
+                results[tid] = _get_ctf_balance(owner, tid)
+                time.sleep(1)
+
+        if batch_start + batch_size < len(token_ids):
+            time.sleep(2)  # pace between batches
+
+    return results
+
+
 def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int) -> Optional[str]:
     """Call NegRiskAdapter.redeemPositions(bytes32, uint256[]) to convert
     resolved CTF tokens back to USDC.e. Returns tx hash or None."""
@@ -1027,21 +1077,34 @@ def redeem_all_old_positions() -> int:
 
     print(f"  [redeem] Found {len(token_pairs)} unique market(s) across all sessions")
 
-    # Check balances and redeem non-zero positions
-    # Pace RPC calls to avoid Polygon rate limits (~2 calls per market for balance check)
+    # Batch-check all balances using balanceOfBatch (2-3 RPC calls instead of 104)
+    all_token_ids = []
+    for up_tid, down_tid in token_pairs:
+        all_token_ids.append(up_tid)
+        all_token_ids.append(down_tid)
+
+    print(f"  [redeem] Checking {len(all_token_ids)} token balances via batch RPC...")
+    balances = _get_ctf_balances_batch(addr, all_token_ids)
+
+    # Filter to markets with non-zero holdings
+    non_zero = []
+    for up_tid, down_tid in token_pairs:
+        up_bal = balances.get(up_tid, 0)
+        down_bal = balances.get(down_tid, 0)
+        if up_bal > 0 or down_bal > 0:
+            non_zero.append((up_tid, down_tid, up_bal, down_bal))
+
+    skipped = len(token_pairs) - len(non_zero)
+    print(f"  [redeem] {len(non_zero)} market(s) with tokens, {skipped} already empty")
+
+    if not non_zero:
+        print(f"\n  [redeem] Done: nothing to redeem")
+        return 0
+
+    # Redeem each non-zero position (paced to avoid rate limits)
     redeemed = 0
-    skipped = 0
     errors = 0
-    for i, (up_tid, down_tid) in enumerate(token_pairs):
-        if i > 0 and i % 5 == 0:
-            time.sleep(2)  # pause every 5 markets to stay under rate limit
-        up_bal = _get_ctf_balance(addr, up_tid)
-        down_bal = _get_ctf_balance(addr, down_tid)
-
-        if up_bal == 0 and down_bal == 0:
-            skipped += 1
-            continue
-
+    for i, (up_tid, down_tid, up_bal, down_bal) in enumerate(non_zero):
         condition_id = _get_condition_id_for_token(up_tid)
         if not condition_id:
             condition_id = _get_condition_id_for_token(down_tid)
@@ -1050,13 +1113,13 @@ def redeem_all_old_positions() -> int:
             errors += 1
             continue
 
-        print(f"  [redeem] Market {condition_id[:16]}...: {up_bal} UP + {down_bal} DOWN tokens")
+        print(f"  [redeem] [{i+1}/{len(non_zero)}] Market {condition_id[:16]}...: {up_bal} UP + {down_bal} DOWN tokens")
         try:
+            time.sleep(3)  # pace before each redemption txn
             tx_hash = _redeem_positions(condition_id, up_bal, down_bal)
             if tx_hash:
                 print(f"  [redeem] ✓ Redeemed → tx={tx_hash}")
                 redeemed += 1
-                time.sleep(3)  # wait between redemption txns
             else:
                 print(f"  [redeem] ✗ Redemption failed")
                 errors += 1
