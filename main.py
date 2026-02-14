@@ -581,8 +581,9 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
     raw_gas = _polygon_rpc("eth_gasPrice", [])
     base_gas = int(raw_gas, 16)
     gas_price_int = int(base_gas * 2)  # 2x multiplier for fast inclusion
-    # Cap at 2000 gwei (keeps tx fee under ~0.6 POL with 300k gas)
-    max_gas_price = int(2000e9)
+    # Cap at 100k gwei — at 300k gas that's only 0.03 POL (~$0.01) per tx
+    # Node cap is 1 POL = 3.3M gwei, so 100k is well under
+    max_gas_price = int(100_000e9)
     gas_price_int = min(gas_price_int, max_gas_price)
     # Floor at 30 gwei (minimum for Polygon)
     gas_price_int = max(gas_price_int, int(30e9))
