@@ -958,12 +958,104 @@ def prompt_market_type() -> str:
         print("Invalid selection. Enter 1.")
 
 
+def redeem_all_old_positions() -> int:
+    """Scan log files for all historical token IDs and redeem any unredeemed positions.
+    Returns number of successful redemptions."""
+    from eth_account import Account
+    import glob as glob_mod
+
+    if not POLY_PRIVATE_KEY:
+        print("  [redeem] POLY_PRIVATE_KEY not set")
+        return 0
+
+    acct = Account.from_key(POLY_PRIVATE_KEY)
+    addr = acct.address
+
+    # Collect all unique token pairs from log files
+    log_dir = os.getenv("LOG_DIR", "logs")
+    log_files = sorted(glob_mod.glob(os.path.join(log_dir, "arb_logs_*.jsonl")))
+    print(f"  [redeem] Scanning {len(log_files)} log file(s) for token IDs...")
+
+    seen: set = set()
+    token_pairs: List[Tuple[str, str]] = []
+
+    for lf in log_files:
+        try:
+            with open(lf, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # Check trade rows
+                    up_tid = row.get("poly_up_token_id") or ""
+                    down_tid = row.get("poly_down_token_id") or ""
+
+                    # Also check diagnostic dumps (nested in poly quotes)
+                    if not up_tid:
+                        for coin_key in ("BTC", "ETH", "SOL"):
+                            quotes = (row.get("all_coin_quotes") or {}).get(coin_key, {})
+                            poly_q = quotes.get("poly", {})
+                            if poly_q.get("up_token_id"):
+                                up_tid = str(poly_q["up_token_id"])
+                                down_tid = str(poly_q.get("down_token_id", ""))
+                                if up_tid and down_tid and up_tid not in seen:
+                                    seen.add(up_tid)
+                                    token_pairs.append((up_tid, down_tid))
+
+                    if up_tid and down_tid and up_tid not in seen:
+                        seen.add(up_tid)
+                        token_pairs.append((up_tid, down_tid))
+        except Exception:
+            continue
+
+    if not token_pairs:
+        print("  [redeem] No token IDs found in logs")
+        return 0
+
+    print(f"  [redeem] Found {len(token_pairs)} unique market(s) across all sessions")
+
+    # Check balances and redeem non-zero positions
+    redeemed = 0
+    skipped = 0
+    for up_tid, down_tid in token_pairs:
+        up_bal = _get_ctf_balance(addr, up_tid)
+        down_bal = _get_ctf_balance(addr, down_tid)
+
+        if up_bal == 0 and down_bal == 0:
+            skipped += 1
+            continue
+
+        condition_id = _get_condition_id_for_token(up_tid)
+        if not condition_id:
+            condition_id = _get_condition_id_for_token(down_tid)
+        if not condition_id:
+            print(f"  [redeem] Could not find conditionId for token {up_tid[:20]}... — skipping")
+            continue
+
+        print(f"  [redeem] Market {condition_id[:16]}...: {up_bal} UP + {down_bal} DOWN tokens")
+        tx_hash = _redeem_positions(condition_id, up_bal, down_bal)
+        if tx_hash:
+            print(f"  [redeem] ✓ Redeemed → tx={tx_hash}")
+            redeemed += 1
+        else:
+            print(f"  [redeem] ✗ Redemption failed")
+
+    print(f"\n  [redeem] Done: {redeemed} redeemed, {skipped} already empty")
+    return redeemed
+
+
 def prompt_execution_mode() -> str:
     """Prompt user to choose between live trading and paper testing."""
     print("\nSELECT EXECUTION MODE")
     print("=" * 45)
     print("1) Paper Testing   — simulated trades, no real money")
     print("2) Live Trading    — real orders on Kalshi & Polymarket")
+    print("3) Redeem Positions — collect unredeemed Polymarket winnings")
 
     while True:
         choice = input("\nSelect mode [1]: ").strip()
@@ -971,7 +1063,9 @@ def prompt_execution_mode() -> str:
             return "paper"
         if choice == "2":
             return "live"
-        print("Invalid selection. Enter 1 or 2.")
+        if choice == "3":
+            return "redeem"
+        print("Invalid selection. Enter 1, 2, or 3.")
 
 
 def prompt_coin_selection(available: List[str]) -> List[str]:
@@ -2568,6 +2662,19 @@ def main() -> None:
 
     # First choice: execution mode
     EXEC_MODE = prompt_execution_mode()
+
+    # Redeem mode: collect unredeemed Polymarket winnings and exit
+    if EXEC_MODE == "redeem":
+        print("\n  Scanning logs for unredeemed Polymarket positions...")
+        try:
+            n = redeem_all_old_positions()
+            if n > 0:
+                print(f"\n  Done — redeemed {n} position(s).")
+            else:
+                print("\n  No unredeemed positions found.")
+        except Exception as e:
+            print(f"\n  Redemption failed: {e}")
+        return
 
     market_type = prompt_market_type()
     if market_type != "CRYPTO_15M_UPDOWN":
