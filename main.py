@@ -255,6 +255,16 @@ def _kalshi_auth_post(path: str, body: dict, timeout: int = 10) -> dict:
     return r.json()
 
 
+def _kalshi_auth_delete(path: str, timeout: int = 10) -> dict:
+    """Authenticated DELETE to Kalshi API (used for order cancellation)."""
+    url = KALSHI_BASE + path
+    full_path = "/trade-api/v2" + path
+    headers = _kalshi_sign("DELETE", full_path)
+    r = _get_session().delete(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
 # -----------------------------
 # Polymarket on-chain approvals + CLOB client (live mode)
 # -----------------------------
@@ -2523,6 +2533,27 @@ def execute_leg(exchange: str, side: str, planned_price: float,
     )
 
 
+def _kalshi_order_is_filled(o: dict, contracts: float, planned_price: float,
+                            order_id: str) -> Optional[Tuple[str, Optional[float], float, str, Optional[str]]]:
+    """Check if a Kalshi order poll response indicates a terminal state.
+
+    Returns the 5-tuple (order_id, price, filled, status, error) if terminal, else None.
+    """
+    o_status = (o.get("status") or "").lower()
+
+    if o_status in ("executed", "filled", "complete"):
+        fill_count = float(o.get("fill_count", o.get("count", contracts)))
+        return order_id, planned_price, fill_count, "filled", None
+
+    if o_status in ("canceled", "cancelled"):
+        fill_count = float(o.get("fill_count", 0))
+        if fill_count > 0:
+            return order_id, planned_price, fill_count, "partial", "order canceled after partial fill"
+        return order_id, None, 0.0, "rejected", "order was canceled"
+
+    return None
+
+
 def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
                         ticker: str, timeout: float = None) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
     """Place and poll a Kalshi limit order. Returns (order_id, actual_price, filled, status, error)."""
@@ -2555,43 +2586,56 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
     if not order_id:
         return None, None, 0.0, "rejected", f"No order_id in response: {resp}"
 
-    # Poll for fill
+    # Check if the order already filled in the placement response
+    result = _kalshi_order_is_filled(order, contracts, planned_price, order_id)
+    if result is not None:
+        return result
+
+    # Poll for fill — check immediately, then at intervals
     deadline = time.monotonic() + fill_timeout
+    first_poll = True
     while time.monotonic() < deadline:
         try:
             poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
             o = poll.get("order", poll)
-            o_status = o.get("status", "")
+            result = _kalshi_order_is_filled(o, contracts, planned_price, order_id)
+            if result is not None:
+                return result
+        except Exception as poll_err:
+            print(f"  [kalshi-poll] Poll error (will retry): {poll_err}")
 
-            if o_status == "executed":
-                fill_count = float(o.get("fill_count", o.get("count", contracts)))
-                # Kalshi doesn't return average fill price directly;
-                # for limit orders, fill price = planned price (exchange guarantees limit-or-better)
-                return order_id, planned_price, fill_count, "filled", None
+        # First iteration: no sleep (order likely fills instantly for crossing limits)
+        if first_poll:
+            first_poll = False
+            time.sleep(0.1)
+        else:
+            time.sleep(ORDER_POLL_INTERVAL_S)
 
-            if o_status == "canceled":
-                fill_count = float(o.get("fill_count", 0))
-                if fill_count > 0:
-                    return order_id, planned_price, fill_count, "partial", "order canceled after partial fill"
-                return order_id, None, 0.0, "rejected", "order was canceled"
-
-        except Exception:
-            pass
-        time.sleep(ORDER_POLL_INTERVAL_S)
-
-    # Timeout — check final state and cancel if still resting
+    # Timeout — do a final status check, then cancel if still resting
     try:
         poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
         o = poll.get("order", poll)
+        result = _kalshi_order_is_filled(o, contracts, planned_price, order_id)
+        if result is not None:
+            return result
+        # Cancel unfilled remainder via DELETE (Kalshi v2 API)
+        _kalshi_auth_delete(f"/portfolio/orders/{order_id}")
         fill_count = float(o.get("fill_count", 0))
-        if o.get("status") == "executed":
-            return order_id, planned_price, fill_count, "filled", None
-        # Cancel unfilled remainder
-        _kalshi_auth_post(f"/portfolio/orders/{order_id}/cancel", {})
         if fill_count > 0:
             return order_id, planned_price, fill_count, "partial", "timeout — canceled remainder"
-    except Exception as e:
-        return order_id, None, 0.0, "error", f"timeout + cancel failed: {e}"
+    except Exception as cancel_err:
+        # Cancel failed (e.g. 404) — order may already be in terminal state.
+        # Re-check order status before giving up.
+        try:
+            poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
+            o = poll.get("order", poll)
+            result = _kalshi_order_is_filled(o, contracts, planned_price, order_id)
+            if result is not None:
+                print(f"  [kalshi] Order filled despite cancel error — recovered")
+                return result
+        except Exception:
+            pass
+        return order_id, None, 0.0, "error", f"timeout + cancel failed: {cancel_err}"
 
     return order_id, None, 0.0, "rejected", "order timed out with no fills"
 
@@ -3043,11 +3087,22 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                 pass
             time.sleep(ORDER_POLL_INTERVAL_S)
 
-        # Timeout — cancel
+        # Timeout — cancel via DELETE (Kalshi v2 API)
         try:
-            _kalshi_auth_post(f"/portfolio/orders/{order_id}/cancel", {})
+            _kalshi_auth_delete(f"/portfolio/orders/{order_id}")
         except Exception:
-            pass
+            # Cancel failed — re-check if order actually filled
+            try:
+                poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
+                o = poll.get("order", poll)
+                if (o.get("status") or "").lower() in ("executed", "filled", "complete"):
+                    msg = f"unwound {contracts:.0f} Kalshi contracts (filled despite cancel error, order {order_id})"
+                    append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
+                                         "side": side, "contracts": contracts,
+                                         "order_id": order_id, "status": "filled"})
+                    return msg
+            except Exception:
+                pass
         msg = f"unwind timed out (order {order_id}) — may need manual close"
         append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                              "side": side, "contracts": contracts, "order_id": order_id, "status": "timeout"})
