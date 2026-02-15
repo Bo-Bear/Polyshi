@@ -2150,8 +2150,9 @@ def print_trade_complete(candidate, exec_result, contracts: float,
 
     # Compute actual edge after fills + fees
     actual_gross = 1.0 - actual_total if actual_total else 0
-    actual_net = actual_gross - candidate.poly_fee - candidate.kalshi_fee - candidate.extras
     total_fees = candidate.poly_fee + candidate.kalshi_fee + candidate.extras
+    fees_per_contract = total_fees / filled if filled > 0 else total_fees
+    actual_net = actual_gross - fees_per_contract
 
     print(f"\n{_box_top('✓ TRADE COMPLETE')}")
     print(_box_line(f"Time:     {utc_ts()[:19].replace('T', ' ')}"))
@@ -2195,8 +2196,8 @@ def print_trade_complete(candidate, exec_result, contracts: float,
         print(_box_line(f"  Slippage: Poly {slip_poly:+.3f}, Kalshi {slip_kalshi:+.3f}"))
     print(_box_mid())
 
-    # Profit estimate: (1 - actual_total - fees) * contracts
-    profit_per = 1.0 - actual_total - total_fees
+    # Profit estimate: (1 - actual_total - fees_per_contract) * contracts
+    profit_per = 1.0 - actual_total - fees_per_contract
     profit_total = profit_per * filled
     print(_box_line(f"PROFIT: ${profit_total:.2f} ({actual_net * 100:.1f}%)"))
     print(_box_bot())
