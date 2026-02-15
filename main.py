@@ -125,14 +125,16 @@ KALSHI_SERIES = {
     "BTC": os.getenv("KALSHI_SERIES_BTC", "KXBTC15M"),
     "ETH": os.getenv("KALSHI_SERIES_ETH", "KXETH15M"),
     "SOL": os.getenv("KALSHI_SERIES_SOL", "KXSOL15M"),
+    "XRP": os.getenv("KALSHI_SERIES_XRP", "KXXRP15M"),
 }
 
 # Polymarket: We'll discover via tag=crypto + recurrence=15M, then select by title prefix.
-AVAILABLE_COINS = ["BTC", "ETH", "SOL"]
+AVAILABLE_COINS = ["BTC", "ETH", "SOL", "XRP"]
 POLY_TITLE_PREFIX = {
     "BTC": "Bitcoin Up or Down",
     "ETH": "Ethereum Up or Down",
     "SOL": "Solana Up or Down",
+    "XRP": "XRP Up or Down",
 }
 
 # Output
@@ -796,7 +798,7 @@ def _get_poly_clob_client():
 _spot_prices: Dict[str, float] = {}
 _spot_prices_ts: float = 0.0
 
-COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
+COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "ripple"}
 
 def fetch_spot_prices() -> Dict[str, float]:
     """Fetch current spot prices from CoinGecko. Returns {coin: usd_price}."""
@@ -1221,7 +1223,7 @@ def redeem_all_old_positions() -> int:
 
                     # Also check diagnostic dumps (nested in poly quotes)
                     if not up_tid:
-                        for coin_key in ("BTC", "ETH", "SOL"):
+                        for coin_key in AVAILABLE_COINS:
                             quotes = (row.get("all_coin_quotes") or {}).get(coin_key, {})
                             poly_q = quotes.get("poly", {})
                             if poly_q.get("up_token_id"):
@@ -3397,7 +3399,7 @@ def main() -> None:
         scan_t0 = time.monotonic()
         print_scan_header(scan_i)
 
-        # Pull Polymarket 15M crypto events once per scan (covers BTC/ETH/SOL)
+        # Pull Polymarket 15M crypto events once per scan (covers all coins)
         gamma_t0 = time.monotonic()
         poly_events = poly_get_active_15m_crypto_events(crypto_tag_id=crypto_tag_id, limit=250)
         gamma_ms = (time.monotonic() - gamma_t0) * 1000
@@ -3577,7 +3579,7 @@ def main() -> None:
         # Scan timing summary
         scan_ms = (time.monotonic() - scan_t0) * 1000
         process_ms = scan_ms - gamma_ms - fetch_ms
-        # Log at most one paper trade per scan (the best across BTC/ETH/SOL)
+        # Log at most one paper trade per scan (the best across all coins)
         if best_global is not None and best_global_poly is not None and best_global_kalshi is not None:
             # Gather per-coin latency for the winning coin
             winning_cd = coin_data[best_global.coin]
@@ -3845,9 +3847,10 @@ def main() -> None:
 
             mode_tag = "LIVE" if EXEC_MODE == "live" else "paper"
             fill_tag = "FILLED" if exec_result.both_filled else "INCOMPLETE"
-            active_str = f"BTC({coin_trade_counts.get('BTC', 0)}/{MAX_TRADES_PER_COIN}), " \
-                         f"ETH({coin_trade_counts.get('ETH', 0)}/{MAX_TRADES_PER_COIN}), " \
-                         f"SOL({coin_trade_counts.get('SOL', 0)}/{MAX_TRADES_PER_COIN})"
+            active_str = ", ".join(
+                f"{c}({coin_trade_counts.get(c, 0)}/{MAX_TRADES_PER_COIN})"
+                for c in AVAILABLE_COINS
+            )
             print(f"[{mode_tag}] Trade #{len(logged)} {fill_tag} | {active_str}")
 
             # Check if coin just hit its per-coin cap
