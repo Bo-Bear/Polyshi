@@ -164,6 +164,14 @@ ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "0.5"))  # poll
 # CLOB gives price improvement, so actual fill price may be lower than limit.
 LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.02"))  # 2 cents
 
+# Poly orderbook-aware retry config (used when Kalshi fills first)
+POLY_FILL_MAX_RETRIES = int(os.getenv("POLY_FILL_MAX_RETRIES", "5"))
+POLY_FILL_RETRY_TIMEOUT_S = float(os.getenv("POLY_FILL_RETRY_TIMEOUT_S", "3"))  # per-attempt timeout
+
+# Per-coin limits
+MAX_TRADES_PER_COIN = int(os.getenv("MAX_TRADES_PER_COIN", "5"))
+MAX_CONSECUTIVE_UNWINDS = int(os.getenv("MAX_CONSECUTIVE_UNWINDS", "3"))
+
 
 # -----------------------------
 # HTTP session + caches
@@ -2640,11 +2648,125 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
     return order_id, None, 0.0, "rejected", "order timed out with no fills"
 
 
+def _execute_poly_with_retries(side: str, planned_price: float, contracts: float,
+                               token_id: str) -> LegFill:
+    """Execute Poly leg with fresh orderbook fetches and retries.
+
+    On each attempt: fetch fresh asks, place limit at best ask + buffer, poll for fill.
+    Returns LegFill with aggregate result across all attempts.
+    """
+    t0 = time.monotonic()
+
+    if EXEC_MODE == "paper":
+        return LegFill(
+            exchange="poly", side=side,
+            planned_price=planned_price, actual_price=planned_price,
+            planned_contracts=contracts, filled_contracts=contracts,
+            order_id=f"paper-{int(time.time()*1000)}", fill_ts=utc_ts(),
+            latency_ms=(time.monotonic() - t0) * 1000, status="filled", error=None,
+        )
+
+    client = _get_poly_clob_client()
+    last_error = None
+
+    for attempt in range(1, POLY_FILL_MAX_RETRIES + 1):
+        # Fetch fresh orderbook
+        asks = poly_clob_get_asks(str(token_id))
+        if not asks:
+            last_error = f"retry {attempt}: empty orderbook"
+            print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: no asks available")
+            time.sleep(0.5)
+            continue
+
+        # Display orderbook levels (up to 3)
+        for i, (lvl_price, lvl_size) in enumerate(asks[:3]):
+            print(f"  [poly-retry]   Level {i+1}: ${lvl_price:.3f} x {lvl_size:.1f}")
+
+        best_ask = asks[0][0]
+        # Use best ask + small buffer (half of normal buffer) for retry fills
+        limit_price = min(round(best_ask + LIVE_PRICE_BUFFER, 2), 0.99)
+        print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
+              f"{int(contracts)}x @ ${limit_price:.2f} (best ask ${best_ask:.3f})")
+
+        # Place order
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=contracts,
+                side=BUY,
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.GTC)
+        except Exception as e:
+            last_error = f"retry {attempt}: order error: {e}"
+            print(f"  [poly-retry]   Order failed: {e}")
+            continue
+
+        if not resp.get("success", False):
+            last_error = f"retry {attempt}: rejected: {resp.get('errorMsg') or resp}"
+            print(f"  [poly-retry]   Rejected: {resp.get('errorMsg') or resp.get('error')}")
+            continue
+
+        order_id = resp.get("orderID") or resp.get("id")
+        if not order_id:
+            last_error = f"retry {attempt}: no orderID"
+            continue
+
+        # Poll for fill with per-attempt timeout
+        deadline = time.monotonic() + POLY_FILL_RETRY_TIMEOUT_S
+        filled = False
+        while time.monotonic() < deadline:
+            try:
+                o = client.get_order(order_id)
+                o_status = (o.get("status") or "").lower()
+                if o_status in ("matched", "filled"):
+                    filled_size = float(o.get("size_matched", o.get("original_size", contracts)))
+                    avg_price = float(o.get("price", planned_price))
+                    latency = (time.monotonic() - t0) * 1000
+                    print(f"  [poly-retry]   Filled on attempt {attempt}")
+                    return LegFill(
+                        exchange="poly", side=side,
+                        planned_price=planned_price, actual_price=avg_price,
+                        planned_contracts=contracts, filled_contracts=filled_size,
+                        order_id=order_id, fill_ts=utc_ts(),
+                        latency_ms=latency, status="filled", error=None,
+                    )
+                if o_status in ("canceled", "cancelled"):
+                    break
+            except Exception:
+                pass
+            time.sleep(ORDER_POLL_INTERVAL_S)
+
+        # Not filled — cancel and retry
+        try:
+            client.cancel(order_id)
+        except Exception:
+            pass
+        last_error = f"retry {attempt}: not filled within {POLY_FILL_RETRY_TIMEOUT_S}s"
+        print(f"  [poly-retry]   Not filled, canceling...")
+
+    # All retries exhausted
+    latency = (time.monotonic() - t0) * 1000
+    return LegFill(
+        exchange="poly", side=side,
+        planned_price=planned_price, actual_price=None,
+        planned_contracts=contracts, filled_contracts=0.0,
+        order_id=None, fill_ts=None,
+        latency_ms=latency, status="rejected",
+        error=f"all {POLY_FILL_MAX_RETRIES} retries exhausted: {last_error}",
+    )
+
+
 def execute_hedge(candidate: HedgeCandidate,
                   poly_quote: PolyMarketQuote,
                   kalshi_quote: KalshiMarketQuote,
                   logfile: str) -> ExecutionResult:
-    """Execute both legs of a hedge and log full execution details."""
+    """Execute both legs of a hedge. Kalshi first (fast, deterministic), then Poly with retries.
+
+    Execution order: Kalshi first, then Poly. If Poly fails after retries, unwind Kalshi.
+    Result preserves leg1=Poly, leg2=Kalshi for backward compatibility with logging/P&L.
+    """
     contracts = PAPER_CONTRACTS
 
     # Determine Poly token ID for the leg we're buying
@@ -2653,29 +2775,39 @@ def execute_hedge(candidate: HedgeCandidate,
     else:
         poly_token = poly_quote.down_token_id
 
-    # Execute leg 1: Polymarket (usually faster, fills via CLOB)
+    # --- STEP 1: Execute Kalshi FIRST (fast, deterministic fills) ---
     t_total = time.monotonic()
-    leg1 = execute_leg("poly", candidate.direction_on_poly,
-                       candidate.poly_price, contracts, token_id=poly_token)
-    leg1_done = time.monotonic()
+    print(f"  [exec] STEP 1: KALSHI — Placing {int(contracts)}x "
+          f"{'YES' if candidate.direction_on_kalshi == 'UP' else 'NO'} "
+          f"@ ${candidate.kalshi_price:.2f}...")
+    kalshi_fill = execute_leg("kalshi", candidate.direction_on_kalshi,
+                              candidate.kalshi_price, contracts,
+                              ticker=kalshi_quote.ticker)
+    kalshi_done = time.monotonic()
 
-    # Guard: if Poly leg failed, do NOT send Kalshi order (avoid unhedged exposure)
-    if leg1.status in ("error", "rejected") and leg1.filled_contracts == 0:
-        print(f"  [exec] Poly leg failed — skipping Kalshi to avoid unhedged position")
-        leg2 = LegFill(
-            exchange="kalshi", side=candidate.direction_on_kalshi,
-            planned_price=candidate.kalshi_price, actual_price=None,
+    # Guard: if Kalshi failed, do NOT send Poly order
+    if kalshi_fill.status in ("error", "rejected") and kalshi_fill.filled_contracts == 0:
+        print(f"  [exec] Kalshi leg failed — skipping Poly to avoid unhedged position")
+        poly_fill = LegFill(
+            exchange="poly", side=candidate.direction_on_poly,
+            planned_price=candidate.poly_price, actual_price=None,
             planned_contracts=contracts, filled_contracts=0.0,
             order_id=None, fill_ts=None,
-            latency_ms=0.0, status="skipped", error="skipped: poly leg failed",
+            latency_ms=0.0, status="skipped", error="skipped: kalshi leg failed",
         )
     else:
-        # Execute leg 2: Kalshi (use shorter timeout to limit unhedged exposure)
-        leg2 = execute_leg("kalshi", candidate.direction_on_kalshi,
-                           candidate.kalshi_price, contracts,
-                           timeout=MAX_UNHEDGED_SECONDS,
-                           ticker=kalshi_quote.ticker)
+        # --- STEP 2: Execute Poly with fresh orderbook retries ---
+        print(f"  [exec] STEP 2: POLYMARKET — Attempting fill with FRESH orderbook...")
+        poly_fill = _execute_poly_with_retries(
+            candidate.direction_on_poly, candidate.poly_price,
+            contracts, poly_token,
+        )
+
     total_ms = (time.monotonic() - t_total) * 1000
+
+    # Map to leg1=Poly, leg2=Kalshi for backward compatibility
+    leg1 = poly_fill
+    leg2 = kalshi_fill
 
     # Compute slippage
     slip_poly = (leg1.actual_price - leg1.planned_price) if leg1.actual_price is not None else 0.0
@@ -2731,8 +2863,8 @@ def execute_hedge(candidate: HedgeCandidate,
     if leg2.actual_price is not None and leg2.actual_price != leg2.planned_price:
         s2 += f" (slip {slip_kalshi:+.4f})"
 
-    fill_gap_ms = (leg1_done - t_total) * 1000
-    print(f"  [exec] {s1} | {s2} | gap={fill_gap_ms:.0f}ms | total={total_ms:.0f}ms")
+    kalshi_ms = (kalshi_done - t_total) * 1000
+    print(f"  [exec] {s2} | {s1} | kalshi={kalshi_ms:.0f}ms | total={total_ms:.0f}ms")
 
     if leg1.status == "partial" or leg2.status == "partial":
         print(f"  [exec] PARTIAL FILL: Poly {leg1.filled_contracts}/{leg1.planned_contracts} "
@@ -2746,33 +2878,11 @@ def execute_hedge(candidate: HedgeCandidate,
             print(f"  [exec]   Kalshi error: {leg2.error}")
 
         # --- Automatic unwind ---
-        # If Poly (leg1) filled but Kalshi (leg2) didn't fully fill,
-        # sell back the unmatched Poly contracts to close exposure.
-        if leg1.status == "filled" and leg2.status != "filled":
-            unmatched = leg1.filled_contracts - leg2.filled_contracts
-            if unmatched > 0 and EXEC_MODE == "live":
-                print(f"  [unwind] Attempting to sell {unmatched:.0f} Poly contracts to close exposure...")
-                unwind_result = _unwind_poly_leg(
-                    candidate.direction_on_poly, leg1.actual_price or leg1.planned_price,
-                    unmatched, poly_token, logfile,
-                )
-                if unwind_result:
-                    print(f"  [unwind] {unwind_result}")
-                exec_row["unwind_attempted"] = True
-                exec_row["unwind_contracts"] = unmatched
-                exec_row["unwind_result"] = unwind_result
-            elif unmatched > 0 and EXEC_MODE == "paper":
-                print(f"  [unwind] Paper mode — would sell {unmatched:.0f} Poly contracts")
-                exec_row["unwind_attempted"] = False
-                exec_row["unwind_contracts"] = unmatched
-                exec_row["unwind_result"] = "paper_mode_skip"
-
-        # If Kalshi (leg2) filled but Poly (leg1) didn't fully fill,
-        # sell back the unmatched Kalshi contracts.
-        elif leg2.status == "filled" and leg1.status != "filled":
+        # Kalshi filled but Poly didn't → unwind Kalshi (fast, reliable)
+        if leg2.status == "filled" and leg1.status != "filled":
             unmatched = leg2.filled_contracts - leg1.filled_contracts
             if unmatched > 0 and EXEC_MODE == "live":
-                print(f"  [unwind] Attempting to sell {unmatched:.0f} Kalshi contracts to close exposure...")
+                print(f"  [unwind] Poly failed — selling {unmatched:.0f} Kalshi contracts to close exposure...")
                 unwind_result = _unwind_kalshi_leg(
                     candidate.direction_on_kalshi, leg2.actual_price or leg2.planned_price,
                     unmatched, kalshi_quote.ticker, logfile,
@@ -2784,6 +2894,26 @@ def execute_hedge(candidate: HedgeCandidate,
                 exec_row["unwind_result"] = unwind_result
             elif unmatched > 0 and EXEC_MODE == "paper":
                 print(f"  [unwind] Paper mode — would sell {unmatched:.0f} Kalshi contracts")
+                exec_row["unwind_attempted"] = False
+                exec_row["unwind_contracts"] = unmatched
+                exec_row["unwind_result"] = "paper_mode_skip"
+
+        # Poly filled but Kalshi didn't → unwind Poly (less likely in new flow)
+        elif leg1.status == "filled" and leg2.status != "filled":
+            unmatched = leg1.filled_contracts - leg2.filled_contracts
+            if unmatched > 0 and EXEC_MODE == "live":
+                print(f"  [unwind] Kalshi failed — selling {unmatched:.0f} Poly contracts to close exposure...")
+                unwind_result = _unwind_poly_leg(
+                    candidate.direction_on_poly, leg1.actual_price or leg1.planned_price,
+                    unmatched, poly_token, logfile,
+                )
+                if unwind_result:
+                    print(f"  [unwind] {unwind_result}")
+                exec_row["unwind_attempted"] = True
+                exec_row["unwind_contracts"] = unmatched
+                exec_row["unwind_result"] = unwind_result
+            elif unmatched > 0 and EXEC_MODE == "paper":
+                print(f"  [unwind] Paper mode — would sell {unmatched:.0f} Poly contracts")
                 exec_row["unwind_attempted"] = False
                 exec_row["unwind_contracts"] = unmatched
                 exec_row["unwind_result"] = "paper_mode_skip"
@@ -3134,6 +3264,9 @@ def main() -> None:
     print(f"  Session drawdown:   ${MAX_SESSION_DRAWDOWN:.2f} max loss before auto-stop")
     print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s (forced unwind)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
+    print(f"  Poly fill retries:  {POLY_FILL_MAX_RETRIES} attempts x {POLY_FILL_RETRY_TIMEOUT_S:.0f}s each")
+    print(f"  Per-coin trade cap: {MAX_TRADES_PER_COIN} trades/coin (incl. unwinds)")
+    print(f"  Max consec unwinds: {MAX_CONSECUTIVE_UNWINDS}/coin before stopping")
 
     # Start Polymarket CLOB WebSocket for real-time orderbook data
     global _poly_ws
@@ -3251,6 +3384,11 @@ def main() -> None:
     scan_i = 0
     consecutive_skips = 0
 
+    # Per-coin tracking
+    coin_trade_counts: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}
+    coin_consecutive_unwinds: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}
+    coin_stopped: Dict[str, str] = {}  # coin -> reason it was stopped
+
     # Store poly quotes per-coin per-scan for book depth lookups on winning trade
     _scan_poly_quotes: Dict[str, Optional[PolyMarketQuote]] = {}
 
@@ -3306,7 +3444,19 @@ def main() -> None:
             # --- Determine skip reason (if any) before printing ---
             skip = None  # (reason_key, display_text) or None
 
-            if kalshi is None or poly is None:
+            # Per-coin caps
+            if coin in coin_stopped:
+                skip = ("coin_stopped", f"{coin} stopped: {coin_stopped[coin]}")
+            elif coin_trade_counts.get(coin, 0) >= MAX_TRADES_PER_COIN:
+                coin_stopped[coin] = f"reached max {MAX_TRADES_PER_COIN} trades"
+                skip = ("coin_max_trades",
+                        f"{coin} reached max {MAX_TRADES_PER_COIN} trades (incl. unwinds) — STOPPING")
+            elif coin_consecutive_unwinds.get(coin, 0) >= MAX_CONSECUTIVE_UNWINDS:
+                coin_stopped[coin] = f"{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds"
+                skip = ("coin_max_unwinds",
+                        f"{coin} hit {MAX_CONSECUTIVE_UNWINDS} consecutive unwinds — STOPPING")
+
+            if skip is None and (kalshi is None or poly is None):
                 skip = ("no_kalshi_market" if kalshi is None else "no_poly_market",
                         f"No {'Kalshi' if kalshi is None else 'Poly'} market found")
                 if cd["kalshi_err"]:
@@ -3681,12 +3831,33 @@ def main() -> None:
             append_log(logfile, row)
             logged.append(row)
             consecutive_skips = 0
+
+            # Per-coin tracking: update trade count and unwind counter
+            traded_coin = best_global.coin
+            coin_trade_counts[traded_coin] = coin_trade_counts.get(traded_coin, 0) + 1
+            was_unwound = not exec_result.both_filled
+            if was_unwound:
+                coin_consecutive_unwinds[traded_coin] = coin_consecutive_unwinds.get(traded_coin, 0) + 1
+                print(f"  [unwind-track] UNWIND COUNT {traded_coin}: "
+                      f"{coin_consecutive_unwinds[traded_coin]}/{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds")
+            else:
+                coin_consecutive_unwinds[traded_coin] = 0  # reset on success
+
             mode_tag = "LIVE" if EXEC_MODE == "live" else "paper"
             fill_tag = "FILLED" if exec_result.both_filled else "INCOMPLETE"
-            active_str = f"BTC({sum(1 for r in logged if r['coin']=='BTC')} trades), " \
-                         f"ETH({sum(1 for r in logged if r['coin']=='ETH')} trades), " \
-                         f"SOL({sum(1 for r in logged if r['coin']=='SOL')} trades)"
+            active_str = f"BTC({coin_trade_counts.get('BTC', 0)}/{MAX_TRADES_PER_COIN}), " \
+                         f"ETH({coin_trade_counts.get('ETH', 0)}/{MAX_TRADES_PER_COIN}), " \
+                         f"SOL({coin_trade_counts.get('SOL', 0)}/{MAX_TRADES_PER_COIN})"
             print(f"[{mode_tag}] Trade #{len(logged)} {fill_tag} | {active_str}")
+
+            # Check if coin just hit its per-coin cap
+            if coin_trade_counts[traded_coin] >= MAX_TRADES_PER_COIN:
+                coin_stopped[traded_coin] = f"reached max {MAX_TRADES_PER_COIN} trades"
+                print(f"  [limit] {traded_coin} reached max {MAX_TRADES_PER_COIN} trades "
+                      f"(incl. unwinds) — STOPPING this crypto")
+            elif coin_consecutive_unwinds.get(traded_coin, 0) >= MAX_CONSECUTIVE_UNWINDS:
+                coin_stopped[traded_coin] = f"{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds"
+                print(f"  [limit] {traded_coin} hit {MAX_CONSECUTIVE_UNWINDS} consecutive unwinds — STOPPING this crypto")
 
             # Session drawdown check (live mode only)
             if EXEC_MODE == "live" and session_start_total > 0 and MAX_SESSION_DRAWDOWN > 0:
