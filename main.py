@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
@@ -875,7 +875,7 @@ class _PolyOrderbookWS:
                 pass
             self._connected.clear()
             if self._running:
-                time.sleep(2)
+                time.sleep(0.5)
 
     def _on_open(self, ws):
         self._connected.set()
@@ -2390,7 +2390,11 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
 # Parallel fetch helper
 # -----------------------------
 def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> dict:
-    """Fetch Kalshi and Polymarket quotes for a single coin. Returns dict with quotes, timing, and errors."""
+    """Fetch Kalshi and Polymarket quotes for a single coin **in parallel**.
+
+    Both exchange quotes are fetched concurrently so neither price is stale
+    relative to the other when the edge is calculated.
+    """
     result: dict = {
         "coin": coin, "kalshi": None, "poly": None,
         "kalshi_ms": 0.0, "poly_ms": 0.0,
@@ -2398,18 +2402,28 @@ def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> dict:
     }
 
     t0 = time.monotonic()
-    try:
-        result["kalshi"] = pick_current_kalshi_market(KALSHI_SERIES[coin])
-    except Exception as e:
-        result["kalshi_err"] = str(e)
-    result["kalshi_ms"] = (time.monotonic() - t0) * 1000
 
-    t0 = time.monotonic()
-    try:
-        result["poly"] = extract_poly_quote_for_coin(poly_events, coin)
-    except Exception as e:
-        result["poly_err"] = str(e)
-    result["poly_ms"] = (time.monotonic() - t0) * 1000
+    def _fetch_kalshi():
+        return pick_current_kalshi_market(KALSHI_SERIES[coin])
+
+    def _fetch_poly():
+        return extract_poly_quote_for_coin(poly_events, coin)
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        kalshi_future = ex.submit(_fetch_kalshi)
+        poly_future = ex.submit(_fetch_poly)
+
+        try:
+            result["kalshi"] = kalshi_future.result(timeout=15)
+        except Exception as e:
+            result["kalshi_err"] = str(e)
+        result["kalshi_ms"] = (time.monotonic() - t0) * 1000
+
+        try:
+            result["poly"] = poly_future.result(timeout=15)
+        except Exception as e:
+            result["poly_err"] = str(e)
+        result["poly_ms"] = (time.monotonic() - t0) * 1000
 
     return result
 
@@ -3399,10 +3413,41 @@ def main() -> None:
         scan_t0 = time.monotonic()
         print_scan_header(scan_i)
 
-        # Pull Polymarket 15M crypto events once per scan (covers all coins)
-        gamma_t0 = time.monotonic()
-        poly_events = poly_get_active_15m_crypto_events(crypto_tag_id=crypto_tag_id, limit=250)
-        gamma_ms = (time.monotonic() - gamma_t0) * 1000
+        # Overlap Gamma event fetch with Kalshi fetches so neither exchange's
+        # prices go stale while the other is loading.
+        # Kalshi doesn't need poly_events, so start both in parallel.
+        fetch_t0 = time.monotonic()
+
+        with ThreadPoolExecutor(max_workers=len(selected_coins) + 1) as executor:
+            # Kick off Gamma events fetch concurrently with all Kalshi fetches
+            gamma_future = executor.submit(
+                poly_get_active_15m_crypto_events,
+                crypto_tag_id=crypto_tag_id, limit=250,
+            )
+            kalshi_futures = {
+                executor.submit(
+                    lambda c=coin: pick_current_kalshi_market(KALSHI_SERIES[c])
+                ): coin
+                for coin in selected_coins
+            }
+
+            # Collect Kalshi results as they arrive
+            kalshi_results: Dict[str, Any] = {}
+            kalshi_errors: Dict[str, str] = {}
+            for future in as_completed(kalshi_futures):
+                coin = kalshi_futures[future]
+                try:
+                    kalshi_results[coin] = future.result(timeout=15)
+                except Exception as e:
+                    kalshi_errors[coin] = str(e)
+
+            # Wait for Gamma events (may already be done)
+            gamma_t0 = time.monotonic()
+            try:
+                poly_events = gamma_future.result(timeout=20)
+            except Exception:
+                poly_events = []
+            gamma_ms = (time.monotonic() - gamma_t0) * 1000
 
         # Local filter: keep only events that are actually 15-minute recurrence (if field present)
         pre_filter_count = len(poly_events)
@@ -3416,17 +3461,36 @@ def main() -> None:
                 filtered.append(e)
 
         poly_events = filtered
-        # Fetch all coin quotes in parallel (Kalshi + Poly CLOB calls concurrently)
-        fetch_t0 = time.monotonic()
-        coin_data: Dict[str, dict] = {}
+
+        # Now fetch Poly CLOB quotes for all coins in parallel (Kalshi already done)
+        poly_results: Dict[str, Any] = {}
+        poly_errors: Dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=len(selected_coins)) as executor:
-            futures = {
-                executor.submit(_fetch_coin_quotes, coin, poly_events): coin
+            poly_futures = {
+                executor.submit(
+                    extract_poly_quote_for_coin, poly_events, coin
+                ): coin
                 for coin in selected_coins
             }
-            for future in as_completed(futures):
-                result = future.result()
-                coin_data[result["coin"]] = result
+            for future in as_completed(poly_futures):
+                coin = poly_futures[future]
+                try:
+                    poly_results[coin] = future.result(timeout=15)
+                except Exception as e:
+                    poly_errors[coin] = str(e)
+
+        # Assemble coin_data in the same format as before
+        coin_data: Dict[str, dict] = {}
+        for coin in selected_coins:
+            coin_data[coin] = {
+                "coin": coin,
+                "kalshi": kalshi_results.get(coin),
+                "poly": poly_results.get(coin),
+                "kalshi_ms": 0.0,
+                "poly_ms": 0.0,
+                "kalshi_err": kalshi_errors.get(coin),
+                "poly_err": poly_errors.get(coin),
+            }
         fetch_ms = (time.monotonic() - fetch_t0) * 1000
 
         best_global: Optional[HedgeCandidate] = None
