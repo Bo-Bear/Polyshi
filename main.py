@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 
 import requests
 from dotenv import load_dotenv
@@ -2813,7 +2813,8 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
             o_status = (o.get("status") or "").lower()
 
             if o_status == "matched" or o_status == "filled":
-                filled_size = float(o.get("size_matched", o.get("original_size", contracts)))
+                raw_matched = o.get("size_matched")
+                filled_size = float(raw_matched) if raw_matched else float(o.get("original_size", contracts))
                 avg_price = _poly_avg_fill_price(o, planned_price)
                 return order_id, avg_price, filled_size, "filled", None
 
@@ -2831,8 +2832,11 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
     # Timeout — cancel unfilled remainder
     try:
         o = client.get_order(order_id)
-        filled_size = float(o.get("size_matched", 0))
+        raw_matched = o.get("size_matched")
+        filled_size = float(raw_matched) if raw_matched else 0.0
         if (o.get("status") or "").lower() in ("matched", "filled"):
+            if not filled_size:
+                filled_size = float(o.get("original_size", contracts))
             avg_price = _poly_avg_fill_price(o, planned_price)
             return order_id, avg_price, filled_size, "filled", None
         client.cancel(order_id)
@@ -2929,7 +2933,8 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                 o = client.get_order(order_id)
                 o_status = (o.get("status") or "").lower()
                 if o_status in ("matched", "filled"):
-                    filled_size = float(o.get("size_matched", o.get("original_size", contracts)))
+                    raw_matched = o.get("size_matched")
+                    filled_size = float(raw_matched) if raw_matched else float(o.get("original_size", contracts))
                     avg_price = _poly_avg_fill_price(o, planned_price)
                     latency = (time.monotonic() - t0) * 1000
                     print(f"  [poly-retry]   Filled on attempt {attempt}")
