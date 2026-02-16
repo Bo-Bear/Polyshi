@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 import requests
 from dotenv import load_dotenv
@@ -49,14 +49,14 @@ load_dotenv()
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "3"))
 MAX_TEST_TRADES = int(os.getenv("MAX_TEST_TRADES", "5"))
 WINDOW_ALIGN_TOLERANCE_SECONDS = int(os.getenv("WINDOW_ALIGN_TOLERANCE_SECONDS", "10"))
-MIN_LEG_NOTIONAL = float(os.getenv("MIN_LEG_NOTIONAL", "10"))  # $ minimum liquidity per leg
+MIN_LEG_NOTIONAL = float(os.getenv("MIN_LEG_NOTIONAL", "25"))  # $ minimum liquidity per leg
 USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 
 # -----------------------------
 # Execution safeguards
 # -----------------------------
 # Minimum net edge to accept a trade (must exceed expected execution slippage of ~2-3c)
-MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.03"))  # 3%
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.04"))  # 4%
 
 # Maximum net edge — skip outliers that are likely stale/bad data, not real opportunities
 MAX_NET_EDGE = float(os.getenv("MAX_NET_EDGE", "0.15"))  # 15%
@@ -174,7 +174,7 @@ ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "0.5"))  # poll
 LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.02"))  # 2 cents
 # Maximum slippage allowed above planned price on Polymarket.
 # If the best ask has moved more than this above planned_price, skip the fill attempt.
-POLY_MAX_SLIPPAGE = float(os.getenv("POLY_MAX_SLIPPAGE", "0.03"))  # 3 cents
+POLY_MAX_SLIPPAGE = float(os.getenv("POLY_MAX_SLIPPAGE", "0.02"))  # 2 cents
 
 # Poly orderbook-aware retry config (used when Kalshi fills first)
 POLY_FILL_MAX_RETRIES = int(os.getenv("POLY_FILL_MAX_RETRIES", "5"))
