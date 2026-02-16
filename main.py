@@ -54,7 +54,7 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 # Execution safeguards
 # -----------------------------
 # Minimum net edge to accept a trade (must exceed expected execution slippage of ~3-4c)
-MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.07"))  # 7%
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.06"))  # 6%
 
 # Maximum net edge — skip outliers that are likely stale/bad data, not real opportunities
 MAX_NET_EDGE = float(os.getenv("MAX_NET_EDGE", "0.15"))  # 15%
