@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.25"
+VERSION = "1.1.26"
 VERSION_DATE = "2026-02-16 21:30 UTC"
 
 import requests
@@ -104,8 +104,8 @@ MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
 PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "10"))
 
-# Cap trade size to this fraction of Poly book depth (0.8 = use at most 80% of visible depth)
-POLY_DEPTH_CAP_RATIO = float(os.getenv("POLY_DEPTH_CAP_RATIO", "0.8"))
+# Cap trade size to this fraction of Poly book depth (0.5 = use at most 50% of visible depth)
+POLY_DEPTH_CAP_RATIO = float(os.getenv("POLY_DEPTH_CAP_RATIO", "0.5"))
 
 # Minimum contracts after depth-capping (skip trade if book can't support this many)
 MIN_CONTRACTS = int(os.getenv("MIN_CONTRACTS", "3"))
@@ -192,6 +192,7 @@ POLY_FILL_RETRY_TIMEOUT_S = float(os.getenv("POLY_FILL_RETRY_TIMEOUT_S", "3"))  
 
 # Per-coin limits
 MAX_TRADES_PER_COIN = int(os.getenv("MAX_TRADES_PER_COIN", "5"))
+MAX_TRADES_PER_COIN_PER_WINDOW = int(os.getenv("MAX_TRADES_PER_COIN_PER_WINDOW", "2"))
 MAX_CONSECUTIVE_UNWINDS = int(os.getenv("MAX_CONSECUTIVE_UNWINDS", "3"))
 
 
@@ -1154,6 +1155,7 @@ class ExecutionResult:
     slippage_poly: float    # actual_price - planned_price (positive = worse)
     slippage_kalshi: float
     both_filled: bool       # True if both legs fully filled
+    unwind_failed: bool = False  # True if unwind was needed but failed
 
 
 # -----------------------------
@@ -3364,10 +3366,17 @@ def execute_hedge(candidate: HedgeCandidate,
         )
     else:
         # --- STEP 2: Execute Poly with fresh orderbook retries ---
+        # Match Poly target to Kalshi's ACTUAL fill count, not planned.
+        # This prevents Poly from overfilling when Kalshi partially fills,
+        # which is the primary cause of Poly-heavy unhedged exposure.
+        poly_target = kalshi_fill.filled_contracts if kalshi_fill.filled_contracts > 0 else contracts
+        if poly_target != contracts:
+            print(f"  [exec] Adjusting Poly target: {int(contracts)} → {int(poly_target)} "
+                  f"(matching Kalshi actual fill)")
         print(f"  [exec] STEP 2: POLYMARKET — Attempting fill with FRESH orderbook...")
         poly_fill = _execute_poly_with_retries(
             candidate.direction_on_poly, candidate.poly_price,
-            contracts, poly_token,
+            poly_target, poly_token,
         )
 
     total_ms = (time.monotonic() - t_total) * 1000
@@ -3459,6 +3468,8 @@ def execute_hedge(candidate: HedgeCandidate,
                 )
                 if unwind_result:
                     print(f"  [unwind] {unwind_result}")
+                if unwind_result and "FAILED" in unwind_result:
+                    result.unwind_failed = True
                 exec_row["unwind_attempted"] = True
                 exec_row["unwind_contracts"] = kalshi_excess
                 exec_row["unwind_result"] = unwind_result
@@ -3478,6 +3489,8 @@ def execute_hedge(candidate: HedgeCandidate,
                 )
                 if unwind_result:
                     print(f"  [unwind] {unwind_result}")
+                if unwind_result and "FAILED" in unwind_result:
+                    result.unwind_failed = True
                 exec_row["unwind_attempted"] = True
                 exec_row["unwind_contracts"] = poly_excess
                 exec_row["unwind_result"] = unwind_result
@@ -3888,6 +3901,7 @@ def main() -> None:
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
     print(f"  Poly fill retries:  {POLY_FILL_MAX_RETRIES} attempts x {POLY_FILL_RETRY_TIMEOUT_S:.0f}s each")
     print(f"  Per-coin trade cap: {MAX_TRADES_PER_COIN} trades/coin (incl. unwinds)")
+    print(f"  Per-window cap:     {MAX_TRADES_PER_COIN_PER_WINDOW} trades/coin/window (resets each 15m)")
     print(f"  Max consec unwinds: {MAX_CONSECUTIVE_UNWINDS}/coin before stopping")
 
     # Start Polymarket CLOB WebSocket for real-time orderbook data
@@ -4008,6 +4022,7 @@ def main() -> None:
 
     # Per-coin tracking
     coin_trade_counts: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}
+    coin_window_trade_counts: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}  # resets each 15m window
     coin_consecutive_unwinds: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}
     coin_stopped: Dict[str, str] = {}  # coin -> reason it was stopped
 
@@ -4086,6 +4101,9 @@ def main() -> None:
 
             window_trades = []
             current_window_close_ts = None  # Will be set from next market data
+            # Reset per-window trade limits so coins can trade again in the new window
+            for c in coin_window_trade_counts:
+                coin_window_trade_counts[c] = 0
 
             if stop_reason:
                 print(f"\n*** {stop_reason} — stopping session ***")
@@ -4210,6 +4228,9 @@ def main() -> None:
                 coin_stopped[coin] = f"reached max {MAX_TRADES_PER_COIN} trades"
                 skip = ("coin_max_trades",
                         f"{coin} reached max {MAX_TRADES_PER_COIN} trades (incl. unwinds) — STOPPING")
+            elif coin_window_trade_counts.get(coin, 0) >= MAX_TRADES_PER_COIN_PER_WINDOW:
+                skip = ("coin_window_cap",
+                        f"{coin} hit {MAX_TRADES_PER_COIN_PER_WINDOW} trades this window — waiting for next")
             elif coin_consecutive_unwinds.get(coin, 0) >= MAX_CONSECUTIVE_UNWINDS:
                 coin_stopped[coin] = f"{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds"
                 skip = ("coin_max_unwinds",
@@ -4603,11 +4624,17 @@ def main() -> None:
             # Per-coin tracking: update trade count and unwind counter
             traded_coin = best_global.coin
             coin_trade_counts[traded_coin] = coin_trade_counts.get(traded_coin, 0) + 1
+            coin_window_trade_counts[traded_coin] = coin_window_trade_counts.get(traded_coin, 0) + 1
             was_unwound = not exec_result.both_filled
             if was_unwound:
                 coin_consecutive_unwinds[traded_coin] = coin_consecutive_unwinds.get(traded_coin, 0) + 1
                 print(f"  [unwind-track] UNWIND COUNT {traded_coin}: "
                       f"{coin_consecutive_unwinds[traded_coin]}/{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds")
+                # Stop the coin entirely if unwind failed — continuing would compound exposure
+                if exec_result.unwind_failed:
+                    coin_stopped[traded_coin] = "unwind FAILED — needs manual close"
+                    print(f"  [unwind-track] *** {traded_coin} STOPPED: unwind failed, "
+                          f"manual close required to avoid compounding exposure ***")
             else:
                 coin_consecutive_unwinds[traded_coin] = 0  # reset on success
 
