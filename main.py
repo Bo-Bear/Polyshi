@@ -165,6 +165,9 @@ ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "0.5"))  # poll
 # Price buffer added to limit orders in live mode to improve fill rate.
 # CLOB gives price improvement, so actual fill price may be lower than limit.
 LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.02"))  # 2 cents
+# Maximum slippage allowed above planned price on Polymarket.
+# If the best ask has moved more than this above planned_price, skip the fill attempt.
+POLY_MAX_SLIPPAGE = float(os.getenv("POLY_MAX_SLIPPAGE", "0.03"))  # 3 cents
 
 # Poly orderbook-aware retry config (used when Kalshi fills first)
 POLY_FILL_MAX_RETRIES = int(os.getenv("POLY_FILL_MAX_RETRIES", "5"))
@@ -2640,6 +2643,31 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
     return order_id, None, 0.0, "rejected", "order timed out with no fills"
 
 
+def _poly_avg_fill_price(order: dict, fallback: float) -> float:
+    """Extract the true average fill price from associate_trades.
+
+    The order's ``price`` field is the *limit* price, not the execution price.
+    ``associate_trades`` contains the individual fills with real prices.
+    """
+    trades = order.get("associate_trades") or []
+    if not trades:
+        # No trade data available — fall back to order price (limit), then planned
+        return float(order.get("price", fallback))
+    total_cost = 0.0
+    total_size = 0.0
+    for t in trades:
+        try:
+            tp = float(t.get("price", 0))
+            ts = float(t.get("size", 0))
+            total_cost += tp * ts
+            total_size += ts
+        except (TypeError, ValueError):
+            continue
+    if total_size > 0:
+        return total_cost / total_size
+    return float(order.get("price", fallback))
+
+
 def _execute_poly_leg(side: str, planned_price: float, contracts: float,
                       token_id: str, timeout: float = None) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
     """Place and poll a Polymarket CLOB limit order. Returns (order_id, actual_price, filled, status, error)."""
@@ -2648,9 +2676,11 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
 
     # Add buffer to limit price for better fill probability.
     # CLOB gives price improvement: if best ask < limit, you fill at best ask.
+    # Cap at planned_price + POLY_MAX_SLIPPAGE to prevent runaway slippage.
     buffered = planned_price + LIVE_PRICE_BUFFER
+    max_acceptable = planned_price + POLY_MAX_SLIPPAGE
     # Round price to 2 decimal places (Poly CLOB tick size is $0.01), cap at 0.99
-    price = min(round(buffered, 2), 0.99)
+    price = min(round(buffered, 2), round(max_acceptable, 2), 0.99)
 
     # Create and sign order
     order_args = OrderArgs(
@@ -2680,13 +2710,14 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
 
             if o_status == "matched" or o_status == "filled":
                 filled_size = float(o.get("size_matched", o.get("original_size", contracts)))
-                avg_price = float(o.get("price", planned_price))
+                avg_price = _poly_avg_fill_price(o, planned_price)
                 return order_id, avg_price, filled_size, "filled", None
 
             if o_status == "canceled" or o_status == "cancelled":
                 filled_size = float(o.get("size_matched", 0))
                 if filled_size > 0:
-                    return order_id, planned_price, filled_size, "partial", "order canceled after partial fill"
+                    avg_price = _poly_avg_fill_price(o, planned_price)
+                    return order_id, avg_price, filled_size, "partial", "order canceled after partial fill"
                 return order_id, None, 0.0, "rejected", "order was canceled"
 
         except Exception:
@@ -2698,7 +2729,8 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
         o = client.get_order(order_id)
         filled_size = float(o.get("size_matched", 0))
         if (o.get("status") or "").lower() in ("matched", "filled"):
-            return order_id, planned_price, filled_size, "filled", None
+            avg_price = _poly_avg_fill_price(o, planned_price)
+            return order_id, avg_price, filled_size, "filled", None
         client.cancel(order_id)
         if filled_size > 0:
             return order_id, planned_price, filled_size, "partial", "timeout — canceled remainder"
@@ -2743,8 +2775,20 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             print(f"  [poly-retry]   Level {i+1}: ${lvl_price:.3f} x {lvl_size:.1f}")
 
         best_ask = asks[0][0]
-        # Use best ask + small buffer (half of normal buffer) for retry fills
-        limit_price = min(round(best_ask + LIVE_PRICE_BUFFER, 2), 0.99)
+
+        # Enforce slippage cap: reject if market moved too far from planned price
+        max_acceptable = planned_price + POLY_MAX_SLIPPAGE
+        if best_ask > max_acceptable:
+            last_error = (f"retry {attempt}: best ask ${best_ask:.3f} exceeds "
+                          f"max acceptable ${max_acceptable:.3f} (planned ${planned_price:.3f} + "
+                          f"${POLY_MAX_SLIPPAGE:.3f} cap)")
+            print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
+                  f"SKIP — best ask ${best_ask:.3f} > cap ${max_acceptable:.3f}")
+            time.sleep(0.5)
+            continue
+
+        # Use best ask + small buffer, but cap at planned_price + max slippage
+        limit_price = min(round(best_ask + LIVE_PRICE_BUFFER, 2), round(max_acceptable, 2), 0.99)
         print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
               f"{int(contracts)}x @ ${limit_price:.2f} (best ask ${best_ask:.3f})")
 
@@ -2782,7 +2826,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                 o_status = (o.get("status") or "").lower()
                 if o_status in ("matched", "filled"):
                     filled_size = float(o.get("size_matched", o.get("original_size", contracts)))
-                    avg_price = float(o.get("price", planned_price))
+                    avg_price = _poly_avg_fill_price(o, planned_price)
                     latency = (time.monotonic() - t0) * 1000
                     print(f"  [poly-retry]   Filled on attempt {attempt}")
                     return LegFill(
