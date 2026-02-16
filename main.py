@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 import requests
 from dotenv import load_dotenv
@@ -2379,6 +2379,103 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
             f"{depth_str}{pnl_str}"
         )
 
+    # Exchange-level diagnostics: contract counts, $ spent, direction bias
+    exec_rows = [r for r in log_rows if r.get("exec_leg1_exchange") is not None]
+    if exec_rows:
+        kalshi_bought = 0.0
+        kalshi_spent = 0.0
+        poly_bought = 0.0
+        poly_spent = 0.0
+        direction_counts: Dict[str, int] = {}
+        partial_fills = 0
+        zero_qty_fills = 0
+
+        for r in exec_rows:
+            direction = f"Kalshi {r.get('kalshi_side','?')} + Poly {r.get('poly_side','?')}"
+            direction_counts[direction] = direction_counts.get(direction, 0) + 1
+
+            for leg in (1, 2):
+                exch = r.get(f"exec_leg{leg}_exchange", "")
+                filled = r.get(f"exec_leg{leg}_filled_qty", 0) or 0
+                planned = r.get(f"exec_leg{leg}_planned_qty", 0) or 0
+                actual_px = r.get(f"exec_leg{leg}_actual_price") or 0
+                status = r.get(f"exec_leg{leg}_status", "")
+
+                if status == "filled" and filled == 0:
+                    zero_qty_fills += 1
+                elif 0 < filled < planned:
+                    partial_fills += 1
+
+                cost = filled * actual_px if actual_px else 0
+                if "kalshi" in exch:
+                    kalshi_bought += filled
+                    kalshi_spent += cost
+                elif "poly" in exch:
+                    poly_bought += filled
+                    poly_spent += cost
+
+        print(f"\n--- Exchange Diagnostics ({len(exec_rows)} trades) ---")
+        print(f"  {'':30s} {'KALSHI':>10s} {'POLY':>10s} {'DELTA':>10s}")
+        print(f"  {'Contracts filled':30s} {kalshi_bought:10.1f} {poly_bought:10.1f} {kalshi_bought - poly_bought:+10.1f}")
+        print(f"  {'$ spent (fills)':30s} ${kalshi_spent:9.2f} ${poly_spent:9.2f} ${kalshi_spent - poly_spent:+9.2f}")
+        if kalshi_bought + poly_bought > 0:
+            print(f"  {'Avg price/contract':30s} ${kalshi_spent/kalshi_bought if kalshi_bought else 0:9.4f} "
+                  f"${poly_spent/poly_bought if poly_bought else 0:9.4f}")
+
+        print(f"\n  Direction bias:")
+        for d, cnt in sorted(direction_counts.items(), key=lambda x: -x[1]):
+            print(f"    {d}: {cnt} trades ({cnt/len(exec_rows)*100:.0f}%)")
+
+        if zero_qty_fills:
+            print(f"\n  WARNING: {zero_qty_fills} leg(s) reported status=filled but filled_qty=0")
+        if partial_fills:
+            print(f"  NOTE: {partial_fills} partial fill(s) detected")
+
+        # Unhedged exposure
+        unhedged = abs(kalshi_bought - poly_bought)
+        if unhedged > 0:
+            heavier = "Kalshi" if kalshi_bought > poly_bought else "Poly"
+            print(f"\n  UNHEDGED EXPOSURE: {unhedged:.1f} contracts ({heavier} side heavy)")
+
+        # Write session diagnostics to log file for post-mortem
+        if logfile:
+            session_diag = {
+                "log_type": "session_diagnostics",
+                "ts": utc_ts(),
+                "total_trades": len(exec_rows),
+                "kalshi_contracts_filled": round(kalshi_bought, 4),
+                "poly_contracts_filled": round(poly_bought, 4),
+                "kalshi_dollar_spent": round(kalshi_spent, 4),
+                "poly_dollar_spent": round(poly_spent, 4),
+                "contract_delta": round(kalshi_bought - poly_bought, 4),
+                "dollar_delta": round(kalshi_spent - poly_spent, 4),
+                "unhedged_contracts": round(unhedged, 4),
+                "unhedged_side": ("kalshi" if kalshi_bought > poly_bought else "poly") if unhedged > 0 else None,
+                "direction_counts": direction_counts,
+                "zero_qty_fills": zero_qty_fills,
+                "partial_fills": partial_fills,
+                "per_trade": [
+                    {
+                        "ts": r.get("ts"),
+                        "coin": r.get("coin"),
+                        "kalshi_side": r.get("kalshi_side"),
+                        "poly_side": r.get("poly_side"),
+                        "kalshi_planned_px": r.get("kalshi_price"),
+                        "kalshi_actual_px": (r.get("exec_leg1_actual_price") if "kalshi" in (r.get("exec_leg1_exchange") or "") else r.get("exec_leg2_actual_price")),
+                        "kalshi_filled_qty": (r.get("exec_leg1_filled_qty", 0) if "kalshi" in (r.get("exec_leg1_exchange") or "") else r.get("exec_leg2_filled_qty", 0)) or 0,
+                        "kalshi_planned_qty": (r.get("exec_leg1_planned_qty", 0) if "kalshi" in (r.get("exec_leg1_exchange") or "") else r.get("exec_leg2_planned_qty", 0)) or 0,
+                        "poly_planned_px": r.get("poly_price"),
+                        "poly_actual_px": (r.get("exec_leg1_actual_price") if "poly" in (r.get("exec_leg1_exchange") or "") else r.get("exec_leg2_actual_price")),
+                        "poly_filled_qty": (r.get("exec_leg1_filled_qty", 0) if "poly" in (r.get("exec_leg1_exchange") or "") else r.get("exec_leg2_filled_qty", 0)) or 0,
+                        "poly_planned_qty": (r.get("exec_leg1_planned_qty", 0) if "poly" in (r.get("exec_leg1_exchange") or "") else r.get("exec_leg2_planned_qty", 0)) or 0,
+                        "both_filled": r.get("exec_both_filled"),
+                        "net_edge": r.get("net_edge"),
+                    }
+                    for r in exec_rows
+                ],
+            }
+            append_log(logfile, session_diag)
+
     # Balance summary (live mode)
     if start_balances:
         end_balances = {}
@@ -3820,13 +3917,19 @@ def main() -> None:
             row["exec_slippage_poly"] = round(exec_result.slippage_poly, 6)
             row["exec_slippage_kalshi"] = round(exec_result.slippage_kalshi, 6)
             row["exec_slippage_total_bps"] = round((exec_result.slippage_poly + exec_result.slippage_kalshi) * 10000, 1)
+            row["exec_leg1_exchange"] = exec_result.leg1.exchange
             row["exec_leg1_order_id"] = exec_result.leg1.order_id
             row["exec_leg1_status"] = exec_result.leg1.status
             row["exec_leg1_actual_price"] = exec_result.leg1.actual_price
+            row["exec_leg1_planned_qty"] = exec_result.leg1.planned_contracts
+            row["exec_leg1_filled_qty"] = exec_result.leg1.filled_contracts
             row["exec_leg1_latency_ms"] = round(exec_result.leg1.latency_ms, 1)
+            row["exec_leg2_exchange"] = exec_result.leg2.exchange
             row["exec_leg2_order_id"] = exec_result.leg2.order_id
             row["exec_leg2_status"] = exec_result.leg2.status
             row["exec_leg2_actual_price"] = exec_result.leg2.actual_price
+            row["exec_leg2_planned_qty"] = exec_result.leg2.planned_contracts
+            row["exec_leg2_filled_qty"] = exec_result.leg2.filled_contracts
             row["exec_leg2_latency_ms"] = round(exec_result.leg2.latency_ms, 1)
 
             # Print trade complete box
