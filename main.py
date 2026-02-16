@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.37"
+VERSION = "1.1.38"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -2163,7 +2163,8 @@ def _box_line(text: str, w: int = BOX_W) -> str:
 
 def print_scan_header(scan_i: int, extra: str = "") -> None:
     label = f" Scan #{scan_i} "
-    line = f"\n{'—' * 3}{label}{'—' * 3}"
+    pad = max(40 - len(label) - 2, 3)
+    line = f"\n{'═' * 2}{label}{'═' * pad}"
     if extra:
         line += f"  {extra}"
     print(line)
@@ -2232,7 +2233,7 @@ def display_skip_table(skipped_rows: list) -> None:
     reasons = {r["reason"] for r in skipped_rows}
     if len(reasons) == 1:
         coins = ", ".join(r["coin"] for r in skipped_rows)
-        print(f"  Skipped {len(skipped_rows)} coins ({coins}): {next(iter(reasons))}")
+        print(f"  ⊘ {len(skipped_rows)} coins skipped ({coins}): {next(iter(reasons))}")
         return
 
     # Column widths
@@ -4267,8 +4268,8 @@ def main() -> None:
         session_remaining_m = int(session_remaining_s // 60)
         session_remaining_sec = int(session_remaining_s % 60)
         print_scan_header(scan_i,
-                          f"{session_remaining_m}m {session_remaining_sec}s left | "
-                          f"{len(logged)} trades | {consecutive_losing_windows}/2 losing windows")
+                          f"{session_remaining_m}m {session_remaining_sec}s left · "
+                          f"{len(logged)} trades · {consecutive_losing_windows}/2 losing windows")
 
         # Overlap Gamma event fetch with Kalshi fetches so neither exchange's
         # prices go stale while the other is loading.
@@ -4372,8 +4373,8 @@ def main() -> None:
                 window_startup_active = True
                 remaining_startup = WINDOW_STARTUP_DELAY_S - window_age_s
                 phase = 1 if window_age_s < 90 else 2
-                print(f"  [startup] Phase {phase} — {remaining_startup:.0f}s until trading opens "
-                      f"(Kalshi+strikes {'loading' if phase == 1 else 'ready'}, "
+                print(f"  ⏳ Phase {phase} — {remaining_startup:.0f}s until trading opens "
+                      f"(Kalshi {'loading' if phase == 1 else 'ready'}, "
                       f"Poly {'waiting' if phase == 1 else 'settling'})")
 
         best_global: Optional[HedgeCandidate] = None
@@ -4891,7 +4892,7 @@ def main() -> None:
 
         else:
             consecutive_skips += 1
-            print(f"  No trades — {consecutive_skips} consecutive skips | {len(logged)} successful trades")
+            print(f"  ↳ {consecutive_skips} consecutive skips · {len(logged)} successful trades")
             # Periodic skip-reason breakdown every 20 scans to help diagnose filter bottlenecks
             if consecutive_skips > 0 and consecutive_skips % 20 == 0 and skip_counts:
                 total_skips = sum(skip_counts.values())
