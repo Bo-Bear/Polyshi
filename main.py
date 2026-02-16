@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.30"
-VERSION_DATE = "2026-02-16 23:00 UTC"
+VERSION = "1.1.31"
+VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
 from dotenv import load_dotenv
@@ -2130,6 +2130,13 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
 # -----------------------------
 # Logging + display
 # -----------------------------
+# ANSI color codes for terminal output
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
 # Box-drawing helpers
 BOX_W = 60  # inner width for boxes
 
@@ -2208,9 +2215,30 @@ def display_coin_box(coin: str, kalshi: Optional[KalshiMarketQuote],
         print(f"  → {skip_reason}")
 
 
+_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
+
+def _green_box_top(label: str = "", w: int = BOX_W) -> str:
+    if label:
+        visible_len = len(_ANSI_RE.sub('', label))
+        pad = w - visible_len - 2
+        return f"{GREEN}{BOLD}┌─ {label}{GREEN}{BOLD} {'─' * max(pad, 0)}┐{RESET}"
+    return f"{GREEN}{BOLD}┌{'─' * (w + 2)}┐{RESET}"
+
+def _green_box_mid(w: int = BOX_W) -> str:
+    return f"{GREEN}├{'─' * (w + 2)}┤{RESET}"
+
+def _green_box_bot(w: int = BOX_W) -> str:
+    return f"{GREEN}{BOLD}└{'─' * (w + 2)}┘{RESET}"
+
+def _green_box_line(text: str, w: int = BOX_W) -> str:
+    visible_len = len(_ANSI_RE.sub('', text))
+    padding = max(w - visible_len, 0)
+    return f"{GREEN}│{RESET} {text}{' ' * padding} {GREEN}│{RESET}"
+
+
 def print_trade_complete(candidate, exec_result, contracts: float,
                         kalshi_quote=None, poly_quote=None) -> None:
-    """Print a box-drawn trade summary matching the screenshot style."""
+    """Print a green box-drawn trade summary for easy terminal scanning."""
     leg1 = exec_result.leg1
     leg2 = exec_result.leg2
     slip_poly = exec_result.slippage_poly
@@ -2229,53 +2257,52 @@ def print_trade_complete(candidate, exec_result, contracts: float,
     fees_per_contract = total_fees / filled if filled > 0 else total_fees
     actual_net = actual_gross - fees_per_contract
 
-    print(f"\n{_box_top('✓ TRADE COMPLETE')}")
-    print(_box_line(f"Time:     {utc_ts()[:19].replace('T', ' ')}"))
-    print(_box_line(f"Crypto:   {candidate.coin}"))
-    print(_box_line(f"Strategy: {strategy}"))
-    print(_box_line(f"Qty:      {filled} contracts"))
-    print(_box_mid())
-
-    # PRICES SEEN from the original quotes
-    print(_box_line("PRICES SEEN:"))
-    if kalshi_quote:
-        print(_box_line(f"  Kalshi:  YES=${kalshi_quote.yes_ask:.2f}   NO=${kalshi_quote.no_ask:.2f}"))
-    else:
-        k_price = candidate.kalshi_price
-        print(_box_line(f"  Kalshi:  {candidate.direction_on_kalshi}=${k_price:.2f}"))
-    if poly_quote:
-        print(_box_line(f"  Poly:    UP=${poly_quote.up_price:.2f}    DOWN=${poly_quote.down_price:.2f}"))
-    else:
-        p_price = candidate.poly_price
-        print(_box_line(f"  Poly:    {candidate.direction_on_poly}=${p_price:.2f}"))
-    print(_box_mid())
-
-    print(_box_line("FILL PRICES:"))
-    print(_box_line(f"  Kalshi:  ${actual_k:.2f}"))
-    print(_box_line(f"  Poly:    ${actual_p:.2f}"))
-    print(_box_line(f"  Total:   ${actual_total:.2f} x {filled} = ${total_outlay:.2f}"))
-    print(_box_mid())
-
-    print(_box_line("FEES:"))
-    print(_box_line(f"  Kalshi:  ${candidate.kalshi_fee:.2f}"))
-    print(_box_line(f"  Poly:    ${candidate.poly_fee:.2f}"))
-    if candidate.extras > 0:
-        print(_box_line(f"  Gas:     ${candidate.extras:.2f}"))
-    print(_box_line(f"  Total:   ${total_fees:.2f}"))
-    print(_box_mid())
-
-    print(_box_line("EDGE:"))
-    print(_box_line(f"  Expected (scan): {candidate.net_edge * 100:.1f}%"))
-    print(_box_line(f"  Actual (fills+fees): {actual_net * 100:.1f}%"))
-    if abs(slip_poly) > 0.001 or abs(slip_kalshi) > 0.001:
-        print(_box_line(f"  Slippage: Poly {slip_poly:+.3f}, Kalshi {slip_kalshi:+.3f}"))
-    print(_box_mid())
-
-    # Profit estimate: (1 - actual_total - fees_per_contract) * contracts
+    # Profit estimate
     profit_per = 1.0 - actual_total - fees_per_contract
     profit_total = profit_per * filled
-    print(_box_line(f"PROFIT: ${profit_total:.2f} ({actual_net * 100:.1f}%)"))
-    print(_box_bot())
+
+    G = GREEN
+    B = BOLD
+    R = RESET
+
+    print(f"\n{_green_box_top(f'{G}{B} ✅  TRADE COMPLETE — {candidate.coin} {R}')}")
+    print(_green_box_line(f"{B}{candidate.coin}{R}  {strategy}  |  {filled} contracts  |  {utc_ts()[:19].replace('T', ' ')}"))
+    print(_green_box_mid())
+
+    # Side-by-side: Quotes vs Fills
+    print(_green_box_line(f"{'':2}{'QUOTES SEEN':<26} {'FILL PRICES':<26}"))
+    if kalshi_quote:
+        k_quote_str = f"YES=${kalshi_quote.yes_ask:.2f}  NO=${kalshi_quote.no_ask:.2f}"
+    else:
+        k_quote_str = f"{candidate.direction_on_kalshi}=${candidate.kalshi_price:.2f}"
+    k_fill_str = f"${actual_k:.2f}"
+    if abs(slip_kalshi) > 0.001:
+        k_fill_str += f"  (slip {slip_kalshi:+.3f})"
+    print(_green_box_line(f"  Kalshi:  {k_quote_str:<16} {k_fill_str}"))
+
+    if poly_quote:
+        p_quote_str = f"UP=${poly_quote.up_price:.2f}   DOWN=${poly_quote.down_price:.2f}"
+    else:
+        p_quote_str = f"{candidate.direction_on_poly}=${candidate.poly_price:.2f}"
+    p_fill_str = f"${actual_p:.2f}"
+    if abs(slip_poly) > 0.001:
+        p_fill_str += f"  (slip {slip_poly:+.3f})"
+    print(_green_box_line(f"  Poly:    {p_quote_str:<16} {p_fill_str}"))
+    print(_green_box_mid())
+
+    # Cost + Fees on one section
+    fee_detail = f"K=${candidate.kalshi_fee:.2f} + P=${candidate.poly_fee:.2f}"
+    if candidate.extras > 0:
+        fee_detail += f" + gas=${candidate.extras:.2f}"
+    print(_green_box_line(f"  Cost:    ${actual_total:.2f} x {filled} = ${total_outlay:.2f}    Fees: {fee_detail} = ${total_fees:.2f}"))
+    print(_green_box_mid())
+
+    # Edge + Profit — the headline numbers
+    edge_str = f"Expected {candidate.net_edge * 100:.1f}%  ->  Actual {actual_net * 100:.1f}%"
+    profit_color = GREEN if profit_total >= 0 else RED
+    print(_green_box_line(f"  Edge:    {edge_str}"))
+    print(_green_box_line(f"  {B}PROFIT:  {profit_color}${profit_total:+.2f}  ({actual_net * 100:+.1f}%){R}"))
+    print(_green_box_bot())
 
 
 def append_log(path: str, row: dict) -> None:
@@ -4751,12 +4778,15 @@ def main() -> None:
                 coin_consecutive_unwinds[traded_coin] = 0  # reset on success
 
             mode_tag = "LIVE" if EXEC_MODE == "live" else "paper"
-            fill_tag = "FILLED" if exec_result.both_filled else "INCOMPLETE"
+            if exec_result.both_filled:
+                fill_tag = f"{GREEN}{BOLD} ✅  FILLED{RESET}"
+            else:
+                fill_tag = f"{RED}{BOLD} ❌  INCOMPLETE{RESET}"
             active_str = ", ".join(
                 f"{c}({coin_trade_counts.get(c, 0)}/{MAX_TRADES_PER_COIN})"
                 for c in AVAILABLE_COINS
             )
-            print(f"[{mode_tag}] Trade #{len(logged)} {fill_tag} | {active_str}")
+            print(f"[{mode_tag}] Trade #{len(logged)}{fill_tag} | {active_str}")
 
             # Check if coin just hit its per-coin cap
             if coin_trade_counts[traded_coin] >= MAX_TRADES_PER_COIN:
