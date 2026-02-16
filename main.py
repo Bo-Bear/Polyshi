@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.20"
-VERSION_DATE = "2026-02-16 18:48 UTC"
+VERSION = "1.1.21"
+VERSION_DATE = "2026-02-16 18:57 UTC"
 
 import requests
 from dotenv import load_dotenv
@@ -2476,6 +2476,56 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
                 ],
             }
             append_log(logfile, session_diag)
+
+    # Position & Potential Payout
+    # Each hedged contract pair pays $1.00 on resolution (one side wins).
+    total_contracts = 0
+    total_cost_basis = 0.0
+    total_fees_all = 0.0
+
+    if exec_rows:
+        # Live mode: use actual fill data
+        for r in exec_rows:
+            k_filled = p_filled = 0
+            k_cost = p_cost = 0.0
+            for leg in (1, 2):
+                filled = r.get(f"exec_leg{leg}_filled_qty", 0) or 0
+                actual_px = r.get(f"exec_leg{leg}_actual_price") or 0
+                exch = r.get(f"exec_leg{leg}_exchange", "")
+                if "kalshi" in exch:
+                    k_filled = filled
+                    k_cost = filled * actual_px
+                elif "poly" in exch:
+                    p_filled = filled
+                    p_cost = filled * actual_px
+            hedged = min(k_filled, p_filled)
+            total_contracts += hedged
+            total_cost_basis += k_cost + p_cost
+            total_fees_all += r.get("poly_fee", 0) + r.get("kalshi_fee", 0) + r.get("extras", 0)
+    else:
+        # Paper mode: each trade = PAPER_CONTRACTS hedged pairs
+        contracts = int(PAPER_CONTRACTS)
+        for r in log_rows:
+            total_contracts += contracts
+            total_cost_basis += r["total_cost"] * contracts
+            total_fees_all += r.get("poly_fee", 0) + r.get("kalshi_fee", 0) + r.get("extras", 0)
+
+    if total_contracts > 0:
+        payout = total_contracts * 1.0  # $1 per winning contract
+        expected_profit = payout - total_cost_basis - total_fees_all
+        max_loss = total_cost_basis + total_fees_all  # if somehow both sides lose (mismatch)
+        avg_cost_per_pair = (total_cost_basis + total_fees_all) / total_contracts
+
+        print(f"\n--- Position & Potential Payout ---")
+        print(f"  Hedged contract pairs:   {total_contracts}")
+        print(f"  Total cost basis:        ${total_cost_basis:.2f}")
+        print(f"  Total fees:              ${total_fees_all:.2f}")
+        print(f"  Total invested:          ${total_cost_basis + total_fees_all:.2f}")
+        print(f"  Avg cost per pair:       ${avg_cost_per_pair:.4f}")
+        print(f"  Payout on resolution:    ${payout:.2f}  ($1.00 x {total_contracts})")
+        print(f"  Expected profit:         ${expected_profit:+.2f}  ({expected_profit / (total_cost_basis + total_fees_all) * 100:+.1f}% ROI)")
+        if max_loss > 0:
+            print(f"  Max loss (hedge fail):   ${-max_loss:.2f}")
 
     # Balance summary (live mode)
     if start_balances:
