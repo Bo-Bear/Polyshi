@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.8"
-VERSION_DATE = "2026-02-16 16:29 UTC"
+VERSION = "1.1.10"
+VERSION_DATE = "2026-02-16 16:36 UTC"
 
 import requests
 from dotenv import load_dotenv
@@ -2947,18 +2947,57 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                         latency_ms=latency, status="filled", error=None,
                     )
                 if o_status in ("canceled", "cancelled"):
+                    # Even canceled orders might have partial fills
+                    cancel_matched = o.get("size_matched")
+                    if cancel_matched and float(cancel_matched) > 0:
+                        filled_size = float(cancel_matched)
+                        avg_price = _poly_avg_fill_price(o, planned_price)
+                        latency = (time.monotonic() - t0) * 1000
+                        print(f"  [poly-retry]   Canceled but {filled_size} contracts matched")
+                        return LegFill(
+                            exchange="poly", side=side,
+                            planned_price=planned_price, actual_price=avg_price,
+                            planned_contracts=contracts, filled_contracts=filled_size,
+                            order_id=order_id, fill_ts=utc_ts(),
+                            latency_ms=latency, status="partial", error=None,
+                        )
                     break
-            except Exception:
-                pass
+            except Exception as poll_err:
+                print(f"  [poly-retry]   Poll error: {poll_err}")
             time.sleep(ORDER_POLL_INTERVAL_S)
 
-        # Not filled — cancel and retry
+        # Not filled in time — cancel and check if it filled before cancel took effect
+        print(f"  [poly-retry]   Timeout, canceling order {order_id}...")
         try:
             client.cancel(order_id)
         except Exception:
             pass
+
+        # Post-cancel check: order may have matched before cancel was processed
+        try:
+            o = client.get_order(order_id)
+            o_status = (o.get("status") or "").lower()
+            raw_matched = o.get("size_matched")
+            matched_size = float(raw_matched) if raw_matched else 0.0
+            print(f"  [poly-retry]   Post-cancel status={o_status} size_matched={raw_matched}")
+
+            if o_status in ("matched", "filled") or matched_size > 0:
+                filled_size = matched_size if matched_size > 0 else float(o.get("original_size", contracts))
+                avg_price = _poly_avg_fill_price(o, planned_price)
+                latency = (time.monotonic() - t0) * 1000
+                status = "filled" if filled_size >= contracts else "partial"
+                print(f"  [poly-retry]   Order was actually {status}! {filled_size} contracts @ ~${avg_price:.4f}")
+                return LegFill(
+                    exchange="poly", side=side,
+                    planned_price=planned_price, actual_price=avg_price,
+                    planned_contracts=contracts, filled_contracts=filled_size,
+                    order_id=order_id, fill_ts=utc_ts(),
+                    latency_ms=latency, status=status, error=None,
+                )
+        except Exception as e:
+            print(f"  [poly-retry]   Post-cancel check failed: {e}")
+
         last_error = f"retry {attempt}: not filled within {POLY_FILL_RETRY_TIMEOUT_S}s"
-        print(f"  [poly-retry]   Not filled, canceling...")
 
     # All retries exhausted
     latency = (time.monotonic() - t0) * 1000
