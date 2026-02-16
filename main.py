@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 
 import requests
 from dotenv import load_dotenv
