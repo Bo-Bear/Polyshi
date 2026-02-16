@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.38"
+VERSION = "1.1.39"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -4105,6 +4105,7 @@ def main() -> None:
         raise RuntimeError("Could not resolve Polymarket tag id for slug 'crypto' (Gamma /tags/slug/crypto).")
 
     logged: List[dict] = []
+    successful_trades = 0
     skip_counts: Dict[str, int] = {}  # reason -> count
     scan_i = 0
     consecutive_skips = 0
@@ -4269,7 +4270,7 @@ def main() -> None:
         session_remaining_sec = int(session_remaining_s % 60)
         print_scan_header(scan_i,
                           f"{session_remaining_m}m {session_remaining_sec}s left · "
-                          f"{len(logged)} trades · {consecutive_losing_windows}/2 losing windows")
+                          f"{successful_trades} trades · {consecutive_losing_windows}/2 losing windows")
 
         # Overlap Gamma event fetch with Kalshi fetches so neither exchange's
         # prices go stale while the other is loading.
@@ -4827,6 +4828,8 @@ def main() -> None:
             logged.append(row)
             window_trades.append(row)
             consecutive_skips = 0
+            if exec_result.both_filled:
+                successful_trades += 1
 
             # Per-coin tracking: update trade count, edge history, and unwind counter
             traded_coin = best_global.coin
@@ -4892,7 +4895,7 @@ def main() -> None:
 
         else:
             consecutive_skips += 1
-            print(f"  ↳ {consecutive_skips} consecutive skips · {len(logged)} successful trades")
+            print(f"  ↳ {consecutive_skips} consecutive skips · {successful_trades} successful trades")
             # Periodic skip-reason breakdown every 20 scans to help diagnose filter bottlenecks
             if consecutive_skips > 0 and consecutive_skips % 20 == 0 and skip_counts:
                 total_skips = sum(skip_counts.values())
