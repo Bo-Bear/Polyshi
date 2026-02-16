@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.15"
+VERSION = "1.1.16"
 VERSION_DATE = "2026-02-16 18:07 UTC"
 
 import requests
@@ -2861,9 +2861,13 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
 
             if o_status == "matched" or o_status == "filled":
                 raw_matched = o.get("size_matched")
-                filled_size = float(raw_matched) if raw_matched else float(o.get("original_size", contracts))
-                avg_price = _poly_avg_fill_price(o, planned_price)
-                return order_id, avg_price, filled_size, "filled", None
+                matched_size = float(raw_matched) if raw_matched and float(raw_matched) > 0 else 0.0
+                trades_size = _poly_fill_size_from_trades(o)
+                filled_size = max(matched_size, trades_size)
+                if filled_size > 0:
+                    avg_price = _poly_avg_fill_price(o, planned_price)
+                    return order_id, avg_price, filled_size, "filled", None
+                # Status=filled but fill data not synced yet — keep polling
 
             if o_status == "canceled" or o_status == "cancelled":
                 filled_size = float(o.get("size_matched", 0))
@@ -2880,7 +2884,9 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
     try:
         o = client.get_order(order_id)
         raw_matched = o.get("size_matched")
-        filled_size = float(raw_matched) if raw_matched else 0.0
+        filled_size = float(raw_matched) if raw_matched and float(raw_matched) > 0 else 0.0
+        trades_size = _poly_fill_size_from_trades(o)
+        filled_size = max(filled_size, trades_size)
         if (o.get("status") or "").lower() in ("matched", "filled"):
             if not filled_size:
                 filled_size = float(o.get("original_size", contracts))
@@ -3007,17 +3013,23 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                 o_status = (o.get("status") or "").lower()
                 if o_status in ("matched", "filled"):
                     raw_matched = o.get("size_matched")
-                    filled_size = float(raw_matched) if raw_matched else float(o.get("original_size", contracts))
-                    avg_price = _poly_avg_fill_price(o, planned_price)
-                    latency = (time.monotonic() - t0) * 1000
-                    print(f"  [poly-retry]   Filled on attempt {attempt}")
-                    return LegFill(
-                        exchange="poly", side=side,
-                        planned_price=planned_price, actual_price=avg_price,
-                        planned_contracts=contracts, filled_contracts=filled_size,
-                        order_id=order_id, fill_ts=utc_ts(),
-                        latency_ms=latency, status="filled", error=None,
-                    )
+                    matched_size = float(raw_matched) if raw_matched and float(raw_matched) > 0 else 0.0
+                    trades_size = _poly_fill_size_from_trades(o)
+                    filled_size = max(matched_size, trades_size)
+                    if filled_size > 0:
+                        avg_price = _poly_avg_fill_price(o, planned_price)
+                        latency = (time.monotonic() - t0) * 1000
+                        print(f"  [poly-retry]   Filled on attempt {attempt} "
+                              f"({filled_size} contracts, matched={matched_size}, trades={trades_size})")
+                        return LegFill(
+                            exchange="poly", side=side,
+                            planned_price=planned_price, actual_price=avg_price,
+                            planned_contracts=contracts, filled_contracts=filled_size,
+                            order_id=order_id, fill_ts=utc_ts(),
+                            latency_ms=latency, status="filled", error=None,
+                        )
+                    # Status says filled but API hasn't synced fill data yet —
+                    # keep polling rather than returning 0 immediately
                 if o_status in ("canceled", "cancelled"):
                     # Even canceled orders might have partial fills — check
                     # both size_matched and associate_trades (on-chain truth)
@@ -3056,7 +3068,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             o = client.get_order(order_id)
             o_status = (o.get("status") or "").lower()
             raw_matched = o.get("size_matched")
-            matched_size = float(raw_matched) if raw_matched else 0.0
+            matched_size = float(raw_matched) if raw_matched and float(raw_matched) > 0 else 0.0
             trades_size = _poly_fill_size_from_trades(o)
             print(f"  [poly-retry]   Post-cancel status={o_status} size_matched={raw_matched} trades_size={trades_size}")
 
@@ -3091,7 +3103,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                 o = client.get_order(oid)
                 trades_size = _poly_fill_size_from_trades(o)
                 raw_matched = o.get("size_matched")
-                matched_size = float(raw_matched) if raw_matched else 0.0
+                matched_size = float(raw_matched) if raw_matched and float(raw_matched) > 0 else 0.0
                 o_status = (o.get("status") or "").lower()
                 effective_size = max(matched_size, trades_size)
                 if effective_size > 0 or o_status in ("matched", "filled"):
