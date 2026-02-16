@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.10"
+VERSION = "1.1.11"
 VERSION_DATE = "2026-02-16 16:36 UTC"
 
 import requests
@@ -3131,44 +3131,46 @@ def execute_hedge(candidate: HedgeCandidate,
             print(f"  [exec]   Kalshi error: {leg2.error}")
 
         # --- Automatic unwind ---
-        # Kalshi filled but Poly didn't → unwind Kalshi (fast, reliable)
-        if leg2.status == "filled" and leg1.status != "filled":
-            unmatched = leg2.filled_contracts - leg1.filled_contracts
-            if unmatched > 0 and EXEC_MODE == "live":
-                print(f"  [unwind] Poly failed — selling {unmatched:.0f} Kalshi contracts to close exposure...")
+        # Kalshi has more fills than Poly → unwind excess Kalshi contracts
+        # Use filled_contracts instead of status to handle "partial" fills
+        kalshi_excess = leg2.filled_contracts - leg1.filled_contracts
+        poly_excess = leg1.filled_contracts - leg2.filled_contracts
+
+        if kalshi_excess > 0:
+            if EXEC_MODE == "live":
+                print(f"  [unwind] Poly under-filled — selling {kalshi_excess:.0f} Kalshi contracts to close exposure...")
                 unwind_result = _unwind_kalshi_leg(
                     candidate.direction_on_kalshi, leg2.actual_price or leg2.planned_price,
-                    unmatched, kalshi_quote.ticker, logfile,
+                    kalshi_excess, kalshi_quote.ticker, logfile,
                 )
                 if unwind_result:
                     print(f"  [unwind] {unwind_result}")
                 exec_row["unwind_attempted"] = True
-                exec_row["unwind_contracts"] = unmatched
+                exec_row["unwind_contracts"] = kalshi_excess
                 exec_row["unwind_result"] = unwind_result
-            elif unmatched > 0 and EXEC_MODE == "paper":
-                print(f"  [unwind] Paper mode — would sell {unmatched:.0f} Kalshi contracts")
+            else:
+                print(f"  [unwind] Paper mode — would sell {kalshi_excess:.0f} Kalshi contracts")
                 exec_row["unwind_attempted"] = False
-                exec_row["unwind_contracts"] = unmatched
+                exec_row["unwind_contracts"] = kalshi_excess
                 exec_row["unwind_result"] = "paper_mode_skip"
 
-        # Poly filled but Kalshi didn't → unwind Poly (less likely in new flow)
-        elif leg1.status == "filled" and leg2.status != "filled":
-            unmatched = leg1.filled_contracts - leg2.filled_contracts
-            if unmatched > 0 and EXEC_MODE == "live":
-                print(f"  [unwind] Kalshi failed — selling {unmatched:.0f} Poly contracts to close exposure...")
+        # Poly has more fills than Kalshi → unwind excess Poly contracts
+        elif poly_excess > 0:
+            if EXEC_MODE == "live":
+                print(f"  [unwind] Kalshi under-filled — selling {poly_excess:.0f} Poly contracts to close exposure...")
                 unwind_result = _unwind_poly_leg(
                     candidate.direction_on_poly, leg1.actual_price or leg1.planned_price,
-                    unmatched, poly_token, logfile,
+                    poly_excess, poly_token, logfile,
                 )
                 if unwind_result:
                     print(f"  [unwind] {unwind_result}")
                 exec_row["unwind_attempted"] = True
-                exec_row["unwind_contracts"] = unmatched
+                exec_row["unwind_contracts"] = poly_excess
                 exec_row["unwind_result"] = unwind_result
-            elif unmatched > 0 and EXEC_MODE == "paper":
-                print(f"  [unwind] Paper mode — would sell {unmatched:.0f} Poly contracts")
+            else:
+                print(f"  [unwind] Paper mode — would sell {poly_excess:.0f} Poly contracts")
                 exec_row["unwind_attempted"] = False
-                exec_row["unwind_contracts"] = unmatched
+                exec_row["unwind_contracts"] = poly_excess
                 exec_row["unwind_result"] = "paper_mode_skip"
 
     return result
