@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 import requests
 from dotenv import load_dotenv
@@ -3383,6 +3383,8 @@ def main() -> None:
     print(f"  Price range:        [{PRICE_FLOOR:.2f}, {PRICE_CEILING:.2f}]")
     print(f"  Max prob diverge:   {pct(MAX_PROB_DIVERGENCE)} (strike mismatch detector)")
     print(f"  Max strike-spot Δ:  {MAX_STRIKE_SPOT_DIVERGENCE*100:.2f}% (hedge validity guard)")
+    print(f"  Min leg notional:   ${MIN_LEG_NOTIONAL:.0f} (skip thin books)")
+    print(f"  Max slippage:       ${POLY_MAX_SLIPPAGE:.2f} (Poly fill rejection)")
     print(f"  Fill price buffer:  ${LIVE_PRICE_BUFFER:.2f} (limit order cushion)")
     print(f"  Session drawdown:   ${MAX_SESSION_DRAWDOWN:.2f} max loss before auto-stop")
     print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s (forced unwind)")
