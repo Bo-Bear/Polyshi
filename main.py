@@ -46,7 +46,7 @@ except ImportError:
 # -----------------------------
 load_dotenv()
 
-SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "5"))
+SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "3"))
 MAX_TEST_TRADES = int(os.getenv("MAX_TEST_TRADES", "5"))
 WINDOW_ALIGN_TOLERANCE_SECONDS = int(os.getenv("WINDOW_ALIGN_TOLERANCE_SECONDS", "10"))
 MIN_LEG_NOTIONAL = float(os.getenv("MIN_LEG_NOTIONAL", "10"))  # $ minimum liquidity per leg
@@ -55,8 +55,8 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 # -----------------------------
 # Execution safeguards
 # -----------------------------
-# Minimum net edge to accept a trade (must exceed expected execution slippage of ~3-4c)
-MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.06"))  # 6%
+# Minimum net edge to accept a trade (must exceed expected execution slippage of ~2-3c)
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.03"))  # 3%
 
 # Maximum net edge — skip outliers that are likely stale/bad data, not real opportunities
 MAX_NET_EDGE = float(os.getenv("MAX_NET_EDGE", "0.15"))  # 15%
@@ -71,15 +71,15 @@ MAX_UNHEDGED_SECONDS = float(os.getenv("MAX_UNHEDGED_SECONDS", "10.0"))  # 10 se
 MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "30"))  # 30 seconds
 
 # Maximum spread (ask_up + ask_down - 1) we'll accept; wider means unreliable pricing
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.06"))  # 6%
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))  # 10%
 
 # Reject prices in extreme ranges where outcome is nearly decided (hedging is risky)
-PRICE_FLOOR = float(os.getenv("PRICE_FLOOR", "0.20"))   # skip legs below 20c (5 contracts * $0.20 = $1 Poly min notional)
+PRICE_FLOOR = float(os.getenv("PRICE_FLOOR", "0.10"))   # skip legs below 10c
 PRICE_CEILING = float(os.getenv("PRICE_CEILING", "0.98"))  # skip legs priced above 98c
 
 # Session-level circuit breaker: stop scanning after this many consecutive no-trade scans
 # (may indicate stale data or broken feeds)
-MAX_CONSECUTIVE_SKIPS = int(os.getenv("MAX_CONSECUTIVE_SKIPS", "200"))
+MAX_CONSECUTIVE_SKIPS = int(os.getenv("MAX_CONSECUTIVE_SKIPS", "500"))
 
 # Maximum gross cost we'll accept (tighter than 1.0 to leave room for execution slippage)
 MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.98"))
@@ -87,12 +87,12 @@ MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.98"))
 # Maximum allowed divergence between implied probabilities across exchanges.
 # Large divergence signals mismatched strikes (Kalshi uses fixed $, Poly uses relative).
 # If |kalshi_up_prob - poly_up_prob| > this, skip the trade.
-MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.10"))  # 10 percentage points
+MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.15"))  # 15 percentage points
 
 # Maximum allowed divergence between Kalshi strike and spot price (as a fraction).
 # Kalshi uses a fixed $ strike; Polymarket uses "up/down from window start."
 # When strike ≠ spot, both hedge legs can lose. 0.15% = ~$100 on BTC.
-MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.0015"))
+MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.003"))
 
 # -----------------------------
 # Fees (paper-trade model)
@@ -114,7 +114,7 @@ AMORTIZE_EXTRAS_OVER_TRADES = int(os.getenv("AMORTIZE_EXTRAS_OVER_TRADES", "1"))
 # Expected execution slippage budget per contract (subtracted from net edge).
 # Accounts for LIVE_PRICE_BUFFER on both legs + adverse market movement.
 # This makes net_edge reflect post-slippage expected profit.
-EXECUTION_SLIPPAGE_BUDGET = float(os.getenv("EXECUTION_SLIPPAGE_BUDGET", "0.03"))  # 3 cents/contract
+EXECUTION_SLIPPAGE_BUDGET = float(os.getenv("EXECUTION_SLIPPAGE_BUDGET", "0.02"))  # 2 cents/contract
 
 
 # Kalshi public base + endpoints are documented here:
@@ -4050,6 +4050,14 @@ def main() -> None:
         else:
             consecutive_skips += 1
             print(f"No viable paper trades found in this scan. ({consecutive_skips} consecutive skips)")
+            # Periodic skip-reason breakdown every 20 scans to help diagnose filter bottlenecks
+            if consecutive_skips > 0 and consecutive_skips % 20 == 0 and skip_counts:
+                total_skips = sum(skip_counts.values())
+                top_reasons = sorted(skip_counts.items(), key=lambda x: -x[1])[:5]
+                print(f"\n  [skip summary] Top reasons across {total_skips} total skips:")
+                for reason, count in top_reasons:
+                    print(f"    {reason:30s} {count:4d} ({count/total_skips*100:5.1f}%)")
+                print()
             if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
                 print(f"\n⚠ Circuit breaker: {MAX_CONSECUTIVE_SKIPS} consecutive scans with no viable trades. Stopping.")
                 break
