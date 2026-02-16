@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.13"
-VERSION_DATE = "2026-02-16 17:32 UTC"
+VERSION = "1.1.14"
+VERSION_DATE = "2026-02-16 17:58 UTC"
 
 import requests
 from dotenv import load_dotenv
@@ -2748,6 +2748,23 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
     return order_id, None, 0.0, "rejected", "order timed out with no fills"
 
 
+def _poly_fill_size_from_trades(order: dict) -> float:
+    """Extract total filled size from associate_trades (on-chain ground truth).
+
+    The CLOB API's ``size_matched`` field is unreliable (returns 0 for filled
+    orders).  ``associate_trades`` contains the actual on-chain fills and is
+    the only trustworthy source of fill information.
+    """
+    trades = order.get("associate_trades") or []
+    total = 0.0
+    for t in trades:
+        try:
+            total += float(t.get("size", 0))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
 def _poly_avg_fill_price(order: dict, fallback: float) -> float:
     """Extract the true average fill price from associate_trades.
 
@@ -2869,8 +2886,31 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
 
     client = _get_poly_clob_client()
     last_error = None
+    placed_order_ids: list = []  # Track all order IDs for final sweep
 
     for attempt in range(1, POLY_FILL_MAX_RETRIES + 1):
+        # Before placing a new order, re-check previous order to prevent duplicate fills
+        if placed_order_ids:
+            prev_id = placed_order_ids[-1]
+            try:
+                prev_o = client.get_order(prev_id)
+                prev_trades_size = _poly_fill_size_from_trades(prev_o)
+                if prev_trades_size > 0:
+                    avg_price = _poly_avg_fill_price(prev_o, planned_price)
+                    latency = (time.monotonic() - t0) * 1000
+                    status = "filled" if prev_trades_size >= contracts else "partial"
+                    print(f"  [poly-retry]   Previous order {prev_id[:12]} actually filled! "
+                          f"{prev_trades_size} contracts — skipping new attempt")
+                    return LegFill(
+                        exchange="poly", side=side,
+                        planned_price=planned_price, actual_price=avg_price,
+                        planned_contracts=contracts, filled_contracts=prev_trades_size,
+                        order_id=prev_id, fill_ts=utc_ts(),
+                        latency_ms=latency, status=status, error=None,
+                    )
+            except Exception:
+                pass
+
         # Fetch fresh orderbook
         asks = poly_clob_get_asks(str(token_id))
         if not asks:
@@ -2926,6 +2966,8 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             last_error = f"retry {attempt}: no orderID"
             continue
 
+        placed_order_ids.append(order_id)
+
         # Poll for fill with per-attempt timeout
         deadline = time.monotonic() + POLY_FILL_RETRY_TIMEOUT_S
         filled = False
@@ -2947,19 +2989,23 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                         latency_ms=latency, status="filled", error=None,
                     )
                 if o_status in ("canceled", "cancelled"):
-                    # Even canceled orders might have partial fills
+                    # Even canceled orders might have partial fills — check
+                    # both size_matched and associate_trades (on-chain truth)
                     cancel_matched = o.get("size_matched")
-                    if cancel_matched and float(cancel_matched) > 0:
-                        filled_size = float(cancel_matched)
+                    trades_size = _poly_fill_size_from_trades(o)
+                    filled_size = (float(cancel_matched) if cancel_matched and float(cancel_matched) > 0
+                                   else trades_size)
+                    if filled_size > 0:
                         avg_price = _poly_avg_fill_price(o, planned_price)
                         latency = (time.monotonic() - t0) * 1000
-                        print(f"  [poly-retry]   Canceled but {filled_size} contracts matched")
+                        status = "filled" if filled_size >= contracts else "partial"
+                        print(f"  [poly-retry]   Canceled but {filled_size} contracts matched (trades_size={trades_size})")
                         return LegFill(
                             exchange="poly", side=side,
                             planned_price=planned_price, actual_price=avg_price,
                             planned_contracts=contracts, filled_contracts=filled_size,
                             order_id=order_id, fill_ts=utc_ts(),
-                            latency_ms=latency, status="partial", error=None,
+                            latency_ms=latency, status=status, error=None,
                         )
                     break
             except Exception as poll_err:
@@ -2973,16 +3019,21 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
         except Exception:
             pass
 
-        # Post-cancel check: order may have matched before cancel was processed
+        # Post-cancel check: order may have matched on-chain before cancel was processed.
+        # Add a short delay so the CLOB API has time to reflect on-chain state.
+        time.sleep(1.0)
         try:
             o = client.get_order(order_id)
             o_status = (o.get("status") or "").lower()
             raw_matched = o.get("size_matched")
             matched_size = float(raw_matched) if raw_matched else 0.0
-            print(f"  [poly-retry]   Post-cancel status={o_status} size_matched={raw_matched}")
+            trades_size = _poly_fill_size_from_trades(o)
+            print(f"  [poly-retry]   Post-cancel status={o_status} size_matched={raw_matched} trades_size={trades_size}")
 
-            if o_status in ("matched", "filled") or matched_size > 0:
-                filled_size = matched_size if matched_size > 0 else float(o.get("original_size", contracts))
+            if o_status in ("matched", "filled") or matched_size > 0 or trades_size > 0:
+                filled_size = (matched_size if matched_size > 0
+                               else trades_size if trades_size > 0
+                               else float(o.get("original_size", contracts)))
                 avg_price = _poly_avg_fill_price(o, planned_price)
                 latency = (time.monotonic() - t0) * 1000
                 status = "filled" if filled_size >= contracts else "partial"
@@ -2999,7 +3050,39 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
 
         last_error = f"retry {attempt}: not filled within {POLY_FILL_RETRY_TIMEOUT_S}s"
 
-    # All retries exhausted
+    # All retries exhausted — final sweep of ALL placed orders.
+    # On-chain fills can lag behind the CLOB API by several seconds, so wait
+    # and then check every order we placed during this execution.
+    if placed_order_ids:
+        print(f"  [poly-retry] Final sweep: checking {len(placed_order_ids)} order(s) after 2s delay...")
+        time.sleep(2.0)
+        for oid in placed_order_ids:
+            try:
+                o = client.get_order(oid)
+                trades_size = _poly_fill_size_from_trades(o)
+                raw_matched = o.get("size_matched")
+                matched_size = float(raw_matched) if raw_matched else 0.0
+                o_status = (o.get("status") or "").lower()
+                effective_size = max(matched_size, trades_size)
+                if effective_size > 0 or o_status in ("matched", "filled"):
+                    if effective_size <= 0:
+                        effective_size = float(o.get("original_size", contracts))
+                    avg_price = _poly_avg_fill_price(o, planned_price)
+                    latency = (time.monotonic() - t0) * 1000
+                    status = "filled" if effective_size >= contracts else "partial"
+                    print(f"  [poly-retry]   FINAL SWEEP: order {oid[:12]} was {status}! "
+                          f"{effective_size} contracts @ ~${avg_price:.4f} (trades_size={trades_size})")
+                    return LegFill(
+                        exchange="poly", side=side,
+                        planned_price=planned_price, actual_price=avg_price,
+                        planned_contracts=contracts, filled_contracts=effective_size,
+                        order_id=oid, fill_ts=utc_ts(),
+                        latency_ms=latency, status=status, error=None,
+                    )
+            except Exception as e:
+                print(f"  [poly-retry]   Final sweep error for {oid[:12]}: {e}")
+
+    # Truly no fills detected
     latency = (time.monotonic() - t0) * 1000
     return LegFill(
         exchange="poly", side=side,
