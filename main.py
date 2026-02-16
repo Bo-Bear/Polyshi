@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.31"
+VERSION = "1.1.32"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -2215,6 +2215,41 @@ def display_coin_box(coin: str, kalshi: Optional[KalshiMarketQuote],
         print(f"  → {skip_reason}")
 
 
+def display_skip_table(skipped_rows: list) -> None:
+    """Print a compact table summarising all skipped coins in a scan."""
+    if not skipped_rows:
+        return
+    # Column widths
+    cw_coin = 6
+    cw_kalshi = 13
+    cw_poly = 13
+    cw_edge = 10
+    # Header
+    hdr = (f"  {'COIN':<{cw_coin}} {'KALSHI':<{cw_kalshi}} "
+           f"{'POLY':<{cw_poly}} {'EDGE':<{cw_edge}} SKIP REASON")
+    print(hdr)
+    print(f"  {'─' * (len(hdr) - 2)}")
+    for r in skipped_rows:
+        # Kalshi prices
+        if r["kalshi"] is None:
+            k_str = "(no market)"
+        else:
+            k_str = f"{r['kalshi'].yes_ask:.2f}/{r['kalshi'].no_ask:.2f}"
+        # Poly prices
+        if r["poly"] is None:
+            p_str = "(no market)"
+        else:
+            p_str = f"{r['poly'].up_price:.2f}/{r['poly'].down_price:.2f}"
+        # Edge
+        e_str = r.get("edge", "—") or "—"
+        # Truncate long skip reasons
+        reason = r["reason"]
+        if len(reason) > 50:
+            reason = reason[:47] + "..."
+        print(f"  {r['coin']:<{cw_coin}} {k_str:<{cw_kalshi}} "
+              f"{p_str:<{cw_poly}} {e_str:<{cw_edge}} {reason}")
+
+
 _ANSI_RE = re.compile(r'\033\[[0-9;]*m')
 
 def _green_box_top(label: str = "", w: int = BOX_W) -> str:
@@ -4328,6 +4363,7 @@ def main() -> None:
         best_global: Optional[HedgeCandidate] = None
         best_global_poly: Optional[PolyMarketQuote] = None
         best_global_kalshi: Optional[KalshiMarketQuote] = None
+        skipped_rows: list = []
 
         # Fetch spot prices once per scan for strike reference
         spot_prices = fetch_spot_prices()
@@ -4462,14 +4498,18 @@ def main() -> None:
                     strat = f"K_{bc.direction_on_kalshi}+P_{bc.direction_on_poly}"
                     box_edge = f"{bc.net_edge * 100:+.1f}% via {strat}"
 
-            skip_text = ""
             if skip:
                 log_skip(logfile, skip_counts, scan_i, coin, skip[0],
                          poly=poly, kalshi=kalshi,
                          remaining_s=remaining_s if remaining_s else None)
-                skip_text = skip[1]
+                skipped_rows.append({
+                    "coin": coin, "kalshi": kalshi, "poly": poly,
+                    "edge": box_edge, "reason": skip[1],
+                })
+                continue
 
-            display_coin_box(coin, kalshi, poly, edge_str=box_edge, skip_reason=skip_text)
+            # Non-skipped: show full box
+            display_coin_box(coin, kalshi, poly, edge_str=box_edge)
 
             # Staleness warning for Poly WS data
             if poly and _poly_ws:
@@ -4483,14 +4523,15 @@ def main() -> None:
                 if stale_parts:
                     print(f"  ⚠ WS stale: {', '.join(stale_parts)}")
 
-            if skip:
-                continue
-
             if best_global is None or best_for_coin.net_edge > best_global.net_edge:
                 best_global = best_for_coin
                 best_global_poly = poly
                 best_global_kalshi = kalshi
 
+
+        # Print compact skip table for all skipped coins in this scan
+        if skipped_rows:
+            display_skip_table(skipped_rows)
 
         # Scan timing summary
         scan_ms = (time.monotonic() - scan_t0) * 1000
