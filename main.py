@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.21"
+VERSION = "1.1.22"
 VERSION_DATE = "2026-02-16 18:57 UTC"
 
 import requests
@@ -100,6 +100,12 @@ MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.00
 # -----------------------------
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
 PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "10"))
+
+# Cap trade size to this fraction of Poly book depth (0.8 = use at most 80% of visible depth)
+POLY_DEPTH_CAP_RATIO = float(os.getenv("POLY_DEPTH_CAP_RATIO", "0.8"))
+
+# Minimum contracts after depth-capping (skip trade if book can't support this many)
+MIN_CONTRACTS = int(os.getenv("MIN_CONTRACTS", "3"))
 
 # Toggle fee modeling
 INCLUDE_POLY_FEES = os.getenv("INCLUDE_POLY_FEES", "true").lower() == "true"
@@ -3265,13 +3271,44 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
 def execute_hedge(candidate: HedgeCandidate,
                   poly_quote: PolyMarketQuote,
                   kalshi_quote: KalshiMarketQuote,
-                  logfile: str) -> ExecutionResult:
+                  logfile: str,
+                  poly_depth: Optional[dict] = None) -> ExecutionResult:
     """Execute both legs of a hedge. Kalshi first (fast, deterministic), then Poly with retries.
 
     Execution order: Kalshi first, then Poly. If Poly fails after retries, unwind Kalshi.
     Result preserves leg1=Poly, leg2=Kalshi for backward compatibility with logging/P&L.
     """
+    # Cap contracts to available Poly book depth to reduce partial fills
     contracts = PAPER_CONTRACTS
+    if poly_depth and poly_depth.get("total_size", 0) > 0:
+        depth_cap = int(poly_depth["total_size"] * POLY_DEPTH_CAP_RATIO)
+        if depth_cap < contracts:
+            print(f"  [depth-cap] Poly book has {poly_depth['total_size']} contracts — "
+                  f"capping order from {int(contracts)} to {depth_cap} "
+                  f"({POLY_DEPTH_CAP_RATIO:.0%} of depth)")
+            contracts = depth_cap
+    if contracts < MIN_CONTRACTS:
+        print(f"  [depth-cap] Effective contracts ({int(contracts)}) below MIN_CONTRACTS ({MIN_CONTRACTS}) — skipping trade")
+        skip_fill = LegFill(
+            exchange="poly", side=candidate.direction_on_poly,
+            planned_price=candidate.poly_price, actual_price=None,
+            planned_contracts=0, filled_contracts=0.0,
+            order_id=None, fill_ts=None,
+            latency_ms=0.0, status="skipped", error="depth too thin",
+        )
+        kalshi_skip = LegFill(
+            exchange="kalshi", side=candidate.direction_on_kalshi,
+            planned_price=candidate.kalshi_price, actual_price=None,
+            planned_contracts=0, filled_contracts=0.0,
+            order_id=None, fill_ts=None,
+            latency_ms=0.0, status="skipped", error="depth too thin",
+        )
+        return ExecutionResult(
+            leg1=skip_fill, leg2=kalshi_skip,
+            total_latency_ms=0.0,
+            slippage_poly=0.0, slippage_kalshi=0.0,
+            both_filled=False,
+        )
 
     # Determine Poly token ID for the leg we're buying
     if candidate.direction_on_poly == "UP":
@@ -3429,136 +3466,168 @@ def execute_hedge(candidate: HedgeCandidate,
 
 def _unwind_poly_leg(side: str, buy_price: float, contracts: float,
                      token_id: str, logfile: str) -> str:
-    """Sell back Poly contracts to close unhedged exposure. Returns status message."""
-    try:
-        client = _get_poly_clob_client()
-        # Sell at a discount to ensure fill (buy_price - 0.02, floor at 0.01)
-        sell_price = max(0.01, round(buy_price - 0.02, 2))
+    """Sell back Poly contracts to close unhedged exposure.
 
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=sell_price,
-            size=contracts,
-            side=SELL,
-        )
-        signed_order = client.create_order(order_args)
-        resp = client.post_order(signed_order, OrderType.GTC)
+    Uses MAX_UNHEDGED_SECONDS as the fill deadline. If the first attempt
+    (buy_price - $0.02) times out, retries with aggressive pricing
+    (buy_price - $0.05) to force a close.
+    """
+    discounts = [0.02, 0.05]  # initial discount, then aggressive retry
+    last_msg = ""
+    for attempt, discount in enumerate(discounts, 1):
+        try:
+            client = _get_poly_clob_client()
+            sell_price = max(0.01, round(buy_price - discount, 2))
 
-        if not resp.get("success", False):
-            msg = f"unwind rejected: {resp.get('errorMsg') or resp.get('error') or resp}"
-            append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "poly",
-                                 "side": side, "contracts": contracts, "status": "rejected", "detail": msg})
-            return msg
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=sell_price,
+                size=contracts,
+                side=SELL,
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.GTC)
 
-        order_id = resp.get("orderID") or resp.get("id")
+            if not resp.get("success", False):
+                last_msg = f"unwind rejected: {resp.get('errorMsg') or resp.get('error') or resp}"
+                append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "poly",
+                                     "side": side, "contracts": contracts, "status": "rejected",
+                                     "attempt": attempt, "detail": last_msg})
+                continue
 
-        # Poll for fill
-        deadline = time.monotonic() + ORDER_TIMEOUT_S
-        while time.monotonic() < deadline:
+            order_id = resp.get("orderID") or resp.get("id")
+
+            # Poll for fill — use MAX_UNHEDGED_SECONDS as deadline
+            deadline = time.monotonic() + MAX_UNHEDGED_SECONDS
+            while time.monotonic() < deadline:
+                try:
+                    o = client.get_order(order_id)
+                    o_status = (o.get("status") or "").lower()
+                    if o_status in ("matched", "filled"):
+                        msg = f"unwound {contracts:.0f} Poly contracts at ~${sell_price:.2f} (order {order_id})"
+                        append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "poly",
+                                             "side": side, "contracts": contracts, "sell_price": sell_price,
+                                             "order_id": order_id, "status": "filled", "attempt": attempt})
+                        return msg
+                except Exception:
+                    pass
+                time.sleep(ORDER_POLL_INTERVAL_S)
+
+            # Timeout — cancel and retry with deeper discount
             try:
-                o = client.get_order(order_id)
-                o_status = (o.get("status") or "").lower()
-                if o_status in ("matched", "filled"):
-                    msg = f"unwound {contracts:.0f} Poly contracts at ~${sell_price:.2f} (order {order_id})"
-                    append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "poly",
-                                         "side": side, "contracts": contracts, "sell_price": sell_price,
-                                         "order_id": order_id, "status": "filled"})
-                    return msg
+                client.cancel(order_id)
             except Exception:
                 pass
-            time.sleep(ORDER_POLL_INTERVAL_S)
 
-        # Timeout — try to cancel
-        try:
-            client.cancel(order_id)
-        except Exception:
-            pass
-        msg = f"unwind timed out (order {order_id}) — may need manual close"
-        append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "poly",
-                             "side": side, "contracts": contracts, "order_id": order_id, "status": "timeout"})
-        return msg
+            if attempt < len(discounts):
+                print(f"  [unwind] Poly unwind attempt {attempt} timed out at -${discount:.2f} — "
+                      f"retrying with -${discounts[attempt]:.2f} aggressive pricing")
+                last_msg = f"unwind attempt {attempt} timed out"
+            else:
+                last_msg = f"unwind FAILED after {attempt} attempts (order {order_id}) — NEEDS MANUAL CLOSE"
+                append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "poly",
+                                     "side": side, "contracts": contracts, "order_id": order_id,
+                                     "status": "timeout_final", "attempt": attempt})
 
-    except Exception as e:
-        msg = f"unwind error: {e}"
-        append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "poly",
-                             "side": side, "contracts": contracts, "status": "error", "detail": str(e)})
-        return msg
+        except Exception as e:
+            last_msg = f"unwind error (attempt {attempt}): {e}"
+            append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "poly",
+                                 "side": side, "contracts": contracts, "status": "error",
+                                 "attempt": attempt, "detail": str(e)})
+
+    return last_msg
 
 
 def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                        ticker: str, logfile: str) -> str:
-    """Sell back Kalshi contracts to close unhedged exposure. Returns status message."""
-    try:
-        kalshi_side = "yes" if side == "UP" else "no"
-        # Sell at a discount to ensure fill
-        sell_price_cents = max(1, int(round((buy_price - 0.02) * 100)))
+    """Sell back Kalshi contracts to close unhedged exposure.
 
-        body: dict = {
-            "ticker": ticker,
-            "action": "sell",
-            "side": kalshi_side,
-            "type": "limit",
-            "count": int(contracts),
-            "client_order_id": f"polyshi-unwind-{uuid.uuid4().hex[:12]}",
-        }
-        if kalshi_side == "yes":
-            body["yes_price"] = sell_price_cents
-        else:
-            body["no_price"] = sell_price_cents
-
-        resp = _kalshi_auth_post("/portfolio/orders", body)
-        order = resp.get("order", resp)
-        order_id = order.get("order_id") or order.get("id")
-
-        if not order_id:
-            msg = f"unwind rejected: no order_id in response"
-            append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
-                                 "side": side, "contracts": contracts, "status": "rejected", "detail": msg})
-            return msg
-
-        # Poll for fill
-        deadline = time.monotonic() + ORDER_TIMEOUT_S
-        while time.monotonic() < deadline:
-            try:
-                poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
-                o = poll.get("order", poll)
-                if o.get("status") == "executed":
-                    msg = f"unwound {contracts:.0f} Kalshi contracts at ~${sell_price_cents/100:.2f} (order {order_id})"
-                    append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
-                                         "side": side, "contracts": contracts,
-                                         "sell_price": sell_price_cents / 100.0,
-                                         "order_id": order_id, "status": "filled"})
-                    return msg
-            except Exception:
-                pass
-            time.sleep(ORDER_POLL_INTERVAL_S)
-
-        # Timeout — cancel via DELETE (Kalshi v2 API)
+    Uses MAX_UNHEDGED_SECONDS as the fill deadline. If the first attempt
+    (buy_price - $0.02) times out, retries with aggressive pricing
+    (buy_price - $0.05) to force a close.
+    """
+    discounts = [0.02, 0.05]  # initial discount, then aggressive retry
+    last_msg = ""
+    for attempt, discount in enumerate(discounts, 1):
         try:
-            _kalshi_auth_delete(f"/portfolio/orders/{order_id}")
-        except Exception:
-            # Cancel failed — re-check if order actually filled
-            try:
-                poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
-                o = poll.get("order", poll)
-                if (o.get("status") or "").lower() in ("executed", "filled", "complete"):
-                    msg = f"unwound {contracts:.0f} Kalshi contracts (filled despite cancel error, order {order_id})"
-                    append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
-                                         "side": side, "contracts": contracts,
-                                         "order_id": order_id, "status": "filled"})
-                    return msg
-            except Exception:
-                pass
-        msg = f"unwind timed out (order {order_id}) — may need manual close"
-        append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
-                             "side": side, "contracts": contracts, "order_id": order_id, "status": "timeout"})
-        return msg
+            kalshi_side = "yes" if side == "UP" else "no"
+            sell_price_cents = max(1, int(round((buy_price - discount) * 100)))
 
-    except Exception as e:
-        msg = f"unwind error: {e}"
-        append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
-                             "side": side, "contracts": contracts, "status": "error", "detail": str(e)})
-        return msg
+            body: dict = {
+                "ticker": ticker,
+                "action": "sell",
+                "side": kalshi_side,
+                "type": "limit",
+                "count": int(contracts),
+                "client_order_id": f"polyshi-unwind-{uuid.uuid4().hex[:12]}",
+            }
+            if kalshi_side == "yes":
+                body["yes_price"] = sell_price_cents
+            else:
+                body["no_price"] = sell_price_cents
+
+            resp = _kalshi_auth_post("/portfolio/orders", body)
+            order = resp.get("order", resp)
+            order_id = order.get("order_id") or order.get("id")
+
+            if not order_id:
+                last_msg = f"unwind rejected: no order_id in response"
+                append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
+                                     "side": side, "contracts": contracts, "status": "rejected",
+                                     "attempt": attempt, "detail": last_msg})
+                continue
+
+            # Poll for fill — use MAX_UNHEDGED_SECONDS as deadline
+            deadline = time.monotonic() + MAX_UNHEDGED_SECONDS
+            while time.monotonic() < deadline:
+                try:
+                    poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
+                    o = poll.get("order", poll)
+                    if o.get("status") == "executed":
+                        msg = f"unwound {contracts:.0f} Kalshi contracts at ~${sell_price_cents/100:.2f} (order {order_id})"
+                        append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
+                                             "side": side, "contracts": contracts,
+                                             "sell_price": sell_price_cents / 100.0,
+                                             "order_id": order_id, "status": "filled", "attempt": attempt})
+                        return msg
+                except Exception:
+                    pass
+                time.sleep(ORDER_POLL_INTERVAL_S)
+
+            # Timeout — cancel via DELETE (Kalshi v2 API)
+            try:
+                _kalshi_auth_delete(f"/portfolio/orders/{order_id}")
+            except Exception:
+                # Cancel failed — re-check if order actually filled
+                try:
+                    poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
+                    o = poll.get("order", poll)
+                    if (o.get("status") or "").lower() in ("executed", "filled", "complete"):
+                        msg = f"unwound {contracts:.0f} Kalshi contracts (filled despite cancel error, order {order_id})"
+                        append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
+                                             "side": side, "contracts": contracts,
+                                             "order_id": order_id, "status": "filled", "attempt": attempt})
+                        return msg
+                except Exception:
+                    pass
+
+            if attempt < len(discounts):
+                print(f"  [unwind] Kalshi unwind attempt {attempt} timed out at -${discount:.2f} — "
+                      f"retrying with -${discounts[attempt]:.2f} aggressive pricing")
+                last_msg = f"unwind attempt {attempt} timed out"
+            else:
+                last_msg = f"unwind FAILED after {attempt} attempts (order {order_id}) — NEEDS MANUAL CLOSE"
+                append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
+                                     "side": side, "contracts": contracts, "order_id": order_id,
+                                     "status": "timeout_final", "attempt": attempt})
+
+        except Exception as e:
+            last_msg = f"unwind error (attempt {attempt}): {e}"
+            append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
+                                 "side": side, "contracts": contracts, "status": "error",
+                                 "attempt": attempt, "detail": str(e)})
+
+    return last_msg
 
 
 def log_skip(logfile: str, skip_counts: Dict[str, int], scan_num: int,
@@ -3782,7 +3851,8 @@ def main() -> None:
     print(f"  Max slippage:       ${POLY_MAX_SLIPPAGE:.2f} (Poly fill rejection)")
     print(f"  Fill price buffer:  ${LIVE_PRICE_BUFFER:.2f} (limit order cushion)")
     print(f"  Session drawdown:   ${MAX_SESSION_DRAWDOWN:.2f} max loss before auto-stop")
-    print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s (forced unwind)")
+    print(f"  Depth cap ratio:    {POLY_DEPTH_CAP_RATIO:.0%} of Poly book (min {MIN_CONTRACTS} contracts)")
+    print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s per attempt (2-pass unwind: -$0.02 then -$0.05)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
     print(f"  Poly fill retries:  {POLY_FILL_MAX_RETRIES} attempts x {POLY_FILL_RETRY_TIMEOUT_S:.0f}s each")
     print(f"  Per-coin trade cap: {MAX_TRADES_PER_COIN} trades/coin (incl. unwinds)")
@@ -4188,6 +4258,7 @@ def main() -> None:
                 "poly_book_size": poly_depth["total_size"] if poly_depth else None,
                 "poly_book_notional_usd": poly_depth["total_notional_usd"] if poly_depth else None,
                 "poly_ws_staleness_s": round(poly_staleness_s, 1) if poly_staleness_s is not None else None,
+                "depth_capped_contracts": int(min(PAPER_CONTRACTS, int(poly_depth["total_size"] * POLY_DEPTH_CAP_RATIO))) if poly_depth and poly_depth.get("total_size", 0) > 0 else int(PAPER_CONTRACTS),
                 # Timing
                 "scan_ms": round(scan_ms, 1),
                 "gamma_ms": round(gamma_ms, 1),
@@ -4206,7 +4277,8 @@ def main() -> None:
                       f"{poly_depth['total_size']} contracts, ${poly_depth['total_notional_usd']:.2f} notional")
 
             # Execute both legs (paper=instant fill, live=real orders)
-            exec_result = execute_hedge(best_global, best_global_poly, best_global_kalshi, logfile)
+            exec_result = execute_hedge(best_global, best_global_poly, best_global_kalshi, logfile,
+                                        poly_depth=poly_depth)
 
             # Attach execution details to the trade log row
             row["exec_mode"] = EXEC_MODE
