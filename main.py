@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.32"
+VERSION = "1.1.33"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -109,6 +109,11 @@ POLY_DEPTH_CAP_RATIO = float(os.getenv("POLY_DEPTH_CAP_RATIO", "0.5"))
 
 # Minimum contracts after depth-capping (skip trade if book can't support this many)
 MIN_CONTRACTS = int(os.getenv("MIN_CONTRACTS", "3"))
+
+# Pre-scan minimum: skip coin entirely if Poly book has fewer than this many contracts.
+# Should be >= PAPER_CONTRACTS / POLY_DEPTH_CAP_RATIO so the depth-cap won't reduce size.
+MIN_POLY_DEPTH_CONTRACTS = int(os.getenv("MIN_POLY_DEPTH_CONTRACTS",
+                                          str(int(PAPER_CONTRACTS / POLY_DEPTH_CAP_RATIO))))
 
 # Toggle fee modeling
 INCLUDE_POLY_FEES = os.getenv("INCLUDE_POLY_FEES", "true").lower() == "true"
@@ -4487,6 +4492,17 @@ def main() -> None:
                                 f"{coin} avg edge {avg_edge*100:.1f}% < {AVG_EDGE_GATE*100:.1f}% "
                                 f"after {window_count} trades (need ≥{GUARANTEED_TRADES_PER_COIN} guaranteed)")
                         best_for_coin = None
+
+            # Pre-trade depth gate: reject if Poly book is too thin for our size
+            if skip is None and best_for_coin is not None and _poly_ws:
+                depth_token = (poly.up_token_id if best_for_coin.direction_on_poly == "UP"
+                               else poly.down_token_id)
+                coin_depth = _poly_ws.get_book_depth(depth_token)
+                if coin_depth is None or coin_depth.get("total_size", 0) < MIN_POLY_DEPTH_CONTRACTS:
+                    actual = coin_depth["total_size"] if coin_depth else 0
+                    skip = ("poly_depth_thin",
+                            f"Poly book too thin ({actual} contracts < {MIN_POLY_DEPTH_CONTRACTS} min)")
+                    best_for_coin = None
 
             # --- Print compact coin box ---
             # Build edge display for the box
