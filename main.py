@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.29"
-VERSION_DATE = "2026-02-16 22:45 UTC"
+VERSION = "1.1.30"
+VERSION_DATE = "2026-02-16 23:00 UTC"
 
 import requests
 from dotenv import load_dotenv
@@ -4076,7 +4076,68 @@ def main() -> None:
                 except Exception as e:
                     print(f"  [window] Redemption failed: {e}")
 
-            # 2. Balance check + stop contingencies (live mode only)
+            # 2. Window contract breakdown by coin and platform
+            if window_trades:
+                # Gather per-coin, per-exchange fill data from execution legs
+                coin_exch: Dict[str, Dict[str, list]] = {}  # coin -> {exchange -> [(qty, price)]}
+                for wt in window_trades:
+                    c = wt.get("coin", "?")
+                    for leg in ("exec_leg1", "exec_leg2"):
+                        exch = wt.get(f"{leg}_exchange")
+                        qty = wt.get(f"{leg}_filled_qty") or 0
+                        px = wt.get(f"{leg}_actual_price") or wt.get(f"{leg.replace('exec_', '')}_planned_price")
+                        if exch and qty > 0 and px:
+                            coin_exch.setdefault(c, {}).setdefault(exch, []).append((qty, px))
+
+                w = BOX_W
+                print(f"\n{'*' * (w + 4)}")
+                print(f"*{'WINDOW CONTRACT BREAKDOWN':^{w + 2}}*")
+                print(f"{'*' * (w + 4)}")
+                print(f"*{'':<{w + 2}}*")
+                hdr = f"  {'COIN':<6} {'EXCHANGE':<10} {'CONTRACTS':>10} {'AVG PRICE':>10} {'TOTAL $':>10}"
+                print(f"*{hdr:<{w + 2}}*")
+                print(f"*{'  ' + '-' * (w - 2):<{w + 2}}*")
+
+                grand_kalshi_qty = 0.0
+                grand_kalshi_cost = 0.0
+                grand_poly_qty = 0.0
+                grand_poly_cost = 0.0
+
+                for coin_name in sorted(coin_exch.keys()):
+                    exchanges = coin_exch[coin_name]
+                    for exch_name in ("kalshi", "poly"):
+                        fills = exchanges.get(exch_name, [])
+                        if not fills:
+                            continue
+                        total_qty = sum(f[0] for f in fills)
+                        avg_px = sum(f[0] * f[1] for f in fills) / total_qty if total_qty else 0
+                        total_cost = sum(f[0] * f[1] for f in fills)
+                        line = f"  {coin_name.upper():<6} {exch_name.upper():<10} {total_qty:>10.1f} {avg_px:>10.4f} {total_cost:>9.2f}"
+                        print(f"*{line:<{w + 2}}*")
+                        if exch_name == "kalshi":
+                            grand_kalshi_qty += total_qty
+                            grand_kalshi_cost += total_cost
+                        else:
+                            grand_poly_qty += total_qty
+                            grand_poly_cost += total_cost
+
+                print(f"*{'  ' + '-' * (w - 2):<{w + 2}}*")
+                k_avg = grand_kalshi_cost / grand_kalshi_qty if grand_kalshi_qty else 0
+                p_avg = grand_poly_cost / grand_poly_qty if grand_poly_qty else 0
+                k_line = f"  {'TOTAL':<6} {'KALSHI':<10} {grand_kalshi_qty:>10.1f} {k_avg:>10.4f} {grand_kalshi_cost:>9.2f}"
+                p_line = f"  {'':<6} {'POLY':<10} {grand_poly_qty:>10.1f} {p_avg:>10.4f} {grand_poly_cost:>9.2f}"
+                print(f"*{k_line:<{w + 2}}*")
+                print(f"*{p_line:<{w + 2}}*")
+                delta = grand_kalshi_qty - grand_poly_qty
+                if abs(delta) > 0.01:
+                    warn = f"  UNHEDGED: {abs(delta):.1f} contracts ({'Kalshi' if delta > 0 else 'Poly'} heavy)"
+                    print(f"*{warn:<{w + 2}}*")
+                print(f"*{'':<{w + 2}}*")
+                print(f"{'*' * (w + 4)}")
+            else:
+                print(f"\n  [window] No trades this window")
+
+            # 3. Balance check + stop contingencies (live mode only)
             if EXEC_MODE == "live":
                 try:
                     current_bal = check_balances(logfile)
