@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.33"
+VERSION = "1.1.34"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -2224,6 +2224,14 @@ def display_skip_table(skipped_rows: list) -> None:
     """Print a compact table summarising all skipped coins in a scan."""
     if not skipped_rows:
         return
+
+    # If every coin was skipped for the same reason, collapse to one line
+    reasons = {r["reason"] for r in skipped_rows}
+    if len(reasons) == 1:
+        coins = ", ".join(r["coin"] for r in skipped_rows)
+        print(f"  Skipped {len(skipped_rows)} coins ({coins}): {next(iter(reasons))}")
+        return
+
     # Column widths
     cw_coin = 6
     cw_kalshi = 13
