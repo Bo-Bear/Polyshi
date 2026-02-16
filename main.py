@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.16"
+VERSION = "1.1.17"
 VERSION_DATE = "2026-02-16 18:07 UTC"
 
 import requests
@@ -2924,6 +2924,16 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
     last_error = None
     placed_order_ids: list = []  # Track all order IDs for final sweep
 
+    # Snapshot on-chain CTF balance before placing any orders.
+    # Used as last-resort ground truth to detect fills when all API methods fail.
+    try:
+        from eth_account import Account as _Acct
+        _owner_addr = _Acct.from_key(POLY_PRIVATE_KEY).address
+        _ctf_balance_before = _get_ctf_balance(_owner_addr, token_id)
+    except Exception:
+        _owner_addr = None
+        _ctf_balance_before = 0
+
     for attempt in range(1, POLY_FILL_MAX_RETRIES + 1):
         # Before placing a new order, re-check previous order to prevent duplicate fills
         if placed_order_ids:
@@ -3142,6 +3152,31 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             fill_ts=utc_ts(),
             latency_ms=latency, status=status, error=None,
         )
+
+    # Nuclear fallback: check on-chain CTF token balance delta.
+    # The blockchain is the ultimate source of truth — if our balance increased,
+    # we definitely received shares regardless of what the CLOB API reports.
+    if _owner_addr and _ctf_balance_before is not None:
+        try:
+            _ctf_balance_after = _get_ctf_balance(_owner_addr, token_id)
+            delta_raw = _ctf_balance_after - _ctf_balance_before
+            delta_shares = delta_raw / 1e6  # CTF tokens use 10^6 decimals
+            print(f"  [poly-retry] On-chain balance fallback: before={_ctf_balance_before} "
+                  f"after={_ctf_balance_after} delta={delta_shares:.2f} shares")
+            if delta_shares > 0:
+                latency = (time.monotonic() - t0) * 1000
+                status = "filled" if delta_shares >= contracts else "partial"
+                print(f"  [poly-retry]   ON-CHAIN CONFIRMED: {delta_shares:.2f} contracts filled!")
+                return LegFill(
+                    exchange="poly", side=side,
+                    planned_price=planned_price, actual_price=planned_price,
+                    planned_contracts=contracts, filled_contracts=delta_shares,
+                    order_id=placed_order_ids[-1] if placed_order_ids else None,
+                    fill_ts=utc_ts(),
+                    latency_ms=latency, status=status, error=None,
+                )
+        except Exception as e:
+            print(f"  [poly-retry]   On-chain balance check failed: {e}")
 
     # Truly no fills detected
     latency = (time.monotonic() - t0) * 1000
