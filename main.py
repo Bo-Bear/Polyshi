@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.36"
+VERSION = "1.1.37"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -2161,9 +2161,12 @@ def _box_line(text: str, w: int = BOX_W) -> str:
     return "│ " + text.ljust(w) + " │"
 
 
-def print_scan_header(scan_i: int) -> None:
+def print_scan_header(scan_i: int, extra: str = "") -> None:
     label = f" Scan #{scan_i} "
-    print(f"\n{'—' * 3}{label}{'—' * 3}")
+    line = f"\n{'—' * 3}{label}{'—' * 3}"
+    if extra:
+        line += f"  {extra}"
+    print(line)
 
 
 def fmt_money(x: float) -> str:
@@ -4263,9 +4266,9 @@ def main() -> None:
         session_remaining_s = max(0, session_deadline - time.monotonic())
         session_remaining_m = int(session_remaining_s // 60)
         session_remaining_sec = int(session_remaining_s % 60)
-        print_scan_header(scan_i)
-        print(f"  Session: {session_remaining_m}m {session_remaining_sec}s remaining | "
-              f"Trades: {len(logged)} | Losing windows: {consecutive_losing_windows}/2")
+        print_scan_header(scan_i,
+                          f"{session_remaining_m}m {session_remaining_sec}s left | "
+                          f"{len(logged)} trades | {consecutive_losing_windows}/2 losing windows")
 
         # Overlap Gamma event fetch with Kalshi fetches so neither exchange's
         # prices go stale while the other is loading.
@@ -4888,8 +4891,7 @@ def main() -> None:
 
         else:
             consecutive_skips += 1
-            print(f"No viable paper trades found in this scan.")
-            print(f"  {consecutive_skips} consecutive skips | {len(logged)} successful trades")
+            print(f"  No trades — {consecutive_skips} consecutive skips | {len(logged)} successful trades")
             # Periodic skip-reason breakdown every 20 scans to help diagnose filter bottlenecks
             if consecutive_skips > 0 and consecutive_skips % 20 == 0 and skip_counts:
                 total_skips = sum(skip_counts.values())
