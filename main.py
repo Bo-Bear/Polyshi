@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.17"
+VERSION = "1.1.18"
 VERSION_DATE = "2026-02-16 18:07 UTC"
 
 import requests
@@ -2952,6 +2952,28 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                         planned_price=planned_price, actual_price=avg_price,
                         planned_contracts=contracts, filled_contracts=prev_trades_size,
                         order_id=prev_id, fill_ts=utc_ts(),
+                        latency_ms=latency, status=status, error=None,
+                    )
+            except Exception:
+                pass
+
+        # CRITICAL: On-chain duplicate guard — if we already hold shares from a
+        # previous retry that the CLOB API failed to report, do NOT place another
+        # order.  This prevents the catastrophic "5 retries × N contracts" overspend.
+        if _owner_addr and placed_order_ids:
+            try:
+                current_bal = _get_ctf_balance(_owner_addr, token_id)
+                delta_shares = (current_bal - _ctf_balance_before) / 1e6
+                if delta_shares >= contracts * 0.9:  # allow small rounding tolerance
+                    latency = (time.monotonic() - t0) * 1000
+                    status = "filled" if delta_shares >= contracts else "partial"
+                    print(f"  [poly-retry]   ON-CHAIN GUARD: balance delta={delta_shares:.2f} "
+                          f"shows previous order already filled — aborting retries")
+                    return LegFill(
+                        exchange="poly", side=side,
+                        planned_price=planned_price, actual_price=planned_price,
+                        planned_contracts=contracts, filled_contracts=delta_shares,
+                        order_id=placed_order_ids[-1], fill_ts=utc_ts(),
                         latency_ms=latency, status=status, error=None,
                     )
             except Exception:
