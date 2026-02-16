@@ -6,13 +6,13 @@ import math
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.24"
+VERSION = "1.1.25"
 VERSION_DATE = "2026-02-16 21:30 UTC"
 
 import requests
@@ -94,6 +94,9 @@ MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.15"))  # 15 perc
 # Kalshi uses a fixed $ strike; Polymarket uses "up/down from window start."
 # When strike ≠ spot, both hedge legs can lose. 0.15% = ~$100 on BTC.
 MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.003"))
+
+# Minimum account balance — stop session if either exchange drops below this ($)
+MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
 
 # -----------------------------
 # Fees (paper-trade model)
@@ -1434,6 +1437,29 @@ def prompt_coin_selection(available: List[str]) -> List[str]:
 
     print("\nSelected: " + ", ".join(selected))
     return selected
+
+
+SESSION_DURATION_OPTIONS = {
+    "1": ("15 minutes", 15 * 60),
+    "2": ("30 minutes", 30 * 60),
+    "3": ("1 hour", 60 * 60),
+}
+
+def prompt_session_duration() -> int:
+    """Prompt user to choose session duration. Returns duration in seconds."""
+    print("\nSELECT SESSION DURATION")
+    print("=" * 45)
+    for key, (label, _) in SESSION_DURATION_OPTIONS.items():
+        print(f"{key}) {label}")
+
+    while True:
+        choice = input("\nSelect duration [1]: ").strip()
+        if choice == "" or choice in SESSION_DURATION_OPTIONS:
+            key = choice if choice else "1"
+            label, seconds = SESSION_DURATION_OPTIONS[key]
+            print(f"\nSession duration: {label}")
+            return seconds
+        print("Invalid selection. Enter 1, 2, or 3.")
 
 
 def dollars_from_cents_maybe(x) -> Optional[float]:
@@ -3831,12 +3857,16 @@ def main() -> None:
 
     selected_coins = prompt_coin_selection(AVAILABLE_COINS)
 
+    session_duration_s = prompt_session_duration()
+
     print("\nConfirm settings")
     print("=" * 45)
     mode_label = "*** LIVE TRADING ***" if EXEC_MODE == "live" else "Paper Testing"
+    duration_label = f"{session_duration_s // 60} minutes" if session_duration_s < 3600 else "1 hour"
     print(f"Execution:  {mode_label}")
     print(f"Market Type: {market_type}")
     print(f"Coins: {', '.join(selected_coins)}")
+    print(f"Duration:   {duration_label}")
     print(f"Contracts:  {int(PAPER_CONTRACTS)}")
     print(f"\nExecution safeguards:")
     print(f"  Min net edge:       {pct(MIN_NET_EDGE)}")
@@ -3851,6 +3881,8 @@ def main() -> None:
     print(f"  Max slippage:       ${POLY_MAX_SLIPPAGE:.2f} (Poly fill rejection)")
     print(f"  Fill price buffer:  ${LIVE_PRICE_BUFFER:.2f} (limit order cushion)")
     print(f"  Session drawdown:   ${MAX_SESSION_DRAWDOWN:.2f} max loss before auto-stop")
+    print(f"  Balance floor:      ${MIN_ACCOUNT_BALANCE:.2f} per account (stop if either drops below)")
+    print(f"  Consec loss stop:   2 losing 15m windows in a row → stop")
     print(f"  Depth cap ratio:    {POLY_DEPTH_CAP_RATIO:.0%} of Poly book (min {MIN_CONTRACTS} contracts)")
     print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s per attempt (2-pass unwind: -$0.02 then -$0.05)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
@@ -3982,10 +4014,90 @@ def main() -> None:
     # Store poly quotes per-coin per-scan for book depth lookups on winning trade
     _scan_poly_quotes: Dict[str, Optional[PolyMarketQuote]] = {}
 
-    while len(logged) < MAX_TEST_TRADES:
+    # --- Timed session + window tracking ---
+    session_deadline = time.monotonic() + session_duration_s
+    session_end_utc = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=session_duration_s)
+    current_window_close_ts: Optional[datetime] = None  # UTC close time of current 15m window
+    window_start_total = session_start_total             # Portfolio value at start of current window
+    consecutive_losing_windows = 0
+    window_trades: List[dict] = []                       # Trades placed in the current window
+    stop_reason: Optional[str] = None
+
+    print(f"\n  Session started — will run until {session_end_utc.strftime('%H:%M:%S')} UTC ({duration_label})")
+
+    while time.monotonic() < session_deadline:
         scan_i += 1
         scan_t0 = time.monotonic()
+
+        # --- Window transition: detect when the previous 15m window has closed ---
+        now_utc = datetime.now(timezone.utc)
+        if current_window_close_ts and now_utc > current_window_close_ts:
+            print(f"\n{'='*60}")
+            print(f"  15-MIN WINDOW ENDED — Running post-market cycle")
+            print(f"{'='*60}")
+
+            # Brief pause for market settlement before redemption
+            if window_trades and EXEC_MODE == "live":
+                print("  Waiting 15s for market settlement...")
+                time.sleep(15)
+
+            # 1. Redeem winning positions from the ended window
+            if window_trades and EXEC_MODE == "live" and POLY_SIGNATURE_TYPE == 0:
+                try:
+                    n = redeem_poly_positions(window_trades)
+                    print(f"  [window] Redeemed {n} position(s)")
+                except Exception as e:
+                    print(f"  [window] Redemption failed: {e}")
+
+            # 2. Balance check + stop contingencies (live mode only)
+            if EXEC_MODE == "live":
+                try:
+                    current_bal = check_balances(logfile)
+                    current_total = sum(v for v in current_bal.values() if v >= 0)
+
+                    print(f"  [window] Balances: Kalshi=${current_bal.get('kalshi', -1):.2f}, "
+                          f"Poly=${current_bal.get('poly', -1):.2f}, Total=${current_total:.2f}")
+
+                    # Stop contingency 1: $50 minimum balance per account
+                    for exch, bal in current_bal.items():
+                        if 0 <= bal < MIN_ACCOUNT_BALANCE:
+                            stop_reason = (f"BALANCE FLOOR: {exch.upper()} balance ${bal:.2f} "
+                                           f"< ${MIN_ACCOUNT_BALANCE:.2f}")
+                            break
+
+                    # Stop contingency 2: consecutive losing windows
+                    if not stop_reason:
+                        window_pnl = current_total - window_start_total
+                        if window_pnl < 0:
+                            consecutive_losing_windows += 1
+                            print(f"  [window] Window P&L: ${window_pnl:+.2f} "
+                                  f"(consecutive losses: {consecutive_losing_windows})")
+                        else:
+                            consecutive_losing_windows = 0
+                            print(f"  [window] Window P&L: ${window_pnl:+.2f} (loss streak reset)")
+
+                        if consecutive_losing_windows >= 2:
+                            stop_reason = "CONSECUTIVE LOSS STOP: 2 losing windows in a row"
+
+                    # Update baseline for next window
+                    window_start_total = current_total
+                except Exception as e:
+                    print(f"  [window] Post-market cycle failed: {e}")
+
+            window_trades = []
+            current_window_close_ts = None  # Will be set from next market data
+
+            if stop_reason:
+                print(f"\n*** {stop_reason} — stopping session ***")
+                break
+
+        # Show remaining session time in header
+        session_remaining_s = max(0, session_deadline - time.monotonic())
+        session_remaining_m = int(session_remaining_s // 60)
+        session_remaining_sec = int(session_remaining_s % 60)
         print_scan_header(scan_i)
+        print(f"  Session: {session_remaining_m}m {session_remaining_sec}s remaining | "
+              f"Trades: {len(logged)} | Losing windows: {consecutive_losing_windows}/2")
 
         # Overlap Gamma event fetch with Kalshi fetches so neither exchange's
         # prices go stale while the other is loading.
@@ -4066,6 +4178,13 @@ def main() -> None:
                 "poly_err": poly_errors.get(coin),
             }
         fetch_ms = (time.monotonic() - fetch_t0) * 1000
+
+        # Update current window close time from market data
+        for coin in selected_coins:
+            k = coin_data[coin].get("kalshi")
+            if k and hasattr(k, 'close_ts') and k.close_ts:
+                if current_window_close_ts is None or k.close_ts > current_window_close_ts:
+                    current_window_close_ts = k.close_ts
 
         best_global: Optional[HedgeCandidate] = None
         best_global_poly: Optional[PolyMarketQuote] = None
@@ -4478,6 +4597,7 @@ def main() -> None:
 
             append_log(logfile, row)
             logged.append(row)
+            window_trades.append(row)
             consecutive_skips = 0
 
             # Per-coin tracking: update trade count and unwind counter
@@ -4508,16 +4628,26 @@ def main() -> None:
                 coin_stopped[traded_coin] = f"{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds"
                 print(f"  [limit] {traded_coin} hit {MAX_CONSECUTIVE_UNWINDS} consecutive unwinds — STOPPING this crypto")
 
-            # Session drawdown check (live mode only)
-            if EXEC_MODE == "live" and session_start_total > 0 and MAX_SESSION_DRAWDOWN > 0:
+            # Session drawdown + balance floor check (live mode only)
+            if EXEC_MODE == "live" and session_start_total > 0:
                 try:
                     current_bal = check_balances(logfile)
                     current_total = sum(v for v in current_bal.values() if v >= 0)
                     drawdown = session_start_total - current_total
                     print(f"\n  [drawdown] Session P&L: ${-drawdown:+.2f} "
                           f"(start: ${session_start_total:.2f}, now: ${current_total:.2f})")
-                    if drawdown >= MAX_SESSION_DRAWDOWN:
-                        print(f"\n*** DRAWDOWN LIMIT HIT: ${drawdown:.2f} >= ${MAX_SESSION_DRAWDOWN:.2f} — stopping session ***")
+                    if MAX_SESSION_DRAWDOWN > 0 and drawdown >= MAX_SESSION_DRAWDOWN:
+                        stop_reason = f"DRAWDOWN LIMIT HIT: ${drawdown:.2f} >= ${MAX_SESSION_DRAWDOWN:.2f}"
+                        print(f"\n*** {stop_reason} — stopping session ***")
+                        break
+                    # Balance floor check: stop if either account < $50
+                    for exch, bal in current_bal.items():
+                        if 0 <= bal < MIN_ACCOUNT_BALANCE:
+                            stop_reason = (f"BALANCE FLOOR: {exch.upper()} balance ${bal:.2f} "
+                                           f"< ${MIN_ACCOUNT_BALANCE:.2f}")
+                            print(f"\n*** {stop_reason} — stopping session ***")
+                            break
+                    if stop_reason:
                         break
                 except Exception as e:
                     print(f"  [drawdown] Balance check failed: {e}")
@@ -4537,15 +4667,51 @@ def main() -> None:
                 print(f"\n⚠ Circuit breaker: {MAX_CONSECUTIVE_SKIPS} consecutive scans with no viable trades. Stopping.")
                 break
 
-        if len(logged) < MAX_TEST_TRADES:
+        if time.monotonic() < session_deadline:
             time.sleep(SCAN_SLEEP_SECONDS)
 
-    print(f"\nDone scanning. Wrote logs to: {logfile}")
+    # Log + print why the session ended
+    end_reason = stop_reason or ("session_duration_reached" if time.monotonic() >= session_deadline else "unknown")
+    log_kill_switch(logfile, end_reason, {
+        "trades_executed": len(logged),
+        "session_duration_s": session_duration_s,
+        "consecutive_losing_windows": consecutive_losing_windows,
+    })
+    if stop_reason:
+        print(f"\nSession stopped: {stop_reason}")
+    elif time.monotonic() >= session_deadline:
+        print(f"\nSession duration reached ({duration_label}). Session complete.")
+    print(f"Trades executed: {len(logged)}")
+    print(f"Wrote logs to: {logfile}")
+
+    # Final redemption pass for any remaining window trades
+    if window_trades and EXEC_MODE == "live" and POLY_SIGNATURE_TYPE == 0:
+        print(f"\n  [session-end] Running final redemption for {len(window_trades)} trade(s) in last window...")
+        try:
+            time.sleep(15)  # Wait for settlement
+            n = redeem_poly_positions(window_trades)
+            if n > 0:
+                print(f"  [session-end] Redeemed {n} position(s)")
+        except Exception as e:
+            print(f"  [session-end] Final redemption failed: {e}")
+
+    # Final balance check
+    if EXEC_MODE == "live":
+        try:
+            final_bal = check_balances(logfile)
+            final_total = sum(v for v in final_bal.values() if v >= 0)
+            session_pnl = final_total - session_start_total
+            print(f"\n  [session-end] Final balances: Kalshi=${final_bal.get('kalshi', -1):.2f}, "
+                  f"Poly=${final_bal.get('poly', -1):.2f}")
+            print(f"  [session-end] Session P&L: ${session_pnl:+.2f} "
+                  f"(start: ${session_start_total:.2f}, end: ${final_total:.2f})")
+        except Exception as e:
+            print(f"  [session-end] Final balance check failed: {e}")
 
     # Outcome verification: wait for windows to close, then check actual results
     # Skip for single-trade diagnostic runs (long wait for little value);
     # keep for multi-trade sessions where P&L tracking matters.
-    if logged and MAX_TEST_TRADES > 1:
+    if logged and len(logged) > 1:
         ans = input("\nWait for outcome verification? [y/N] ").strip().lower()
         if ans == "y":
             verify_trade_outcomes(logged, logfile)
