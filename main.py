@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.26"
+VERSION = "1.1.27"
 VERSION_DATE = "2026-02-16 21:30 UTC"
 
 import requests
@@ -57,7 +57,7 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 # Execution safeguards
 # -----------------------------
 # Minimum net edge to accept a trade (must exceed expected execution slippage of ~2-3c)
-MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.04"))  # 4%
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.06"))  # 6%
 
 # Maximum net edge — skip outliers that are likely stale/bad data, not real opportunities
 MAX_NET_EDGE = float(os.getenv("MAX_NET_EDGE", "0.15"))  # 15%
@@ -69,7 +69,7 @@ MAX_SESSION_DRAWDOWN = float(os.getenv("MAX_SESSION_DRAWDOWN", "60.0"))  # $60
 MAX_UNHEDGED_SECONDS = float(os.getenv("MAX_UNHEDGED_SECONDS", "10.0"))  # 10 seconds
 
 # Minimum seconds remaining in the window before we'll trade (need time to fill both legs)
-MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "30"))  # 30 seconds
+MIN_WINDOW_REMAINING_S = float(os.getenv("MIN_WINDOW_REMAINING_S", "90"))  # 90 seconds (last 1.5 min blocked)
 
 # Maximum spread (ask_up + ask_down - 1) we'll accept; wider means unreliable pricing
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))  # 10%
@@ -102,7 +102,7 @@ MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
 # Fees (paper-trade model)
 # -----------------------------
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
-PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "10"))
+PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "7"))
 
 # Cap trade size to this fraction of Poly book depth (0.5 = use at most 50% of visible depth)
 POLY_DEPTH_CAP_RATIO = float(os.getenv("POLY_DEPTH_CAP_RATIO", "0.5"))
@@ -192,8 +192,18 @@ POLY_FILL_RETRY_TIMEOUT_S = float(os.getenv("POLY_FILL_RETRY_TIMEOUT_S", "3"))  
 
 # Per-coin limits
 MAX_TRADES_PER_COIN = int(os.getenv("MAX_TRADES_PER_COIN", "5"))
-MAX_TRADES_PER_COIN_PER_WINDOW = int(os.getenv("MAX_TRADES_PER_COIN_PER_WINDOW", "2"))
+MAX_TRADES_PER_COIN_PER_WINDOW = int(os.getenv("MAX_TRADES_PER_COIN_PER_WINDOW", "6"))
 MAX_CONSECUTIVE_UNWINDS = int(os.getenv("MAX_CONSECUTIVE_UNWINDS", "3"))
+
+# Guaranteed trades + avg-edge gating: first N trades per coin per window are guaranteed,
+# then subsequent trades require the coin's rolling avg edge >= this threshold.
+GUARANTEED_TRADES_PER_COIN = int(os.getenv("GUARANTEED_TRADES_PER_COIN", "3"))
+AVG_EDGE_GATE = float(os.getenv("AVG_EDGE_GATE", "0.045"))  # 4.5%
+
+# 2-phase window startup: block trading for the first N seconds of each 15m window
+# to let orderbooks settle. Phase 1 (0-90s) = Kalshi connections + strikes load,
+# Phase 2 (90-120s) = Poly scrape stabilizes, trading opens at 120s.
+WINDOW_STARTUP_DELAY_S = float(os.getenv("WINDOW_STARTUP_DELAY_S", "120"))  # 120 seconds
 
 
 # -----------------------------
@@ -4024,6 +4034,7 @@ def main() -> None:
     coin_trade_counts: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}
     coin_window_trade_counts: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}  # resets each 15m window
     coin_consecutive_unwinds: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}
+    coin_window_edges: Dict[str, List[float]] = {c: [] for c in AVAILABLE_COINS}  # per-window edge history
     coin_stopped: Dict[str, str] = {}  # coin -> reason it was stopped
 
     # Store poly quotes per-coin per-scan for book depth lookups on winning trade
@@ -4033,6 +4044,7 @@ def main() -> None:
     session_deadline = time.monotonic() + session_duration_s
     session_end_utc = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=session_duration_s)
     current_window_close_ts: Optional[datetime] = None  # UTC close time of current 15m window
+    window_open_utc: Optional[datetime] = None           # UTC time when current window was first detected
     window_start_total = session_start_total             # Portfolio value at start of current window
     consecutive_losing_windows = 0
     window_trades: List[dict] = []                       # Trades placed in the current window
@@ -4101,9 +4113,11 @@ def main() -> None:
 
             window_trades = []
             current_window_close_ts = None  # Will be set from next market data
-            # Reset per-window trade limits so coins can trade again in the new window
+            window_open_utc = None  # Reset so 2-phase startup triggers for new window
+            # Reset per-window trade limits and edge history so coins can trade again
             for c in coin_window_trade_counts:
                 coin_window_trade_counts[c] = 0
+                coin_window_edges[c] = []
 
             if stop_reason:
                 print(f"\n*** {stop_reason} — stopping session ***")
@@ -4198,11 +4212,30 @@ def main() -> None:
         fetch_ms = (time.monotonic() - fetch_t0) * 1000
 
         # Update current window close time from market data
+        prev_window_close = current_window_close_ts
         for coin in selected_coins:
             k = coin_data[coin].get("kalshi")
             if k and hasattr(k, 'close_ts') and k.close_ts:
                 if current_window_close_ts is None or k.close_ts > current_window_close_ts:
                     current_window_close_ts = k.close_ts
+
+        # Detect new window: when close_ts advances (or first seen), record window open time
+        if current_window_close_ts and (prev_window_close is None or current_window_close_ts != prev_window_close):
+            window_open_utc = datetime.now(timezone.utc)
+            print(f"  [startup] New window detected (closes {current_window_close_ts.strftime('%H:%M:%S')} UTC) "
+                  f"— {WINDOW_STARTUP_DELAY_S:.0f}s startup delay begins")
+
+        # 2-phase startup: skip trading until WINDOW_STARTUP_DELAY_S has elapsed since window open
+        window_startup_active = False
+        if window_open_utc is not None:
+            window_age_s = (datetime.now(timezone.utc) - window_open_utc).total_seconds()
+            if window_age_s < WINDOW_STARTUP_DELAY_S:
+                window_startup_active = True
+                remaining_startup = WINDOW_STARTUP_DELAY_S - window_age_s
+                phase = 1 if window_age_s < 90 else 2
+                print(f"  [startup] Phase {phase} — {remaining_startup:.0f}s until trading opens "
+                      f"(Kalshi+strikes {'loading' if phase == 1 else 'ready'}, "
+                      f"Poly {'waiting' if phase == 1 else 'settling'})")
 
         best_global: Optional[HedgeCandidate] = None
         best_global_poly: Optional[PolyMarketQuote] = None
@@ -4221,20 +4254,25 @@ def main() -> None:
             # --- Determine skip reason (if any) before printing ---
             skip = None  # (reason_key, display_text) or None
 
+            # 2-phase startup delay: block all trading until window has settled
+            if window_startup_active:
+                skip = ("window_startup", "Window startup delay — orderbooks settling")
+
             # Per-coin caps
-            if coin in coin_stopped:
-                skip = ("coin_stopped", f"{coin} stopped: {coin_stopped[coin]}")
-            elif coin_trade_counts.get(coin, 0) >= MAX_TRADES_PER_COIN:
-                coin_stopped[coin] = f"reached max {MAX_TRADES_PER_COIN} trades"
-                skip = ("coin_max_trades",
-                        f"{coin} reached max {MAX_TRADES_PER_COIN} trades (incl. unwinds) — STOPPING")
-            elif coin_window_trade_counts.get(coin, 0) >= MAX_TRADES_PER_COIN_PER_WINDOW:
-                skip = ("coin_window_cap",
-                        f"{coin} hit {MAX_TRADES_PER_COIN_PER_WINDOW} trades this window — waiting for next")
-            elif coin_consecutive_unwinds.get(coin, 0) >= MAX_CONSECUTIVE_UNWINDS:
-                coin_stopped[coin] = f"{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds"
-                skip = ("coin_max_unwinds",
-                        f"{coin} hit {MAX_CONSECUTIVE_UNWINDS} consecutive unwinds — STOPPING")
+            if skip is None:
+                if coin in coin_stopped:
+                    skip = ("coin_stopped", f"{coin} stopped: {coin_stopped[coin]}")
+                elif coin_trade_counts.get(coin, 0) >= MAX_TRADES_PER_COIN:
+                    coin_stopped[coin] = f"reached max {MAX_TRADES_PER_COIN} trades"
+                    skip = ("coin_max_trades",
+                            f"{coin} reached max {MAX_TRADES_PER_COIN} trades (incl. unwinds) — STOPPING")
+                elif coin_window_trade_counts.get(coin, 0) >= MAX_TRADES_PER_COIN_PER_WINDOW:
+                    skip = ("coin_window_cap",
+                            f"{coin} hit {MAX_TRADES_PER_COIN_PER_WINDOW} trades this window — waiting for next")
+                elif coin_consecutive_unwinds.get(coin, 0) >= MAX_CONSECUTIVE_UNWINDS:
+                    coin_stopped[coin] = f"{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds"
+                    skip = ("coin_max_unwinds",
+                            f"{coin} hit {MAX_CONSECUTIVE_UNWINDS} consecutive unwinds — STOPPING")
 
             if skip is None and (kalshi is None or poly is None):
                 skip = ("no_kalshi_market" if kalshi is None else "no_poly_market",
@@ -4313,6 +4351,18 @@ def main() -> None:
                     if strike_divergence is not None:
                         safe_tag = f" *SAFE(cross-strike (K${float(kalshi.strike):,.2f}<P${spot_prices.get(coin, 0):,.2f}))"
                     edge_str = f"{best_for_coin.net_edge * 100:+.1f}% via {strategy}{safe_tag}"
+
+            # Avg-edge gating: after guaranteed trades, require rolling avg >= threshold
+            if skip is None and best_for_coin is not None:
+                window_count = coin_window_trade_counts.get(coin, 0)
+                if window_count >= GUARANTEED_TRADES_PER_COIN:
+                    edges = coin_window_edges.get(coin, [])
+                    avg_edge = sum(edges) / len(edges) if edges else 0.0
+                    if avg_edge < AVG_EDGE_GATE:
+                        skip = ("avg_edge_gate",
+                                f"{coin} avg edge {avg_edge*100:.1f}% < {AVG_EDGE_GATE*100:.1f}% "
+                                f"after {window_count} trades (need ≥{GUARANTEED_TRADES_PER_COIN} guaranteed)")
+                        best_for_coin = None
 
             # --- Print compact coin box ---
             # Build edge display for the box
@@ -4621,10 +4671,11 @@ def main() -> None:
             window_trades.append(row)
             consecutive_skips = 0
 
-            # Per-coin tracking: update trade count and unwind counter
+            # Per-coin tracking: update trade count, edge history, and unwind counter
             traded_coin = best_global.coin
             coin_trade_counts[traded_coin] = coin_trade_counts.get(traded_coin, 0) + 1
             coin_window_trade_counts[traded_coin] = coin_window_trade_counts.get(traded_coin, 0) + 1
+            coin_window_edges[traded_coin].append(best_global.net_edge)
             was_unwound = not exec_result.both_filled
             if was_unwound:
                 coin_consecutive_unwinds[traded_coin] = coin_consecutive_unwinds.get(traded_coin, 0) + 1
