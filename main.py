@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.35"
+VERSION = "1.1.36"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -4888,7 +4888,8 @@ def main() -> None:
 
         else:
             consecutive_skips += 1
-            print(f"No viable paper trades found in this scan. ({consecutive_skips} consecutive skips | {len(logged)} trades)")
+            print(f"No viable paper trades found in this scan.")
+            print(f"  {consecutive_skips} consecutive skips | {len(logged)} successful trades")
             # Periodic skip-reason breakdown every 20 scans to help diagnose filter bottlenecks
             if consecutive_skips > 0 and consecutive_skips % 20 == 0 and skip_counts:
                 total_skips = sum(skip_counts.values())
