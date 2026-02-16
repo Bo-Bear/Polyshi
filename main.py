@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
+VERSION = "1.0.1"
+
 import requests
 from dotenv import load_dotenv
 
@@ -3321,6 +3323,7 @@ def verify_trade_outcomes(trades: List[dict], logfile: str) -> List[dict]:
 # -----------------------------
 def main() -> None:
     global EXEC_MODE
+    print(f"\n  Polyshi v{VERSION}\n")
     ensure_dir(LOG_DIR)
     logfile = os.path.join(LOG_DIR, f"arb_logs_market_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jsonl")
 
