@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.14"
-VERSION_DATE = "2026-02-16 17:58 UTC"
+VERSION = "1.1.15"
+VERSION_DATE = "2026-02-16 18:07 UTC"
 
 import requests
 from dotenv import load_dotenv
@@ -35,7 +35,7 @@ except ImportError:
 # Polymarket CLOB client (needed for live trading)
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.clob_types import OrderArgs, OrderType, TradeParams
     from py_clob_client.order_builder.constants import BUY, SELL
     _HAS_CLOB_CLIENT = True
 except ImportError:
@@ -2748,6 +2748,35 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
     return order_id, None, 0.0, "rejected", "order timed out with no fills"
 
 
+def _poly_query_recent_fills(client, token_id: str, since_ts: int) -> Tuple[float, float]:
+    """Query the CLOB trades ledger for fills on a token since a timestamp.
+
+    Uses ``client.get_trades()`` which returns actual executed trades — the most
+    reliable source of fill data, independent of ``get_order()`` status/size_matched.
+
+    Returns (total_size, weighted_avg_price).  Returns (0.0, 0.0) on error or
+    if no trades are found.
+    """
+    try:
+        trades = client.get_trades(TradeParams(asset_id=token_id, after=since_ts))
+    except Exception:
+        return 0.0, 0.0
+    if not trades:
+        return 0.0, 0.0
+    total_size = 0.0
+    total_cost = 0.0
+    for t in trades:
+        try:
+            sz = float(t.get("size", 0))
+            px = float(t.get("price", 0))
+            total_size += sz
+            total_cost += sz * px
+        except (TypeError, ValueError):
+            continue
+    avg_price = total_cost / total_size if total_size > 0 else 0.0
+    return total_size, avg_price
+
+
 def _poly_fill_size_from_trades(order: dict) -> float:
     """Extract total filled size from associate_trades (on-chain ground truth).
 
@@ -2874,6 +2903,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
     Returns LegFill with aggregate result across all attempts.
     """
     t0 = time.monotonic()
+    epoch_before = int(time.time())  # Unix timestamp for get_trades() fallback
 
     if EXEC_MODE == "paper":
         return LegFill(
@@ -3081,6 +3111,25 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                     )
             except Exception as e:
                 print(f"  [poly-retry]   Final sweep error for {oid[:12]}: {e}")
+
+    # Last resort: query the CLOB trades ledger directly.  This catches fills
+    # that get_order() misses entirely (status="canceled" + empty associate_trades
+    # due to API sync lag).  get_trades() returns actual executed trade records
+    # independent of order status.
+    print(f"  [poly-retry] Trades-ledger fallback: querying get_trades(asset_id={token_id[:12]}..., after={epoch_before})...")
+    ledger_size, ledger_price = _poly_query_recent_fills(client, token_id, epoch_before)
+    if ledger_size > 0:
+        latency = (time.monotonic() - t0) * 1000
+        status = "filled" if ledger_size >= contracts else "partial"
+        print(f"  [poly-retry]   TRADES LEDGER: found {ledger_size} contracts @ ~${ledger_price:.4f}!")
+        return LegFill(
+            exchange="poly", side=side,
+            planned_price=planned_price, actual_price=ledger_price,
+            planned_contracts=contracts, filled_contracts=ledger_size,
+            order_id=placed_order_ids[-1] if placed_order_ids else None,
+            fill_ts=utc_ts(),
+            latency_ms=latency, status=status, error=None,
+        )
 
     # Truly no fills detected
     latency = (time.monotonic() - t0) * 1000
