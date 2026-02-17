@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.46"
+VERSION = "1.1.47"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -3226,7 +3226,14 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
         _owner_addr = None
         _ctf_balance_before = 0
 
+    cumulative_filled = 0.0  # Track fills across retries to prevent overfill
+
     for attempt in range(1, POLY_FILL_MAX_RETRIES + 1):
+        remaining = contracts - cumulative_filled
+        if remaining < 1:
+            print(f"  [poly-retry]   Target reached ({cumulative_filled:.1f}/{contracts:.0f}) — done")
+            break
+
         # Before placing a new order, re-check previous order to prevent duplicate fills
         if placed_order_ids:
             prev_id = placed_order_ids[-1]
@@ -3235,17 +3242,20 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                 prev_trades_size = _poly_fill_size_from_trades(prev_o)
                 if prev_trades_size > 0:
                     avg_price = _poly_avg_fill_price(prev_o, planned_price)
+                    cumulative_filled += prev_trades_size
                     latency = (time.monotonic() - t0) * 1000
-                    status = "filled" if prev_trades_size >= contracts else "partial"
+                    status = "filled" if cumulative_filled >= contracts else "partial"
                     print(f"  [poly-retry]   Previous order {prev_id[:12]} actually filled! "
-                          f"{prev_trades_size} contracts — skipping new attempt")
-                    return LegFill(
-                        exchange="poly", side=side,
-                        planned_price=planned_price, actual_price=avg_price,
-                        planned_contracts=contracts, filled_contracts=prev_trades_size,
-                        order_id=prev_id, fill_ts=utc_ts(),
-                        latency_ms=latency, status=status, error=None,
-                    )
+                          f"{prev_trades_size} contracts (cumulative {cumulative_filled:.1f}/{contracts:.0f})")
+                    if cumulative_filled >= contracts * 0.9:
+                        return LegFill(
+                            exchange="poly", side=side,
+                            planned_price=planned_price, actual_price=avg_price,
+                            planned_contracts=contracts, filled_contracts=min(cumulative_filled, contracts),
+                            order_id=prev_id, fill_ts=utc_ts(),
+                            latency_ms=latency, status=status, error=None,
+                        )
+                    remaining = contracts - cumulative_filled
             except Exception:
                 pass
 
@@ -3256,20 +3266,30 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             try:
                 current_bal = _get_ctf_balance(_owner_addr, token_id)
                 delta_shares = (current_bal - _ctf_balance_before) / 1e6
-                if delta_shares >= contracts * 0.9:  # allow small rounding tolerance
+                if delta_shares >= contracts * 0.5:  # catch partial fills early (was 0.9)
                     latency = (time.monotonic() - t0) * 1000
-                    status = "filled" if delta_shares >= contracts else "partial"
+                    capped = min(delta_shares, contracts)
+                    status = "filled" if capped >= contracts else "partial"
                     print(f"  [poly-retry]   ON-CHAIN GUARD: balance delta={delta_shares:.2f} "
-                          f"shows previous order already filled — aborting retries")
+                          f"shows previous order(s) filled — aborting retries")
                     return LegFill(
                         exchange="poly", side=side,
                         planned_price=planned_price, actual_price=planned_price,
-                        planned_contracts=contracts, filled_contracts=delta_shares,
+                        planned_contracts=contracts, filled_contracts=capped,
                         order_id=placed_order_ids[-1], fill_ts=utc_ts(),
                         latency_ms=latency, status=status, error=None,
                     )
+                elif delta_shares > 0:
+                    # Some shares already filled — reduce order size
+                    cumulative_filled = max(cumulative_filled, delta_shares)
+                    remaining = contracts - cumulative_filled
+                    print(f"  [poly-retry]   ON-CHAIN: {delta_shares:.1f} already filled, "
+                          f"reducing order to {remaining:.0f}")
             except Exception:
                 pass
+
+        if remaining < 1:
+            break
 
         # Fetch fresh orderbook
         asks = poly_clob_get_asks(str(token_id))
@@ -3298,15 +3318,16 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
 
         # Use best ask + small buffer, but cap at planned_price + max slippage
         limit_price = min(round(best_ask + LIVE_PRICE_BUFFER, 2), round(max_acceptable, 2), 0.99)
+        order_size = remaining
         print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
-              f"{int(contracts)}x @ ${limit_price:.2f} (best ask ${best_ask:.3f})")
+              f"{int(order_size)}x @ ${limit_price:.2f} (best ask ${best_ask:.3f})")
 
         # Place order
         try:
             order_args = OrderArgs(
                 token_id=token_id,
                 price=limit_price,
-                size=contracts,
+                size=order_size,
                 side=BUY,
             )
             signed_order = client.create_order(order_args)
@@ -3416,37 +3437,59 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
 
         last_error = f"retry {attempt}: not filled within {POLY_FILL_RETRY_TIMEOUT_S}s"
 
+    # If cumulative tracking found fills during the retry loop, return them
+    if cumulative_filled > 0:
+        capped = min(cumulative_filled, contracts)
+        latency = (time.monotonic() - t0) * 1000
+        status = "filled" if capped >= contracts else "partial"
+        print(f"  [poly-retry] Cumulative fills from retry loop: {capped:.1f}/{contracts:.0f}")
+        return LegFill(
+            exchange="poly", side=side,
+            planned_price=planned_price, actual_price=planned_price,
+            planned_contracts=contracts, filled_contracts=capped,
+            order_id=placed_order_ids[-1] if placed_order_ids else None,
+            fill_ts=utc_ts(),
+            latency_ms=latency, status=status, error=None,
+        )
+
     # All retries exhausted — final sweep of ALL placed orders.
     # On-chain fills can lag behind the CLOB API by several seconds, so wait
     # and then check every order we placed during this execution.
+    # Aggregate fills across all orders to get the true total.
     if placed_order_ids:
         print(f"  [poly-retry] Final sweep: checking {len(placed_order_ids)} order(s) after 2s delay...")
         time.sleep(2.0)
+        sweep_total = 0.0
+        sweep_last_oid = None
+        sweep_avg_price = planned_price
         for oid in placed_order_ids:
             try:
                 o = client.get_order(oid)
                 trades_size = _poly_fill_size_from_trades(o)
                 raw_matched = o.get("size_matched")
                 matched_size = float(raw_matched) if raw_matched and float(raw_matched) > 0 else 0.0
-                o_status = (o.get("status") or "").lower()
                 effective_size = max(matched_size, trades_size)
-                if effective_size > 0 or o_status in ("matched", "filled"):
-                    if effective_size <= 0:
-                        effective_size = float(o.get("original_size", contracts))
-                    avg_price = _poly_avg_fill_price(o, planned_price)
-                    latency = (time.monotonic() - t0) * 1000
-                    status = "filled" if effective_size >= contracts else "partial"
-                    print(f"  [poly-retry]   FINAL SWEEP: order {oid[:12]} was {status}! "
-                          f"{effective_size} contracts @ ~${avg_price:.4f} (trades_size={trades_size})")
-                    return LegFill(
-                        exchange="poly", side=side,
-                        planned_price=planned_price, actual_price=avg_price,
-                        planned_contracts=contracts, filled_contracts=effective_size,
-                        order_id=oid, fill_ts=utc_ts(),
-                        latency_ms=latency, status=status, error=None,
-                    )
+                if effective_size > 0:
+                    sweep_total += effective_size
+                    sweep_last_oid = oid
+                    sweep_avg_price = _poly_avg_fill_price(o, planned_price)
+                    print(f"  [poly-retry]   FINAL SWEEP: order {oid[:12]} filled "
+                          f"{effective_size} contracts (running total {sweep_total:.1f})")
             except Exception as e:
                 print(f"  [poly-retry]   Final sweep error for {oid[:12]}: {e}")
+        if sweep_total > 0:
+            capped = min(sweep_total, contracts)
+            if sweep_total > contracts:
+                print(f"  [poly-retry]   WARNING: sweep found {sweep_total:.1f} but target was {contracts:.0f} — capping")
+            latency = (time.monotonic() - t0) * 1000
+            status = "filled" if capped >= contracts else "partial"
+            return LegFill(
+                exchange="poly", side=side,
+                planned_price=planned_price, actual_price=sweep_avg_price,
+                planned_contracts=contracts, filled_contracts=capped,
+                order_id=sweep_last_oid, fill_ts=utc_ts(),
+                latency_ms=latency, status=status, error=None,
+            )
 
     # Last resort: query the CLOB trades ledger directly.  This catches fills
     # that get_order() misses entirely (status="canceled" + empty associate_trades
@@ -3455,13 +3498,17 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
     print(f"  [poly-retry] Trades-ledger fallback: querying get_trades(asset_id={token_id[:12]}..., after={epoch_before})...")
     ledger_size, ledger_price = _poly_query_recent_fills(client, token_id, epoch_before)
     if ledger_size > 0:
+        # Cap to target to prevent overfill from aggregating multiple retry orders
+        capped_size = min(ledger_size, contracts)
+        if ledger_size > contracts:
+            print(f"  [poly-retry]   WARNING: ledger shows {ledger_size} but target was {contracts} — capping")
         latency = (time.monotonic() - t0) * 1000
-        status = "filled" if ledger_size >= contracts else "partial"
-        print(f"  [poly-retry]   TRADES LEDGER: found {ledger_size} contracts @ ~${ledger_price:.4f}!")
+        status = "filled" if capped_size >= contracts else "partial"
+        print(f"  [poly-retry]   TRADES LEDGER: found {capped_size} contracts @ ~${ledger_price:.4f}!")
         return LegFill(
             exchange="poly", side=side,
             planned_price=planned_price, actual_price=ledger_price,
-            planned_contracts=contracts, filled_contracts=ledger_size,
+            planned_contracts=contracts, filled_contracts=capped_size,
             order_id=placed_order_ids[-1] if placed_order_ids else None,
             fill_ts=utc_ts(),
             latency_ms=latency, status=status, error=None,
@@ -3478,13 +3525,15 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             print(f"  [poly-retry] On-chain balance fallback: before={_ctf_balance_before} "
                   f"after={_ctf_balance_after} delta={delta_shares:.2f} shares")
             if delta_shares > 0:
+                # Cap to target to prevent overfill
+                capped_shares = min(delta_shares, contracts)
                 latency = (time.monotonic() - t0) * 1000
-                status = "filled" if delta_shares >= contracts else "partial"
-                print(f"  [poly-retry]   ON-CHAIN CONFIRMED: {delta_shares:.2f} contracts filled!")
+                status = "filled" if capped_shares >= contracts else "partial"
+                print(f"  [poly-retry]   ON-CHAIN CONFIRMED: {capped_shares:.2f} contracts filled!")
                 return LegFill(
                     exchange="poly", side=side,
                     planned_price=planned_price, actual_price=planned_price,
-                    planned_contracts=contracts, filled_contracts=delta_shares,
+                    planned_contracts=contracts, filled_contracts=capped_shares,
                     order_id=placed_order_ids[-1] if placed_order_ids else None,
                     fill_ts=utc_ts(),
                     latency_ms=latency, status=status, error=None,
@@ -3842,7 +3891,7 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
     3-pass strategy:
       Attempt 1: Limit sell at the best bid from the live order book
       Attempt 2: Limit sell at best_bid - $0.02 (aggressive)
-      Attempt 3: Market order (guaranteed fill, worst pricing)
+      Attempt 3: Limit sell at $0.01 (floor price, maximizes fill chance)
 
     Falls back to fixed discounts off buy_price if the order book fetch fails.
     Returns (message, sell_price_or_None).
@@ -3883,8 +3932,8 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
         # Fallback: fixed discounts off buy price
         attempts.append(("buy-0.02", "limit", max(1, int(round((buy_price - 0.02) * 100)))))
         attempts.append(("buy-0.05", "limit", max(1, int(round((buy_price - 0.05) * 100)))))
-    # Attempt 3 (final): market order — guaranteed fill
-    attempts.append(("market", "market", None))
+    # Attempt 3 (final): floor-price limit — Kalshi doesn't support market orders
+    attempts.append(("floor_price", "limit", 1))  # 1 cent — will fill against any bid
 
     last_msg = ""
     for attempt, (label, order_type, price_cents) in enumerate(attempts, 1):
@@ -3893,27 +3942,27 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                 "ticker": ticker,
                 "action": "sell",
                 "side": kalshi_side,
-                "type": order_type,
+                "type": "limit",
                 "count": int(contracts),
                 "client_order_id": f"polyshi-unwind-{uuid.uuid4().hex[:12]}",
             }
-            if order_type == "limit":
-                if kalshi_side == "yes":
-                    body["yes_price"] = price_cents
-                else:
-                    body["no_price"] = price_cents
-                price_display = f"${price_cents / 100.0:.2f}"
+            if kalshi_side == "yes":
+                body["yes_price"] = price_cents
             else:
-                price_display = "MARKET"
+                body["no_price"] = price_cents
+            price_display = f"${price_cents / 100.0:.2f}"
 
-            print(f"  [unwind] attempt {attempt}/{len(attempts)}: {order_type} sell @ {price_display} ({label})")
+            print(f"  [unwind] attempt {attempt}/{len(attempts)}: limit sell @ {price_display} ({label})")
 
             resp = _kalshi_auth_post("/portfolio/orders", body)
             order = resp.get("order", resp)
             order_id = order.get("order_id") or order.get("id")
 
             if not order_id:
-                last_msg = f"unwind rejected: no order_id in response"
+                # Log the actual API response for debugging
+                err_detail = resp.get("error") or resp.get("message") or str(resp)[:200]
+                last_msg = f"unwind rejected: no order_id ({err_detail})"
+                print(f"  [unwind] API response: {err_detail}")
                 append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                      "side": side, "contracts": contracts, "status": "rejected",
                                      "attempt": attempt, "label": label, "detail": last_msg})
@@ -3926,15 +3975,7 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                     poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
                     o = poll.get("order", poll)
                     if o.get("status") == "executed":
-                        # For market orders, get actual fill price from the response
-                        if order_type == "market":
-                            avg_price_cents = o.get("avg_price") or o.get("average_price")
-                            if avg_price_cents is not None:
-                                sell_price = float(avg_price_cents) / 100.0
-                            else:
-                                sell_price = 0.01  # placeholder if API doesn't return fill price
-                        else:
-                            sell_price = price_cents / 100.0
+                        sell_price = price_cents / 100.0
                         msg = f"unwound {contracts:.0f} Kalshi contracts at ~${sell_price:.2f} ({label}, order {order_id})"
                         append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                              "side": side, "contracts": contracts,
@@ -3956,11 +3997,7 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                     o = poll.get("order", poll)
                     status_str = (o.get("status") or "").lower()
                     if status_str in ("executed", "filled", "complete"):
-                        if order_type == "market":
-                            avg_price_cents = o.get("avg_price") or o.get("average_price")
-                            sell_price = float(avg_price_cents) / 100.0 if avg_price_cents else 0.01
-                        else:
-                            sell_price = price_cents / 100.0
+                        sell_price = price_cents / 100.0
                         msg = f"unwound {contracts:.0f} Kalshi contracts (filled despite cancel error, {label}, order {order_id})"
                         append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                              "side": side, "contracts": contracts,
@@ -4218,7 +4255,7 @@ def main() -> None:
     print(f"  Balance floor:      ${MIN_ACCOUNT_BALANCE:.2f} per account (stop if either drops below)")
     print(f"  Consec loss stop:   2 losing 15m windows in a row → stop")
     print(f"  Depth cap ratio:    {POLY_DEPTH_CAP_RATIO:.0%} of Poly book (min {MIN_CONTRACTS} contracts)")
-    print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s per attempt (3-pass unwind: best_bid → best_bid-$0.02 → market)")
+    print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s per attempt (3-pass unwind: best_bid → best_bid-$0.02 → $0.01 floor)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
     print(f"  Poly fill retries:  {POLY_FILL_MAX_RETRIES} attempts x {POLY_FILL_RETRY_TIMEOUT_S:.0f}s each")
     print(f"  Per-coin trade cap: {MAX_TRADES_PER_COIN} trades/coin (incl. unwinds)")
