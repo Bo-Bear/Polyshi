@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.41"
+VERSION = "1.1.42"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -2404,7 +2404,7 @@ def print_trade_unwound(candidate, exec_result, kalshi_quote=None, poly_quote=No
     strategy = f"K_{candidate.direction_on_kalshi}+P_{candidate.direction_on_poly}"
     success = sell_price is not None
 
-    label = f"{RED}{B} TRADE UNWOUND — {candidate.coin} {R}"
+    label = f"{RED}{B} ❌  TRADE UNWOUND — {candidate.coin} {R}"
     print(f"\n{_red_box_top(label)}")
     ts_str = utc_ts()[:19].replace('T', ' ')
     print(_red_box_line(f"{B}{candidate.coin}{R}  {strategy}  |  {int(contracts)} contracts  |  {ts_str}"))
