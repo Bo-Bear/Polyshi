@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.39"
+VERSION = "1.1.40"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -1171,6 +1171,12 @@ class ExecutionResult:
     slippage_kalshi: float
     both_filled: bool       # True if both legs fully filled
     unwind_failed: bool = False  # True if unwind was needed but failed
+    unwind_attempted: bool = False
+    unwind_exchange: Optional[str] = None   # "kalshi" or "poly"
+    unwind_contracts: float = 0.0
+    unwind_buy_price: float = 0.0           # price we originally bought at
+    unwind_sell_price: Optional[float] = None  # price we sold back at (None if failed)
+    unwind_result: Optional[str] = None     # human-readable result string
 
 
 # -----------------------------
@@ -2357,6 +2363,76 @@ def print_trade_complete(candidate, exec_result, contracts: float,
     print(_green_box_bot())
 
 
+# --- Red box helpers (for unwind summaries) ---
+def _red_box_top(label: str = "", w: int = BOX_W) -> str:
+    if label:
+        visible_len = len(_ANSI_RE.sub('', label))
+        pad = w - visible_len - 2
+        return f"{RED}{BOLD}┌─ {label}{RED}{BOLD} " + "─" * max(pad, 0) + f"┐{RESET}"
+    return f"{RED}{BOLD}┌" + "─" * (w + 2) + f"┐{RESET}"
+
+def _red_box_mid(w: int = BOX_W) -> str:
+    return f"{RED}├" + "─" * (w + 2) + f"┤{RESET}"
+
+def _red_box_bot(w: int = BOX_W) -> str:
+    return f"{RED}{BOLD}└" + "─" * (w + 2) + f"┘{RESET}"
+
+def _red_box_line(text: str, w: int = BOX_W) -> str:
+    visible_len = len(_ANSI_RE.sub('', text))
+    padding = max(w - visible_len, 0)
+    return f"{RED}│{RESET} {text}" + " " * padding + f" {RED}│{RESET}"
+
+
+def print_trade_unwound(candidate, exec_result, kalshi_quote=None, poly_quote=None) -> None:
+    """Print a red box-drawn unwind summary for easy terminal scanning."""
+    R = RESET
+    B = BOLD
+
+    exchange = (exec_result.unwind_exchange or "unknown").upper()
+    contracts = exec_result.unwind_contracts
+    buy_price = exec_result.unwind_buy_price
+    sell_price = exec_result.unwind_sell_price
+    strategy = f"K_{candidate.direction_on_kalshi}+P_{candidate.direction_on_poly}"
+    success = sell_price is not None
+
+    label = f"{RED}{B} TRADE UNWOUND — {candidate.coin} {R}"
+    print(f"\n{_red_box_top(label)}")
+    ts_str = utc_ts()[:19].replace('T', ' ')
+    print(_red_box_line(f"{B}{candidate.coin}{R}  {strategy}  |  {int(contracts)} contracts  |  {ts_str}"))
+    print(_red_box_mid())
+
+    # Quotes seen
+    print(_red_box_line(f"  {'QUOTES SEEN':<40}"))
+    if kalshi_quote:
+        print(_red_box_line(f"  Kalshi:  YES=${kalshi_quote.yes_ask:.2f}   NO=${kalshi_quote.no_ask:.2f}"))
+    else:
+        print(_red_box_line(f"  Kalshi:  {candidate.direction_on_kalshi}=${candidate.kalshi_price:.2f}"))
+    if poly_quote:
+        print(_red_box_line(f"  Poly:    UP=${poly_quote.up_price:.2f}   DOWN=${poly_quote.down_price:.2f}"))
+    else:
+        print(_red_box_line(f"  Poly:    {candidate.direction_on_poly}=${candidate.poly_price:.2f}"))
+    print(_red_box_mid())
+
+    # Unwind details
+    print(_red_box_line(f"  {B}Unwound leg:{R}  {exchange}"))
+    print(_red_box_line(f"  Bought @:   ${buy_price:.2f}"))
+    if success:
+        print(_red_box_line(f"  Sold @:     ${sell_price:.2f}"))
+        loss_per = buy_price - sell_price
+        loss_total = loss_per * contracts
+        print(_red_box_line(f"  {B}Loss:{R}       {RED}${loss_total:.2f}  (${loss_per:.2f}/contract x {int(contracts)}){R}"))
+    else:
+        print(_red_box_line(f"  Sold @:     {RED}FAILED{R}"))
+        print(_red_box_line(f"  {B}Loss:{R}       {RED}UNKNOWN — NEEDS MANUAL CLOSE{R}"))
+    print(_red_box_mid())
+
+    # Edge at entry
+    print(_red_box_line(f"  Edge (raw): {candidate.net_edge * 100:.1f}% net"))
+    status_str = f"{GREEN}YES{R}" if success else f"{RED}FAILED{R}"
+    print(_red_box_line(f"  {B}Unwound:{R}   {status_str}"))
+    print(_red_box_bot())
+
+
 def append_log(path: str, row: dict) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
@@ -2478,6 +2554,40 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
                       if (r["exec_slippage_poly"] + r["exec_slippage_kalshi"]) > r["net_edge"]]
         if edge_eaten:
             print(f"  ⚠ {len(edge_eaten)}/{len(slip_rows)} trades had slippage > expected edge")
+
+    # Unwind analysis
+    unwind_rows = [r for r in log_rows if r.get("unwind_attempted")]
+    if unwind_rows:
+        successful_unwinds = [r for r in unwind_rows if r.get("unwind_success")]
+        failed_unwinds = [r for r in unwind_rows if not r.get("unwind_success")]
+        total_unwind_contracts = sum(r.get("unwind_contracts", 0) for r in unwind_rows)
+        realized_losses = [r["unwind_loss"] for r in unwind_rows if r.get("unwind_loss") is not None]
+        total_loss = sum(realized_losses) if realized_losses else 0.0
+
+        print(f"\n--- Unwind Analysis ({len(unwind_rows)} unwinds) ---")
+        print(f"  Successful:     {len(successful_unwinds)}/{len(unwind_rows)}")
+        if failed_unwinds:
+            print(f"  FAILED:         {len(failed_unwinds)} (needs manual close!)")
+        print(f"  Total contracts unwound: {total_unwind_contracts:.0f}")
+        if realized_losses:
+            avg_loss = total_loss / len(realized_losses)
+            worst_loss = max(realized_losses)
+            print(f"  Total loss:     ${total_loss:.2f}")
+            print(f"  Avg loss:       ${avg_loss:.2f}/unwind")
+            print(f"  Worst loss:     ${worst_loss:.2f}")
+        # Per-exchange breakdown
+        kalshi_unwinds = [r for r in unwind_rows if r.get("unwind_exchange") == "kalshi"]
+        poly_unwinds = [r for r in unwind_rows if r.get("unwind_exchange") == "poly"]
+        if kalshi_unwinds or poly_unwinds:
+            print(f"  By exchange:    Kalshi={len(kalshi_unwinds)}  Poly={len(poly_unwinds)}")
+        # Per-coin breakdown
+        unwind_coins = {}
+        for r in unwind_rows:
+            c = r.get("coin", "?")
+            unwind_coins[c] = unwind_coins.get(c, 0) + 1
+        if len(unwind_coins) > 1:
+            coin_str = "  ".join(f"{c}={n}" for c, n in sorted(unwind_coins.items(), key=lambda x: -x[1]))
+            print(f"  By coin:        {coin_str}")
 
     print(f"\n--- Recent Trades ---")
     for r in log_rows[-5:]:
@@ -3549,42 +3659,66 @@ def execute_hedge(candidate: HedgeCandidate,
         poly_excess = leg1.filled_contracts - leg2.filled_contracts
 
         if kalshi_excess > 0:
+            unwind_buy = leg2.actual_price or leg2.planned_price
             if EXEC_MODE == "live":
                 print(f"  [unwind] Poly under-filled — selling {kalshi_excess:.0f} Kalshi contracts to close exposure...")
-                unwind_result = _unwind_kalshi_leg(
-                    candidate.direction_on_kalshi, leg2.actual_price or leg2.planned_price,
+                unwind_msg, unwind_sell = _unwind_kalshi_leg(
+                    candidate.direction_on_kalshi, unwind_buy,
                     kalshi_excess, kalshi_quote.ticker, logfile,
                 )
-                if unwind_result:
-                    print(f"  [unwind] {unwind_result}")
-                if unwind_result and "FAILED" in unwind_result:
+                if unwind_msg:
+                    print(f"  [unwind] {unwind_msg}")
+                if unwind_msg and "FAILED" in unwind_msg:
                     result.unwind_failed = True
+                result.unwind_attempted = True
+                result.unwind_exchange = "kalshi"
+                result.unwind_contracts = kalshi_excess
+                result.unwind_buy_price = unwind_buy
+                result.unwind_sell_price = unwind_sell
+                result.unwind_result = unwind_msg
                 exec_row["unwind_attempted"] = True
                 exec_row["unwind_contracts"] = kalshi_excess
-                exec_row["unwind_result"] = unwind_result
+                exec_row["unwind_result"] = unwind_msg
             else:
                 print(f"  [unwind] Paper mode — would sell {kalshi_excess:.0f} Kalshi contracts")
+                result.unwind_attempted = True
+                result.unwind_exchange = "kalshi"
+                result.unwind_contracts = kalshi_excess
+                result.unwind_buy_price = unwind_buy
+                result.unwind_result = "paper_mode_skip"
                 exec_row["unwind_attempted"] = False
                 exec_row["unwind_contracts"] = kalshi_excess
                 exec_row["unwind_result"] = "paper_mode_skip"
 
         # Poly has more fills than Kalshi → unwind excess Poly contracts
         elif poly_excess > 0:
+            unwind_buy = leg1.actual_price or leg1.planned_price
             if EXEC_MODE == "live":
                 print(f"  [unwind] Kalshi under-filled — selling {poly_excess:.0f} Poly contracts to close exposure...")
-                unwind_result = _unwind_poly_leg(
-                    candidate.direction_on_poly, leg1.actual_price or leg1.planned_price,
+                unwind_msg, unwind_sell = _unwind_poly_leg(
+                    candidate.direction_on_poly, unwind_buy,
                     poly_excess, poly_token, logfile,
                 )
-                if unwind_result:
-                    print(f"  [unwind] {unwind_result}")
-                if unwind_result and "FAILED" in unwind_result:
+                if unwind_msg:
+                    print(f"  [unwind] {unwind_msg}")
+                if unwind_msg and "FAILED" in unwind_msg:
                     result.unwind_failed = True
+                result.unwind_attempted = True
+                result.unwind_exchange = "poly"
+                result.unwind_contracts = poly_excess
+                result.unwind_buy_price = unwind_buy
+                result.unwind_sell_price = unwind_sell
+                result.unwind_result = unwind_msg
                 exec_row["unwind_attempted"] = True
                 exec_row["unwind_contracts"] = poly_excess
-                exec_row["unwind_result"] = unwind_result
+                exec_row["unwind_result"] = unwind_msg
             else:
                 print(f"  [unwind] Paper mode — would sell {poly_excess:.0f} Poly contracts")
+                result.unwind_attempted = True
+                result.unwind_exchange = "poly"
+                result.unwind_contracts = poly_excess
+                result.unwind_buy_price = unwind_buy
+                result.unwind_result = "paper_mode_skip"
                 exec_row["unwind_attempted"] = False
                 exec_row["unwind_contracts"] = poly_excess
                 exec_row["unwind_result"] = "paper_mode_skip"
@@ -3593,12 +3727,14 @@ def execute_hedge(candidate: HedgeCandidate,
 
 
 def _unwind_poly_leg(side: str, buy_price: float, contracts: float,
-                     token_id: str, logfile: str) -> str:
+                     token_id: str, logfile: str) -> Tuple[str, Optional[float]]:
     """Sell back Poly contracts to close unhedged exposure.
 
     Uses MAX_UNHEDGED_SECONDS as the fill deadline. If the first attempt
     (buy_price - $0.02) times out, retries with aggressive pricing
     (buy_price - $0.05) to force a close.
+
+    Returns (message, sell_price_or_None).
     """
     discounts = [0.02, 0.05]  # initial discount, then aggressive retry
     last_msg = ""
@@ -3636,7 +3772,7 @@ def _unwind_poly_leg(side: str, buy_price: float, contracts: float,
                         append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "poly",
                                              "side": side, "contracts": contracts, "sell_price": sell_price,
                                              "order_id": order_id, "status": "filled", "attempt": attempt})
-                        return msg
+                        return msg, sell_price
                 except Exception:
                     pass
                 time.sleep(ORDER_POLL_INTERVAL_S)
@@ -3663,16 +3799,18 @@ def _unwind_poly_leg(side: str, buy_price: float, contracts: float,
                                  "side": side, "contracts": contracts, "status": "error",
                                  "attempt": attempt, "detail": str(e)})
 
-    return last_msg
+    return last_msg, None
 
 
 def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
-                       ticker: str, logfile: str) -> str:
+                       ticker: str, logfile: str) -> Tuple[str, Optional[float]]:
     """Sell back Kalshi contracts to close unhedged exposure.
 
     Uses MAX_UNHEDGED_SECONDS as the fill deadline. If the first attempt
     (buy_price - $0.02) times out, retries with aggressive pricing
     (buy_price - $0.05) to force a close.
+
+    Returns (message, sell_price_or_None).
     """
     discounts = [0.02, 0.05]  # initial discount, then aggressive retry
     last_msg = ""
@@ -3712,12 +3850,13 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                     poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
                     o = poll.get("order", poll)
                     if o.get("status") == "executed":
-                        msg = f"unwound {contracts:.0f} Kalshi contracts at ~${sell_price_cents/100:.2f} (order {order_id})"
+                        sell_price = sell_price_cents / 100.0
+                        msg = f"unwound {contracts:.0f} Kalshi contracts at ~${sell_price:.2f} (order {order_id})"
                         append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                              "side": side, "contracts": contracts,
-                                             "sell_price": sell_price_cents / 100.0,
+                                             "sell_price": sell_price,
                                              "order_id": order_id, "status": "filled", "attempt": attempt})
-                        return msg
+                        return msg, sell_price
                 except Exception:
                     pass
                 time.sleep(ORDER_POLL_INTERVAL_S)
@@ -3731,11 +3870,12 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                     poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
                     o = poll.get("order", poll)
                     if (o.get("status") or "").lower() in ("executed", "filled", "complete"):
+                        sell_price = sell_price_cents / 100.0
                         msg = f"unwound {contracts:.0f} Kalshi contracts (filled despite cancel error, order {order_id})"
                         append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                              "side": side, "contracts": contracts,
                                              "order_id": order_id, "status": "filled", "attempt": attempt})
-                        return msg
+                        return msg, sell_price
                 except Exception:
                     pass
 
@@ -3755,7 +3895,7 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                                  "side": side, "contracts": contracts, "status": "error",
                                  "attempt": attempt, "detail": str(e)})
 
-    return last_msg
+    return last_msg, None
 
 
 def log_skip(logfile: str, skip_counts: Dict[str, int], scan_num: int,
@@ -4650,10 +4790,27 @@ def main() -> None:
             row["exec_leg2_filled_qty"] = exec_result.leg2.filled_contracts
             row["exec_leg2_latency_ms"] = round(exec_result.leg2.latency_ms, 1)
 
-            # Print trade complete box
+            # Attach unwind details to trade row for summary aggregation
+            if exec_result.unwind_attempted:
+                row["unwind_attempted"] = True
+                row["unwind_exchange"] = exec_result.unwind_exchange
+                row["unwind_contracts"] = exec_result.unwind_contracts
+                row["unwind_buy_price"] = exec_result.unwind_buy_price
+                row["unwind_sell_price"] = exec_result.unwind_sell_price
+                row["unwind_success"] = exec_result.unwind_sell_price is not None
+                row["unwind_failed"] = exec_result.unwind_failed
+                if exec_result.unwind_sell_price is not None:
+                    row["unwind_loss"] = (exec_result.unwind_buy_price - exec_result.unwind_sell_price) * exec_result.unwind_contracts
+                else:
+                    row["unwind_loss"] = None
+
+            # Print trade complete box or unwind box
             if exec_result.both_filled:
                 print_trade_complete(best_global, exec_result, PAPER_CONTRACTS,
                                      kalshi_quote=best_global_kalshi, poly_quote=best_global_poly)
+            elif exec_result.unwind_attempted:
+                print_trade_unwound(best_global, exec_result,
+                                    kalshi_quote=best_global_kalshi, poly_quote=best_global_poly)
 
             # --- Comprehensive diagnostic snapshot ---
             # Captures full context for every trade so Claude can reconstruct
