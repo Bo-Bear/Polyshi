@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.52"
+VERSION = "1.1.53"
 VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
@@ -3582,9 +3582,10 @@ def execute_hedge(candidate: HedgeCandidate,
                   kalshi_quote: KalshiMarketQuote,
                   logfile: str,
                   poly_depth: Optional[dict] = None) -> ExecutionResult:
-    """Execute both legs of a hedge. Kalshi first (fast, deterministic), then Poly with retries.
+    """Execute both legs of a hedge. Poly first (unreliable), then Kalshi capped to Poly actual.
 
-    Execution order: Kalshi first, then Poly. If Poly fails after retries, unwind Kalshi.
+    Execution order: Poly first, then Kalshi. If Poly fails, no Kalshi order is placed —
+    eliminating the most common unwind scenario (excess Kalshi contracts from partial Poly fills).
     Result preserves leg1=Poly, leg2=Kalshi for backward compatibility with logging/P&L.
     """
     # Cap contracts to available Poly book depth to reduce partial fills
@@ -3625,64 +3626,64 @@ def execute_hedge(candidate: HedgeCandidate,
     else:
         poly_token = poly_quote.down_token_id
 
-    # --- STEP 1: Execute Kalshi FIRST (fast, deterministic fills) ---
+    # --- STEP 1: Execute POLY FIRST (unreliable fills — go first so we can gate Kalshi) ---
     t_total = time.monotonic()
-    print(f"  [exec] STEP 1: KALSHI — Placing {int(contracts)}x "
-          f"{'YES' if candidate.direction_on_kalshi == 'UP' else 'NO'} "
-          f"@ ${candidate.kalshi_price:.2f}...")
-    kalshi_fill = execute_leg("kalshi", candidate.direction_on_kalshi,
-                              candidate.kalshi_price, contracts,
-                              ticker=kalshi_quote.ticker)
-    kalshi_done = time.monotonic()
 
-    # Guard: if Kalshi failed, do NOT send Poly order
-    if kalshi_fill.status in ("error", "rejected") and kalshi_fill.filled_contracts == 0:
-        print(f"  [exec] Kalshi leg failed — skipping Poly to avoid unhedged position")
-        poly_fill = LegFill(
-            exchange="poly", side=candidate.direction_on_poly,
-            planned_price=candidate.poly_price, actual_price=None,
+    # Refresh Poly planned_price from live orderbook so the slippage cap
+    # in _execute_poly_with_retries operates against CURRENT market prices,
+    # not the 30-50s stale scan price.  Re-validate edge before proceeding.
+    fresh_poly_price = candidate.poly_price  # fallback to scan price
+    try:
+        fresh_asks = poly_clob_get_asks(str(poly_token))
+        if fresh_asks:
+            fresh_best = fresh_asks[0][0]
+            fresh_total = fresh_best + candidate.kalshi_price
+            fresh_gross_edge = 1.0 - fresh_total
+            # Quick edge check: gross edge must cover fees + slippage budget
+            if fresh_gross_edge >= MIN_NET_EDGE * 0.5:  # use half MIN as floor since fees not recalculated
+                if fresh_best != candidate.poly_price:
+                    print(f"  [exec] Poly price refreshed: ${candidate.poly_price:.3f} → ${fresh_best:.3f} "
+                          f"(Δ${fresh_best - candidate.poly_price:+.3f}, fresh edge {fresh_gross_edge*100:.1f}%)")
+                fresh_poly_price = fresh_best
+            else:
+                print(f"  [exec] Fresh Poly ask ${fresh_best:.3f} + Kalshi ${candidate.kalshi_price:.3f} = "
+                      f"${fresh_total:.3f} — edge gone ({fresh_gross_edge*100:.1f}%), using scan price")
+    except Exception as e:
+        print(f"  [exec] Poly price refresh failed ({e}), using scan price ${candidate.poly_price:.3f}")
+
+    print(f"  [exec] STEP 1: POLYMARKET — Placing {int(contracts)}x "
+          f"{candidate.direction_on_poly} @ ${fresh_poly_price:.3f} (FRESH orderbook)...")
+    poly_fill = _execute_poly_with_retries(
+        candidate.direction_on_poly, fresh_poly_price,
+        contracts, poly_token,
+    )
+    poly_done = time.monotonic()
+
+    # Guard: if Poly failed, do NOT send Kalshi order — no unwind needed
+    if poly_fill.status in ("error", "rejected") and poly_fill.filled_contracts == 0:
+        print(f"  [exec] Poly leg failed — skipping Kalshi (no unhedged exposure)")
+        kalshi_fill = LegFill(
+            exchange="kalshi", side=candidate.direction_on_kalshi,
+            planned_price=candidate.kalshi_price, actual_price=None,
             planned_contracts=contracts, filled_contracts=0.0,
             order_id=None, fill_ts=None,
-            latency_ms=0.0, status="skipped", error="skipped: kalshi leg failed",
+            latency_ms=0.0, status="skipped", error="skipped: poly leg failed",
         )
     else:
-        # --- STEP 2: Execute Poly with fresh orderbook retries ---
-        # Match Poly target to Kalshi's ACTUAL fill count, not planned.
-        # This prevents Poly from overfilling when Kalshi partially fills,
-        # which is the primary cause of Poly-heavy unhedged exposure.
-        poly_target = kalshi_fill.filled_contracts if kalshi_fill.filled_contracts > 0 else contracts
-        if poly_target != contracts:
-            print(f"  [exec] Adjusting Poly target: {int(contracts)} → {int(poly_target)} "
-                  f"(matching Kalshi actual fill)")
+        # --- STEP 2: Execute Kalshi, capped to Poly's ACTUAL fill count ---
+        # This prevents Kalshi from overfilling when Poly partially fills.
+        # Since Kalshi is fast and deterministic, it will reliably fill the exact amount.
+        kalshi_target = poly_fill.filled_contracts if poly_fill.filled_contracts > 0 else contracts
+        if kalshi_target != contracts:
+            print(f"  [exec] Adjusting Kalshi target: {int(contracts)} → {int(kalshi_target)} "
+                  f"(matching Poly actual fill)")
 
-        # Refresh Poly planned_price from live orderbook so the slippage cap
-        # in _execute_poly_with_retries operates against CURRENT market prices,
-        # not the 30-50s stale scan price.  Re-validate edge before proceeding.
-        fresh_poly_price = candidate.poly_price  # fallback to scan price
-        try:
-            fresh_asks = poly_clob_get_asks(str(poly_token))
-            if fresh_asks:
-                fresh_best = fresh_asks[0][0]
-                kalshi_actual = kalshi_fill.actual_price if kalshi_fill.actual_price is not None else candidate.kalshi_price
-                fresh_total = fresh_best + kalshi_actual
-                fresh_gross_edge = 1.0 - fresh_total
-                # Quick edge check: gross edge must cover fees + slippage budget
-                if fresh_gross_edge >= MIN_NET_EDGE * 0.5:  # use half MIN as floor since fees not recalculated
-                    if fresh_best != candidate.poly_price:
-                        print(f"  [exec] Poly price refreshed: ${candidate.poly_price:.3f} → ${fresh_best:.3f} "
-                              f"(Δ${fresh_best - candidate.poly_price:+.3f}, fresh edge {fresh_gross_edge*100:.1f}%)")
-                    fresh_poly_price = fresh_best
-                else:
-                    print(f"  [exec] Fresh Poly ask ${fresh_best:.3f} + Kalshi ${kalshi_actual:.3f} = "
-                          f"${fresh_total:.3f} — edge gone ({fresh_gross_edge*100:.1f}%), using scan price")
-        except Exception as e:
-            print(f"  [exec] Poly price refresh failed ({e}), using scan price ${candidate.poly_price:.3f}")
-
-        print(f"  [exec] STEP 2: POLYMARKET — Attempting fill with FRESH orderbook...")
-        poly_fill = _execute_poly_with_retries(
-            candidate.direction_on_poly, fresh_poly_price,
-            poly_target, poly_token,
-        )
+        print(f"  [exec] STEP 2: KALSHI — Placing {int(kalshi_target)}x "
+              f"{'YES' if candidate.direction_on_kalshi == 'UP' else 'NO'} "
+              f"@ ${candidate.kalshi_price:.2f}...")
+        kalshi_fill = execute_leg("kalshi", candidate.direction_on_kalshi,
+                                  candidate.kalshi_price, kalshi_target,
+                                  ticker=kalshi_quote.ticker)
 
     total_ms = (time.monotonic() - t_total) * 1000
 
@@ -3744,8 +3745,8 @@ def execute_hedge(candidate: HedgeCandidate,
     if leg2.actual_price is not None and leg2.actual_price != leg2.planned_price:
         s2 += f" (slip {slip_kalshi:+.4f})"
 
-    kalshi_ms = (kalshi_done - t_total) * 1000
-    print(f"  [exec] {s2} | {s1} | kalshi={kalshi_ms:.0f}ms | total={total_ms:.0f}ms")
+    poly_ms = (poly_done - t_total) * 1000
+    print(f"  [exec] {s1} | {s2} | poly={poly_ms:.0f}ms | total={total_ms:.0f}ms")
 
     if leg1.status == "partial" or leg2.status == "partial":
         print(f"  [exec] PARTIAL FILL: Poly {leg1.filled_contracts}/{leg1.planned_contracts} "
@@ -3759,8 +3760,10 @@ def execute_hedge(candidate: HedgeCandidate,
             print(f"  [exec]   Kalshi error: {leg2.error}")
 
         # --- Automatic unwind ---
-        # Kalshi has more fills than Poly → unwind excess Kalshi contracts
-        # Use filled_contracts instead of status to handle "partial" fills
+        # With Poly-first execution, the common case (Poly partial fill) is handled
+        # by capping Kalshi to Poly actual.  Unwinds should be rare, but handle both
+        # directions: Kalshi excess (Kalshi partial fill overflow) or Poly excess
+        # (Kalshi under-filled relative to Poly).
         kalshi_excess = leg2.filled_contracts - leg1.filled_contracts
         poly_excess = leg1.filled_contracts - leg2.filled_contracts
 
@@ -3796,7 +3799,7 @@ def execute_hedge(candidate: HedgeCandidate,
                 exec_row["unwind_contracts"] = kalshi_excess
                 exec_row["unwind_result"] = "paper_mode_skip"
 
-        # Poly has more fills than Kalshi → unwind excess Poly contracts
+        # Poly has more fills than Kalshi → unwind excess Poly contracts (rare with Poly-first)
         elif poly_excess > 0:
             unwind_buy = leg1.actual_price or leg1.planned_price
             if EXEC_MODE == "live":
