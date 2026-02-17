@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.49"
+VERSION = "1.1.50"
 VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
@@ -199,6 +199,11 @@ POLY_FILL_RETRY_TIMEOUT_S = float(os.getenv("POLY_FILL_RETRY_TIMEOUT_S", "3"))  
 MAX_TRADES_PER_COIN = int(os.getenv("MAX_TRADES_PER_COIN", "5"))
 MAX_TRADES_PER_COIN_PER_WINDOW = int(os.getenv("MAX_TRADES_PER_COIN_PER_WINDOW", "6"))
 MAX_CONSECUTIVE_UNWINDS = int(os.getenv("MAX_CONSECUTIVE_UNWINDS", "5"))
+
+# Maximum per-coin contract imbalance (Kalshi fills - Poly fills) allowed within a window.
+# If a coin's cumulative imbalance exceeds this, skip new trades for that coin until
+# the window resets.  Prevents compounding directional exposure from repeated partial fills.
+MAX_WINDOW_IMBALANCE = float(os.getenv("MAX_WINDOW_IMBALANCE", "5.0"))  # 5 contracts
 
 # Guaranteed trades + avg-edge gating: first N trades per coin per window are guaranteed,
 # then subsequent trades require the coin's rolling avg edge >= this threshold.
@@ -4388,6 +4393,8 @@ def main() -> None:
     coin_window_trade_counts: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}  # resets each 15m window
     coin_consecutive_unwinds: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}
     coin_window_edges: Dict[str, List[float]] = {c: [] for c in AVAILABLE_COINS}  # per-window edge history
+    coin_window_kalshi_fills: Dict[str, float] = {c: 0.0 for c in AVAILABLE_COINS}  # cumulative Kalshi fills this window
+    coin_window_poly_fills: Dict[str, float] = {c: 0.0 for c in AVAILABLE_COINS}   # cumulative Poly fills this window
     coin_stopped: Dict[str, str] = {}  # coin -> reason it was stopped
 
     # Store poly quotes per-coin per-scan for book depth lookups on winning trade
@@ -4532,6 +4539,8 @@ def main() -> None:
             for c in coin_window_trade_counts:
                 coin_window_trade_counts[c] = 0
                 coin_window_edges[c] = []
+                coin_window_kalshi_fills[c] = 0.0
+                coin_window_poly_fills[c] = 0.0
 
             if stop_reason:
                 print(f"\n*** {stop_reason} — stopping session ***")
@@ -4686,6 +4695,18 @@ def main() -> None:
                     coin_stopped[coin] = f"{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds"
                     skip = ("coin_max_unwinds",
                             f"{coin} hit {MAX_CONSECUTIVE_UNWINDS} consecutive unwinds — STOPPING")
+
+            # Window-level imbalance guard: skip if cumulative fills are too lopsided
+            if skip is None:
+                k_fills = coin_window_kalshi_fills.get(coin, 0.0)
+                p_fills = coin_window_poly_fills.get(coin, 0.0)
+                window_imbalance = abs(k_fills - p_fills)
+                if window_imbalance > MAX_WINDOW_IMBALANCE:
+                    heavy_side = "Kalshi" if k_fills > p_fills else "Poly"
+                    skip = ("imbalance_cap",
+                            f"{coin} window imbalance {window_imbalance:.1f} contracts "
+                            f"({heavy_side} heavy: K={k_fills:.1f} P={p_fills:.1f}) "
+                            f"> {MAX_WINDOW_IMBALANCE:.0f} max")
 
             if skip is None and (kalshi is None or poly is None):
                 skip = ("no_kalshi_market" if kalshi is None else "no_poly_market",
@@ -5124,6 +5145,24 @@ def main() -> None:
             coin_trade_counts[traded_coin] = coin_trade_counts.get(traded_coin, 0) + 1
             coin_window_trade_counts[traded_coin] = coin_window_trade_counts.get(traded_coin, 0) + 1
             coin_window_edges[traded_coin].append(best_global.net_edge)
+
+            # Track per-exchange fills for window imbalance detection
+            # leg1=Poly, leg2=Kalshi (see line mapping after execute_hedge_pair)
+            coin_window_kalshi_fills[traded_coin] = (
+                coin_window_kalshi_fills.get(traded_coin, 0.0) + exec_result.leg2.filled_contracts
+            )
+            coin_window_poly_fills[traded_coin] = (
+                coin_window_poly_fills.get(traded_coin, 0.0) + exec_result.leg1.filled_contracts
+            )
+            k_tot = coin_window_kalshi_fills[traded_coin]
+            p_tot = coin_window_poly_fills[traded_coin]
+            imb = abs(k_tot - p_tot)
+            if imb > 0:
+                heavy = "K" if k_tot > p_tot else "P"
+                print(f"  [imbalance] {traded_coin} window fills: K={k_tot:.1f} P={p_tot:.1f} "
+                      f"(Δ{imb:.1f} {heavy}-heavy"
+                      f"{', NEAR CAP' if imb > MAX_WINDOW_IMBALANCE * 0.8 else ''})")
+
             was_unwound = not exec_result.both_filled
             if was_unwound:
                 total_unwinds += 1
