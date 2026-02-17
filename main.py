@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.42"
+VERSION = "1.1.43"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -3815,31 +3815,74 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                        ticker: str, logfile: str) -> Tuple[str, Optional[float]]:
     """Sell back Kalshi contracts to close unhedged exposure.
 
-    Uses MAX_UNHEDGED_SECONDS as the fill deadline. If the first attempt
-    (buy_price - $0.02) times out, retries with aggressive pricing
-    (buy_price - $0.05) to force a close.
+    3-pass strategy:
+      Attempt 1: Limit sell at the best bid from the live order book
+      Attempt 2: Limit sell at best_bid - $0.02 (aggressive)
+      Attempt 3: Market order (guaranteed fill, worst pricing)
 
+    Falls back to fixed discounts off buy_price if the order book fetch fails.
     Returns (message, sell_price_or_None).
     """
-    discounts = [0.02, 0.05]  # initial discount, then aggressive retry
-    last_msg = ""
-    for attempt, discount in enumerate(discounts, 1):
-        try:
-            kalshi_side = "yes" if side == "UP" else "no"
-            sell_price_cents = max(1, int(round((buy_price - discount) * 100)))
+    kalshi_side = "yes" if side == "UP" else "no"
 
+    # --- Fetch order book to determine best bid for our side ---
+    best_bid: Optional[float] = None
+    try:
+        ob = kalshi_get_orderbook(ticker)
+        orderbook = ob.get("orderbook", ob)
+        if kalshi_side == "yes":
+            bids = orderbook.get("yes") or orderbook.get("yes_bids") or []
+        else:
+            bids = orderbook.get("no") or orderbook.get("no_bids") or []
+        # Find highest bid price
+        for lvl in bids:
+            try:
+                p = float(lvl.get("price")) / 100.0
+                sz = float(lvl.get("count") or lvl.get("quantity") or lvl.get("size") or lvl.get("contracts") or 0)
+                if sz > 0 and (best_bid is None or p > best_bid):
+                    best_bid = p
+            except Exception:
+                continue
+        if best_bid is not None:
+            print(f"  [unwind] Kalshi {kalshi_side} best bid: ${best_bid:.2f} (buy was ${buy_price:.2f})")
+    except Exception as e:
+        print(f"  [unwind] orderbook fetch failed ({e}), using fixed discounts")
+
+    # --- Build attempt plan: (label, order_type, price_cents_or_None) ---
+    attempts: list = []
+    if best_bid is not None:
+        # Attempt 1: at best bid
+        attempts.append(("best_bid", "limit", max(1, int(round(best_bid * 100)))))
+        # Attempt 2: best bid - $0.02
+        attempts.append(("best_bid-0.02", "limit", max(1, int(round((best_bid - 0.02) * 100)))))
+    else:
+        # Fallback: fixed discounts off buy price
+        attempts.append(("buy-0.02", "limit", max(1, int(round((buy_price - 0.02) * 100)))))
+        attempts.append(("buy-0.05", "limit", max(1, int(round((buy_price - 0.05) * 100)))))
+    # Attempt 3 (final): market order — guaranteed fill
+    attempts.append(("market", "market", None))
+
+    last_msg = ""
+    for attempt, (label, order_type, price_cents) in enumerate(attempts, 1):
+        try:
             body: dict = {
                 "ticker": ticker,
                 "action": "sell",
                 "side": kalshi_side,
-                "type": "limit",
+                "type": order_type,
                 "count": int(contracts),
                 "client_order_id": f"polyshi-unwind-{uuid.uuid4().hex[:12]}",
             }
-            if kalshi_side == "yes":
-                body["yes_price"] = sell_price_cents
+            if order_type == "limit":
+                if kalshi_side == "yes":
+                    body["yes_price"] = price_cents
+                else:
+                    body["no_price"] = price_cents
+                price_display = f"${price_cents / 100.0:.2f}"
             else:
-                body["no_price"] = sell_price_cents
+                price_display = "MARKET"
+
+            print(f"  [unwind] attempt {attempt}/{len(attempts)}: {order_type} sell @ {price_display} ({label})")
 
             resp = _kalshi_auth_post("/portfolio/orders", body)
             order = resp.get("order", resp)
@@ -3849,7 +3892,7 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                 last_msg = f"unwind rejected: no order_id in response"
                 append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                      "side": side, "contracts": contracts, "status": "rejected",
-                                     "attempt": attempt, "detail": last_msg})
+                                     "attempt": attempt, "label": label, "detail": last_msg})
                 continue
 
             # Poll for fill — use MAX_UNHEDGED_SECONDS as deadline
@@ -3859,15 +3902,24 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                     poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
                     o = poll.get("order", poll)
                     if o.get("status") == "executed":
-                        sell_price = sell_price_cents / 100.0
-                        msg = f"unwound {contracts:.0f} Kalshi contracts at ~${sell_price:.2f} (order {order_id})"
+                        # For market orders, get actual fill price from the response
+                        if order_type == "market":
+                            avg_price_cents = o.get("avg_price") or o.get("average_price")
+                            if avg_price_cents is not None:
+                                sell_price = float(avg_price_cents) / 100.0
+                            else:
+                                sell_price = 0.01  # placeholder if API doesn't return fill price
+                        else:
+                            sell_price = price_cents / 100.0
+                        msg = f"unwound {contracts:.0f} Kalshi contracts at ~${sell_price:.2f} ({label}, order {order_id})"
                         append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                              "side": side, "contracts": contracts,
                                              "sell_price": sell_price,
-                                             "order_id": order_id, "status": "filled", "attempt": attempt})
+                                             "order_id": order_id, "status": "filled",
+                                             "attempt": attempt, "label": label})
                         return msg, sell_price
-                except Exception:
-                    pass
+                except Exception as poll_err:
+                    print(f"  [unwind] poll error (attempt {attempt}): {poll_err}")
                 time.sleep(ORDER_POLL_INTERVAL_S)
 
             # Timeout — cancel via DELETE (Kalshi v2 API)
@@ -3878,31 +3930,38 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
                 try:
                     poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
                     o = poll.get("order", poll)
-                    if (o.get("status") or "").lower() in ("executed", "filled", "complete"):
-                        sell_price = sell_price_cents / 100.0
-                        msg = f"unwound {contracts:.0f} Kalshi contracts (filled despite cancel error, order {order_id})"
+                    status_str = (o.get("status") or "").lower()
+                    if status_str in ("executed", "filled", "complete"):
+                        if order_type == "market":
+                            avg_price_cents = o.get("avg_price") or o.get("average_price")
+                            sell_price = float(avg_price_cents) / 100.0 if avg_price_cents else 0.01
+                        else:
+                            sell_price = price_cents / 100.0
+                        msg = f"unwound {contracts:.0f} Kalshi contracts (filled despite cancel error, {label}, order {order_id})"
                         append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                              "side": side, "contracts": contracts,
-                                             "order_id": order_id, "status": "filled", "attempt": attempt})
+                                             "order_id": order_id, "status": "filled",
+                                             "attempt": attempt, "label": label})
                         return msg, sell_price
                 except Exception:
                     pass
 
-            if attempt < len(discounts):
-                print(f"  [unwind] Kalshi unwind attempt {attempt} timed out at -${discount:.2f} — "
-                      f"retrying with -${discounts[attempt]:.2f} aggressive pricing")
-                last_msg = f"unwind attempt {attempt} timed out"
+            if attempt < len(attempts):
+                next_label = attempts[attempt][0]
+                print(f"  [unwind] Kalshi unwind attempt {attempt} timed out ({label}) — "
+                      f"retrying with {next_label}")
+                last_msg = f"unwind attempt {attempt} timed out ({label})"
             else:
                 last_msg = f"unwind FAILED after {attempt} attempts (order {order_id}) — NEEDS MANUAL CLOSE"
                 append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                      "side": side, "contracts": contracts, "order_id": order_id,
-                                     "status": "timeout_final", "attempt": attempt})
+                                     "status": "timeout_final", "attempt": attempt, "label": label})
 
         except Exception as e:
-            last_msg = f"unwind error (attempt {attempt}): {e}"
+            last_msg = f"unwind error (attempt {attempt}, {label}): {e}"
             append_log(logfile, {"log_type": "unwind", "ts": utc_ts(), "exchange": "kalshi",
                                  "side": side, "contracts": contracts, "status": "error",
-                                 "attempt": attempt, "detail": str(e)})
+                                 "attempt": attempt, "label": label, "detail": str(e)})
 
     return last_msg, None
 
@@ -4135,7 +4194,7 @@ def main() -> None:
     print(f"  Balance floor:      ${MIN_ACCOUNT_BALANCE:.2f} per account (stop if either drops below)")
     print(f"  Consec loss stop:   2 losing 15m windows in a row → stop")
     print(f"  Depth cap ratio:    {POLY_DEPTH_CAP_RATIO:.0%} of Poly book (min {MIN_CONTRACTS} contracts)")
-    print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s per attempt (2-pass unwind: -$0.02 then -$0.05)")
+    print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s per attempt (3-pass unwind: best_bid → best_bid-$0.02 → market)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
     print(f"  Poly fill retries:  {POLY_FILL_MAX_RETRIES} attempts x {POLY_FILL_RETRY_TIMEOUT_S:.0f}s each")
     print(f"  Per-coin trade cap: {MAX_TRADES_PER_COIN} trades/coin (incl. unwinds)")
