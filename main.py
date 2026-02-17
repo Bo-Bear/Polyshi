@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.40"
+VERSION = "1.1.41"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -2169,11 +2169,14 @@ def _box_line(text: str, w: int = BOX_W) -> str:
 
 def print_scan_header(scan_i: int, extra: str = "") -> None:
     label = f" Scan #{scan_i} "
-    pad = max(40 - len(label) - 2, 3)
-    line = f"\n{'═' * 2}{label}{'═' * pad}"
+    total_w = 71
+    side = (total_w - len(label)) // 2
+    line = f"\n{'═' * side}{label}{'═' * (total_w - side - len(label))}"
     if extra:
-        line += f"  {extra}"
-    print(line)
+        print(line)
+        print(f"{'':>12}{extra}")
+    else:
+        print(line)
 
 
 def fmt_money(x: float) -> str:
@@ -2246,12 +2249,12 @@ def display_skip_table(skipped_rows: list) -> None:
     cw_coin = 6
     cw_kalshi = 13
     cw_poly = 13
-    cw_edge = 10
+    cw_edge = 22
     # Header
     hdr = (f"  {'COIN':<{cw_coin}} {'KALSHI':<{cw_kalshi}} "
            f"{'POLY':<{cw_poly}} {'EDGE':<{cw_edge}} SKIP REASON")
     print(hdr)
-    print(f"  {'─' * (len(hdr) - 2)}")
+    print(f"  {'─' * 69}")
     for r in skipped_rows:
         # Kalshi prices
         if r["kalshi"] is None:
@@ -2265,10 +2268,16 @@ def display_skip_table(skipped_rows: list) -> None:
             p_str = f"{r['poly'].up_price:.2f}/{r['poly'].down_price:.2f}"
         # Edge
         e_str = r.get("edge", "—") or "—"
-        # Truncate long skip reasons
+        # Short skip reason (just the category, no duplicated numbers)
         reason = r["reason"]
-        if len(reason) > 50:
-            reason = reason[:47] + "..."
+        # Strip everything after the first parenthetical or numeric detail
+        for sep in (" (", " +", " -"):
+            idx = reason.find(sep, 4)
+            if idx > 0:
+                reason = reason[:idx]
+                break
+        if len(reason) > 30:
+            reason = reason[:27] + "..."
         print(f"  {r['coin']:<{cw_coin}} {k_str:<{cw_kalshi}} "
               f"{p_str:<{cw_poly}} {e_str:<{cw_edge}} {reason}")
 
@@ -5052,7 +5061,9 @@ def main() -> None:
 
         else:
             consecutive_skips += 1
-            print(f"  ↳ {consecutive_skips} consecutive skips · {successful_trades} successful trades")
+            footer_msg = f" ({consecutive_skips} consecutive skips · {successful_trades} successful trades)"
+            footer_side = (71 - len(footer_msg)) // 2
+            print(f"{'═' * footer_side}{footer_msg}{'═' * (71 - footer_side - len(footer_msg))}")
             # Periodic skip-reason breakdown every 20 scans to help diagnose filter bottlenecks
             if consecutive_skips > 0 and consecutive_skips % 20 == 0 and skip_counts:
                 total_skips = sum(skip_counts.values())
