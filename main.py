@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.44"
+VERSION = "1.1.45"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -4317,6 +4317,7 @@ def main() -> None:
 
     logged: List[dict] = []
     successful_trades = 0
+    total_unwinds = 0
     skip_counts: Dict[str, int] = {}  # reason -> count
     scan_i = 0
     consecutive_skips = 0
@@ -5064,6 +5065,7 @@ def main() -> None:
             coin_window_edges[traded_coin].append(best_global.net_edge)
             was_unwound = not exec_result.both_filled
             if was_unwound:
+                total_unwinds += 1
                 coin_consecutive_unwinds[traded_coin] = coin_consecutive_unwinds.get(traded_coin, 0) + 1
                 print(f"  [unwind-track] UNWIND COUNT {traded_coin}: "
                       f"{coin_consecutive_unwinds[traded_coin]}/{MAX_CONSECUTIVE_UNWINDS} consecutive unwinds")
@@ -5121,7 +5123,7 @@ def main() -> None:
 
         else:
             consecutive_skips += 1
-            footer_msg = f" ({consecutive_skips} consecutive skips · {successful_trades} successful trades)"
+            footer_msg = f" ({consecutive_skips} consecutive skips · {successful_trades} successful trades · {total_unwinds} unwinds)"
             footer_side = (71 - len(footer_msg)) // 2
             print(f"{'═' * footer_side}{footer_msg}{'═' * (71 - footer_side - len(footer_msg))}")
             # Periodic skip-reason breakdown every 20 scans to help diagnose filter bottlenecks
