@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.50"
+VERSION = "1.1.51"
 VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
@@ -194,6 +194,11 @@ POLY_MAX_SLIPPAGE = float(os.getenv("POLY_MAX_SLIPPAGE", "0.02"))  # 2 cents
 # Poly orderbook-aware retry config (used when Kalshi fills first)
 POLY_FILL_MAX_RETRIES = int(os.getenv("POLY_FILL_MAX_RETRIES", "5"))
 POLY_FILL_RETRY_TIMEOUT_S = float(os.getenv("POLY_FILL_RETRY_TIMEOUT_S", "3"))  # per-attempt timeout
+
+# Background unwind retry sweep — retries failed unwinds between scans
+UNWIND_RETRY_MAX_ATTEMPTS = int(os.getenv("UNWIND_RETRY_MAX_ATTEMPTS", "10"))
+UNWIND_RETRY_INTERVAL_S = float(os.getenv("UNWIND_RETRY_INTERVAL_S", "30"))  # min seconds between retries
+UNWIND_RETRY_POLL_S = float(os.getenv("UNWIND_RETRY_POLL_S", "8"))  # per-attempt fill timeout
 
 # Per-coin limits
 MAX_TRADES_PER_COIN = int(os.getenv("MAX_TRADES_PER_COIN", "5"))
@@ -1182,6 +1187,20 @@ class ExecutionResult:
     unwind_buy_price: float = 0.0           # price we originally bought at
     unwind_sell_price: Optional[float] = None  # price we sold back at (None if failed)
     unwind_result: Optional[str] = None     # human-readable result string
+
+
+@dataclass
+class PendingUnwind:
+    """Tracks a failed unwind position for background retry."""
+    exchange: str           # "kalshi" or "poly"
+    coin: str               # e.g. "BTC"
+    side: str               # "UP" or "DOWN" (direction we hold)
+    contracts: float        # number of excess contracts to sell
+    buy_price: float        # price we originally bought at
+    ticker_or_token: str    # Kalshi ticker or Poly token_id
+    attempts: int = 0       # retries so far
+    last_attempt_ts: float = 0.0  # monotonic timestamp of last retry
+    created_ts: float = 0.0       # monotonic timestamp when first added
 
 
 # -----------------------------
@@ -4032,6 +4051,237 @@ def _unwind_kalshi_leg(side: str, buy_price: float, contracts: float,
     return last_msg, None
 
 
+def _retry_pending_unwinds(pending: List[PendingUnwind], logfile: str,
+                           coin_stopped: Dict[str, str]) -> List[PendingUnwind]:
+    """Background sweep: retry failed unwinds with fresh orderbook pricing.
+
+    Called once per scan iteration. Respects UNWIND_RETRY_INTERVAL_S between
+    attempts and gives up after UNWIND_RETRY_MAX_ATTEMPTS. Successfully closed
+    positions are removed from the list and the coin is un-stopped.
+
+    Returns the updated pending list (expired entries removed).
+    """
+    if not pending or EXEC_MODE != "live":
+        return pending
+
+    now = time.monotonic()
+    remaining: List[PendingUnwind] = []
+
+    for pu in pending:
+        # Respect cooldown between retries
+        if now - pu.last_attempt_ts < UNWIND_RETRY_INTERVAL_S:
+            remaining.append(pu)
+            continue
+
+        # Give up after max attempts
+        if pu.attempts >= UNWIND_RETRY_MAX_ATTEMPTS:
+            print(f"  [sweep] GIVING UP on {pu.coin} {pu.exchange} unwind after "
+                  f"{pu.attempts} attempts ({pu.contracts:.0f} contracts) — truly needs manual close")
+            append_log(logfile, {"log_type": "unwind_sweep", "ts": utc_ts(),
+                                 "exchange": pu.exchange, "coin": pu.coin,
+                                 "contracts": pu.contracts, "status": "abandoned",
+                                 "attempts": pu.attempts})
+            # Don't re-add; it's dead
+            continue
+
+        pu.attempts += 1
+        pu.last_attempt_ts = now
+        sell_price: Optional[float] = None
+
+        if pu.exchange == "kalshi":
+            sell_price = _retry_kalshi_unwind(pu, logfile)
+        elif pu.exchange == "poly":
+            sell_price = _retry_poly_unwind(pu, logfile)
+
+        if sell_price is not None:
+            loss = (pu.buy_price - sell_price) * pu.contracts
+            print(f"  [sweep] {GREEN}CLOSED{RESET} {pu.coin} {pu.exchange} unwind: "
+                  f"{pu.contracts:.0f} contracts @ ${sell_price:.2f} "
+                  f"(loss ${loss:.2f}, attempt {pu.attempts})")
+            # Un-stop the coin if the only reason it was stopped was this unwind
+            if coin_stopped.get(pu.coin, "").startswith("unwind FAILED"):
+                del coin_stopped[pu.coin]
+                print(f"  [sweep] {pu.coin} un-stopped — can trade again")
+            # Don't re-add; it's resolved
+        else:
+            print(f"  [sweep] {pu.coin} {pu.exchange} unwind retry {pu.attempts}/{UNWIND_RETRY_MAX_ATTEMPTS} "
+                  f"— no fill, will retry in {UNWIND_RETRY_INTERVAL_S:.0f}s")
+            remaining.append(pu)
+
+    return remaining
+
+
+def _retry_kalshi_unwind(pu: PendingUnwind, logfile: str) -> Optional[float]:
+    """Single retry attempt to sell excess Kalshi contracts using live orderbook."""
+    kalshi_side = "yes" if pu.side == "UP" else "no"
+
+    # Fetch fresh orderbook for best bid
+    best_bid: Optional[float] = None
+    try:
+        ob = kalshi_get_orderbook(pu.ticker_or_token)
+        orderbook = ob.get("orderbook", ob)
+        bids = orderbook.get(kalshi_side) or orderbook.get(f"{kalshi_side}_bids") or []
+        for lvl in bids:
+            try:
+                p = float(lvl.get("price")) / 100.0
+                sz = float(lvl.get("count") or lvl.get("quantity") or lvl.get("size") or lvl.get("contracts") or 0)
+                if sz > 0 and (best_bid is None or p > best_bid):
+                    best_bid = p
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"  [sweep] Kalshi orderbook fetch failed: {e}")
+
+    # Price: use best_bid if available, otherwise aggressive floor
+    if best_bid is not None and best_bid >= 0.01:
+        # Undercut by $0.01 to maximize fill chance
+        price_cents = max(1, int(round((best_bid - 0.01) * 100)))
+        label = f"bid${best_bid:.2f}-0.01"
+    else:
+        price_cents = 1  # floor
+        label = "floor_$0.01"
+
+    try:
+        body: dict = {
+            "ticker": pu.ticker_or_token,
+            "action": "sell",
+            "side": kalshi_side,
+            "type": "limit",
+            "count": int(pu.contracts),
+            "client_order_id": f"polyshi-sweep-{uuid.uuid4().hex[:12]}",
+        }
+        if kalshi_side == "yes":
+            body["yes_price"] = price_cents
+        else:
+            body["no_price"] = price_cents
+
+        print(f"  [sweep] Kalshi {pu.coin} sell {pu.contracts:.0f}x @ ${price_cents/100:.2f} ({label})")
+
+        resp = _kalshi_auth_post("/portfolio/orders", body)
+        order = resp.get("order", resp)
+        order_id = order.get("order_id") or order.get("id")
+
+        if not order_id:
+            err = resp.get("error") or resp.get("message") or str(resp)[:200]
+            print(f"  [sweep] Kalshi order rejected: {err}")
+            append_log(logfile, {"log_type": "unwind_sweep", "ts": utc_ts(),
+                                 "exchange": "kalshi", "coin": pu.coin,
+                                 "contracts": pu.contracts, "status": "rejected",
+                                 "attempt": pu.attempts, "detail": err})
+            return None
+
+        # Poll for fill
+        deadline = time.monotonic() + UNWIND_RETRY_POLL_S
+        while time.monotonic() < deadline:
+            try:
+                poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
+                o = poll.get("order", poll)
+                if o.get("status") == "executed":
+                    sell_price = price_cents / 100.0
+                    append_log(logfile, {"log_type": "unwind_sweep", "ts": utc_ts(),
+                                         "exchange": "kalshi", "coin": pu.coin,
+                                         "contracts": pu.contracts,
+                                         "sell_price": sell_price, "order_id": order_id,
+                                         "status": "filled", "attempt": pu.attempts, "label": label})
+                    return sell_price
+            except Exception:
+                pass
+            time.sleep(ORDER_POLL_INTERVAL_S)
+
+        # Timeout — cancel
+        try:
+            _kalshi_auth_delete(f"/portfolio/orders/{order_id}")
+        except Exception:
+            # Check if it actually filled despite cancel error
+            try:
+                poll = _kalshi_auth_get(f"/portfolio/orders/{order_id}")
+                o = poll.get("order", poll)
+                if (o.get("status") or "").lower() in ("executed", "filled", "complete"):
+                    sell_price = price_cents / 100.0
+                    append_log(logfile, {"log_type": "unwind_sweep", "ts": utc_ts(),
+                                         "exchange": "kalshi", "coin": pu.coin,
+                                         "contracts": pu.contracts,
+                                         "sell_price": sell_price, "order_id": order_id,
+                                         "status": "filled", "attempt": pu.attempts})
+                    return sell_price
+            except Exception:
+                pass
+
+        append_log(logfile, {"log_type": "unwind_sweep", "ts": utc_ts(),
+                             "exchange": "kalshi", "coin": pu.coin,
+                             "contracts": pu.contracts, "order_id": order_id,
+                             "status": "timeout", "attempt": pu.attempts, "label": label})
+        return None
+
+    except Exception as e:
+        print(f"  [sweep] Kalshi unwind error: {e}")
+        append_log(logfile, {"log_type": "unwind_sweep", "ts": utc_ts(),
+                             "exchange": "kalshi", "coin": pu.coin,
+                             "contracts": pu.contracts, "status": "error",
+                             "attempt": pu.attempts, "detail": str(e)})
+        return None
+
+
+def _retry_poly_unwind(pu: PendingUnwind, logfile: str) -> Optional[float]:
+    """Single retry attempt to sell excess Poly contracts at aggressive pricing."""
+    try:
+        client = _get_poly_clob_client()
+        # Aggressive discount: starts at -$0.03 and widens with attempts
+        discount = min(0.03 + pu.attempts * 0.01, 0.15)
+        sell_price = max(0.01, round(pu.buy_price - discount, 2))
+        label = f"buy${pu.buy_price:.2f}-{discount:.2f}"
+
+        print(f"  [sweep] Poly {pu.coin} sell {pu.contracts:.0f}x @ ${sell_price:.2f} ({label})")
+
+        order_args = OrderArgs(
+            token_id=pu.ticker_or_token,
+            price=sell_price,
+            size=pu.contracts,
+            side=SELL,
+        )
+        signed_order = client.create_order(order_args)
+        resp = client.post_order(signed_order, OrderType.GTC)
+
+        if not resp.get("success", False):
+            err = resp.get("errorMsg") or resp.get("error") or resp
+            print(f"  [sweep] Poly order rejected: {err}")
+            return None
+
+        order_id = resp.get("orderID") or resp.get("id")
+
+        # Poll for fill
+        deadline = time.monotonic() + UNWIND_RETRY_POLL_S
+        while time.monotonic() < deadline:
+            try:
+                o = client.get_order(order_id)
+                if (o.get("status") or "").lower() in ("matched", "filled"):
+                    append_log(logfile, {"log_type": "unwind_sweep", "ts": utc_ts(),
+                                         "exchange": "poly", "coin": pu.coin,
+                                         "contracts": pu.contracts,
+                                         "sell_price": sell_price, "order_id": order_id,
+                                         "status": "filled", "attempt": pu.attempts})
+                    return sell_price
+            except Exception:
+                pass
+            time.sleep(ORDER_POLL_INTERVAL_S)
+
+        # Timeout — cancel
+        try:
+            client.cancel(order_id)
+        except Exception:
+            pass
+
+        append_log(logfile, {"log_type": "unwind_sweep", "ts": utc_ts(),
+                             "exchange": "poly", "coin": pu.coin,
+                             "contracts": pu.contracts, "order_id": order_id,
+                             "status": "timeout", "attempt": pu.attempts, "label": label})
+        return None
+
+    except Exception as e:
+        print(f"  [sweep] Poly unwind error: {e}")
+        return None
+
+
 def log_skip(logfile: str, skip_counts: Dict[str, int], scan_num: int,
              coin: str, reason: str, poly: Optional[PolyMarketQuote] = None,
              kalshi: Optional[KalshiMarketQuote] = None,
@@ -4266,6 +4516,7 @@ def main() -> None:
     print(f"  Per-coin trade cap: {MAX_TRADES_PER_COIN} trades/coin (incl. unwinds)")
     print(f"  Per-window cap:     {MAX_TRADES_PER_COIN_PER_WINDOW} trades/coin/window (resets each 15m)")
     print(f"  Max consec unwinds: {MAX_CONSECUTIVE_UNWINDS}/coin before stopping")
+    print(f"  Unwind retry sweep: up to {UNWIND_RETRY_MAX_ATTEMPTS} retries, every {UNWIND_RETRY_INTERVAL_S:.0f}s, {UNWIND_RETRY_POLL_S:.0f}s fill timeout")
     print(f"  Startup delay:      {WINDOW_STARTUP_DELAY_S:.0f}s per window (orderbook settling)")
     print(f"  Window align tol:   {WINDOW_ALIGN_TOLERANCE_SECONDS}s (cross-exchange close time)")
     print(f"  Slippage budget:    ${EXECUTION_SLIPPAGE_BUDGET:.2f}/contract (subtracted from net edge)")
@@ -4396,6 +4647,7 @@ def main() -> None:
     coin_window_kalshi_fills: Dict[str, float] = {c: 0.0 for c in AVAILABLE_COINS}  # cumulative Kalshi fills this window
     coin_window_poly_fills: Dict[str, float] = {c: 0.0 for c in AVAILABLE_COINS}   # cumulative Poly fills this window
     coin_stopped: Dict[str, str] = {}  # coin -> reason it was stopped
+    pending_unwinds: List[PendingUnwind] = []  # failed unwinds awaiting background retry
 
     # Store poly quotes per-coin per-scan for book depth lookups on winning trade
     _scan_poly_quotes: Dict[str, Optional[PolyMarketQuote]] = {}
@@ -5173,7 +5425,29 @@ def main() -> None:
                 if exec_result.unwind_failed:
                     coin_stopped[traded_coin] = "unwind FAILED — needs manual close"
                     print(f"  [unwind-track] *** {traded_coin} STOPPED: unwind failed, "
-                          f"manual close required to avoid compounding exposure ***")
+                          f"queued for background retry sweep ***")
+                    # Queue for background retry sweep
+                    if exec_result.unwind_exchange == "kalshi":
+                        pu_side = best_global.direction_on_kalshi
+                        pu_ticker = best_global_kalshi.ticker
+                    else:
+                        pu_side = best_global.direction_on_poly
+                        pu_ticker = (best_global_poly.up_token_id
+                                     if best_global.direction_on_poly == "UP"
+                                     else best_global_poly.down_token_id)
+                    pending_unwinds.append(PendingUnwind(
+                        exchange=exec_result.unwind_exchange or "kalshi",
+                        coin=traded_coin,
+                        side=pu_side,
+                        contracts=exec_result.unwind_contracts,
+                        buy_price=exec_result.unwind_buy_price,
+                        ticker_or_token=pu_ticker,
+                        attempts=0,
+                        last_attempt_ts=time.monotonic(),  # first retry after cooldown
+                        created_ts=time.monotonic(),
+                    ))
+                    print(f"  [sweep] Queued {traded_coin} {exec_result.unwind_exchange} "
+                          f"{exec_result.unwind_contracts:.0f} contracts for background retry")
             else:
                 coin_consecutive_unwinds[traded_coin] = 0  # reset on success
 
@@ -5238,8 +5512,22 @@ def main() -> None:
                 print(f"\n⚠ Circuit breaker: {MAX_CONSECUTIVE_SKIPS} consecutive scans with no viable trades. Stopping.")
                 break
 
+        # Background sweep: retry any failed unwinds between scans
+        if pending_unwinds:
+            pending_unwinds = _retry_pending_unwinds(pending_unwinds, logfile, coin_stopped)
+
         if time.monotonic() < session_deadline:
             time.sleep(SCAN_SLEEP_SECONDS)
+
+    # Final sweep: one last attempt to close any remaining failed unwinds
+    if pending_unwinds:
+        print(f"\n  [sweep] Session ending — final retry for {len(pending_unwinds)} pending unwind(s)...")
+        pending_unwinds = _retry_pending_unwinds(pending_unwinds, logfile, coin_stopped)
+        if pending_unwinds:
+            print(f"  [sweep] *** {len(pending_unwinds)} unwind(s) still open — MANUAL CLOSE REQUIRED ***")
+            for pu in pending_unwinds:
+                print(f"    {pu.coin} {pu.exchange} {pu.side} {pu.contracts:.0f}x "
+                      f"(bought @ ${pu.buy_price:.2f}, {pu.attempts} retries)")
 
     # Log + print why the session ended
     end_reason = stop_reason or ("session_duration_reached" if time.monotonic() >= session_deadline else "unknown")
