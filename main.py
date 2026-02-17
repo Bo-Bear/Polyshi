@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.51"
+VERSION = "1.1.52"
 VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
@@ -56,8 +56,8 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 # -----------------------------
 # Execution safeguards
 # -----------------------------
-# Minimum net edge to accept a trade (must exceed expected execution slippage of ~2-3c)
-MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.04"))  # 4%
+# Minimum net edge to accept a trade (must exceed execution slippage + unwind risk buffer)
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.06"))  # 6% — raised from 4% to absorb partial-fill unwind losses
 
 # Maximum net edge — skip outliers that are likely stale/bad data, not real opportunities
 MAX_NET_EDGE = float(os.getenv("MAX_NET_EDGE", "0.15"))  # 15%
