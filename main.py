@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.47"
-VERSION_DATE = "2026-02-16 23:15 UTC"
+VERSION = "1.1.49"
+VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
 from dotenv import load_dotenv
