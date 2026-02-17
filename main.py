@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.45"
+VERSION = "1.1.46"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -198,7 +198,7 @@ POLY_FILL_RETRY_TIMEOUT_S = float(os.getenv("POLY_FILL_RETRY_TIMEOUT_S", "3"))  
 # Per-coin limits
 MAX_TRADES_PER_COIN = int(os.getenv("MAX_TRADES_PER_COIN", "5"))
 MAX_TRADES_PER_COIN_PER_WINDOW = int(os.getenv("MAX_TRADES_PER_COIN_PER_WINDOW", "6"))
-MAX_CONSECUTIVE_UNWINDS = int(os.getenv("MAX_CONSECUTIVE_UNWINDS", "3"))
+MAX_CONSECUTIVE_UNWINDS = int(os.getenv("MAX_CONSECUTIVE_UNWINDS", "5"))
 
 # Guaranteed trades + avg-edge gating: first N trades per coin per window are guaranteed,
 # then subsequent trades require the coin's rolling avg edge >= this threshold.
@@ -3581,9 +3581,33 @@ def execute_hedge(candidate: HedgeCandidate,
         if poly_target != contracts:
             print(f"  [exec] Adjusting Poly target: {int(contracts)} → {int(poly_target)} "
                   f"(matching Kalshi actual fill)")
+
+        # Refresh Poly planned_price from live orderbook so the slippage cap
+        # in _execute_poly_with_retries operates against CURRENT market prices,
+        # not the 30-50s stale scan price.  Re-validate edge before proceeding.
+        fresh_poly_price = candidate.poly_price  # fallback to scan price
+        try:
+            fresh_asks = poly_clob_get_asks(str(poly_token))
+            if fresh_asks:
+                fresh_best = fresh_asks[0][0]
+                kalshi_actual = kalshi_fill.actual_price if kalshi_fill.actual_price is not None else candidate.kalshi_price
+                fresh_total = fresh_best + kalshi_actual
+                fresh_gross_edge = 1.0 - fresh_total
+                # Quick edge check: gross edge must cover fees + slippage budget
+                if fresh_gross_edge >= MIN_NET_EDGE * 0.5:  # use half MIN as floor since fees not recalculated
+                    if fresh_best != candidate.poly_price:
+                        print(f"  [exec] Poly price refreshed: ${candidate.poly_price:.3f} → ${fresh_best:.3f} "
+                              f"(Δ${fresh_best - candidate.poly_price:+.3f}, fresh edge {fresh_gross_edge*100:.1f}%)")
+                    fresh_poly_price = fresh_best
+                else:
+                    print(f"  [exec] Fresh Poly ask ${fresh_best:.3f} + Kalshi ${kalshi_actual:.3f} = "
+                          f"${fresh_total:.3f} — edge gone ({fresh_gross_edge*100:.1f}%), using scan price")
+        except Exception as e:
+            print(f"  [exec] Poly price refresh failed ({e}), using scan price ${candidate.poly_price:.3f}")
+
         print(f"  [exec] STEP 2: POLYMARKET — Attempting fill with FRESH orderbook...")
         poly_fill = _execute_poly_with_retries(
-            candidate.direction_on_poly, candidate.poly_price,
+            candidate.direction_on_poly, fresh_poly_price,
             poly_target, poly_token,
         )
 
