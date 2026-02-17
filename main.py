@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.52"
+VERSION = "1.1.53"
 VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
@@ -1449,6 +1449,133 @@ def redeem_all_old_positions() -> int:
     return redeemed
 
 
+def review_session_history() -> None:
+    """Parse past JSONL log files and display trade summaries for selected sessions."""
+    import glob as glob_mod
+
+    log_dir = os.getenv("LOG_DIR", "logs")
+    log_files = sorted(glob_mod.glob(os.path.join(log_dir, "arb_logs_*.jsonl")))
+
+    if not log_files:
+        print("\n  No session logs found in logs/")
+        return
+
+    # Parse each log file to build a summary index
+    sessions: List[dict] = []
+    for lf in log_files:
+        trades = 0
+        skips = 0
+        coins_seen: set = set()
+        first_ts = None
+        last_ts = None
+        exec_mode = "paper"
+        try:
+            with open(lf, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = row.get("ts")
+                    if ts and not first_ts:
+                        first_ts = ts
+                    if ts:
+                        last_ts = ts
+                    lt = row.get("log_type", "")
+                    if lt == "trade":
+                        trades += 1
+                        c = row.get("coin")
+                        if c:
+                            coins_seen.add(c)
+                        if row.get("exec_mode"):
+                            exec_mode = row["exec_mode"]
+                    elif lt == "skip":
+                        skips += 1
+        except Exception:
+            continue
+
+        sessions.append({
+            "path": lf,
+            "filename": os.path.basename(lf),
+            "trades": trades,
+            "skips": skips,
+            "coins": sorted(coins_seen),
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "exec_mode": exec_mode,
+        })
+
+    print(f"\nSESSION HISTORY")
+    print("=" * 60)
+    print(f"Found {len(sessions)} session(s) in {log_dir}/\n")
+
+    for i, s in enumerate(sessions):
+        coins_str = ",".join(s["coins"]) if s["coins"] else "none"
+        mode_tag = "LIVE" if s["exec_mode"] == "live" else "PAPER"
+        ts_str = s["first_ts"][:19] if s["first_ts"] else "?"
+        print(f"  {i+1}) {ts_str}  [{mode_tag}]  {s['trades']} trades, {s['skips']} skips  ({coins_str})")
+
+    print(f"\n  0) Exit")
+
+    while True:
+        choice = input(f"\nSelect session [1-{len(sessions)}]: ").strip()
+        if choice == "0" or choice == "":
+            return
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(sessions):
+                break
+        except ValueError:
+            pass
+        print(f"Invalid selection. Enter 1-{len(sessions)} or 0 to exit.")
+
+    selected = sessions[idx]
+    print(f"\n  Loading {selected['filename']}...")
+
+    # Parse the full log file
+    trade_rows: List[dict] = []
+    skip_counts: Dict[str, int] = {}
+    balance_checks: List[dict] = []
+
+    with open(selected["path"], "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            lt = row.get("log_type", "")
+            if lt == "trade":
+                trade_rows.append(row)
+            elif lt == "skip":
+                reason = row.get("reason", "unknown")
+                skip_counts[reason] = skip_counts.get(reason, 0) + 1
+            elif lt == "balance_check":
+                balance_checks.append(row)
+
+    # Determine start/end balances from balance_check entries
+    start_balances: Optional[Dict[str, float]] = None
+    if balance_checks:
+        first_bal = balance_checks[0]
+        start_balances = {}
+        if "kalshi" in first_bal:
+            start_balances["kalshi"] = first_bal["kalshi"]
+        if "poly" in first_bal:
+            start_balances["poly"] = first_bal["poly"]
+
+    # Determine coins from the trade rows
+    coins_in_session = sorted(set(r.get("coin", "") for r in trade_rows)) if trade_rows else AVAILABLE_COINS
+
+    # Reuse the existing summarize() function
+    summarize(trade_rows, coins_in_session, skip_counts=skip_counts,
+              start_balances=start_balances, logfile=None)
+
+
 def prompt_execution_mode() -> str:
     """Prompt user to choose between live trading and paper testing."""
     print("\nSELECT EXECUTION MODE")
@@ -1456,6 +1583,7 @@ def prompt_execution_mode() -> str:
     print("1) Paper Testing   — simulated trades, no real money")
     print("2) Live Trading    — real orders on Kalshi & Polymarket")
     print("3) Redeem Positions — collect unredeemed Polymarket winnings")
+    print("4) Session History  — review past session trade summaries")
 
     while True:
         choice = input("\nSelect mode [1]: ").strip()
@@ -1465,7 +1593,9 @@ def prompt_execution_mode() -> str:
             return "live"
         if choice == "3":
             return "redeem"
-        print("Invalid selection. Enter 1, 2, or 3.")
+        if choice == "4":
+            return "history"
+        print("Invalid selection. Enter 1, 2, 3, or 4.")
 
 
 def prompt_coin_selection(available: List[str]) -> List[str]:
@@ -4475,6 +4605,11 @@ def main() -> None:
                 print("\n  No unredeemed positions found.")
         except Exception as e:
             print(f"\n  Redemption failed: {e}")
+        return
+
+    # Session history mode: review past session summaries and exit
+    if EXEC_MODE == "history":
+        review_session_history()
         return
 
     market_type = prompt_market_type()
