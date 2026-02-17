@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.43"
+VERSION = "1.1.44"
 VERSION_DATE = "2026-02-16 23:15 UTC"
 
 import requests
@@ -49,7 +49,7 @@ load_dotenv()
 
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "3"))
 MAX_TEST_TRADES = int(os.getenv("MAX_TEST_TRADES", "5"))
-WINDOW_ALIGN_TOLERANCE_SECONDS = int(os.getenv("WINDOW_ALIGN_TOLERANCE_SECONDS", "10"))
+WINDOW_ALIGN_TOLERANCE_SECONDS = int(os.getenv("WINDOW_ALIGN_TOLERANCE_SECONDS", "30"))
 MIN_LEG_NOTIONAL = float(os.getenv("MIN_LEG_NOTIONAL", "25"))  # $ minimum liquidity per leg
 USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 
@@ -57,7 +57,7 @@ USE_VWAP_DEPTH = os.getenv("USE_VWAP_DEPTH", "true").lower() == "true"
 # Execution safeguards
 # -----------------------------
 # Minimum net edge to accept a trade (must exceed expected execution slippage of ~2-3c)
-MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.06"))  # 6%
+MIN_NET_EDGE = float(os.getenv("MIN_NET_EDGE", "0.04"))  # 4%
 
 # Maximum net edge — skip outliers that are likely stale/bad data, not real opportunities
 MAX_NET_EDGE = float(os.getenv("MAX_NET_EDGE", "0.15"))  # 15%
@@ -129,7 +129,7 @@ AMORTIZE_EXTRAS_OVER_TRADES = int(os.getenv("AMORTIZE_EXTRAS_OVER_TRADES", "1"))
 # Expected execution slippage budget per contract (subtracted from net edge).
 # Accounts for LIVE_PRICE_BUFFER on both legs + adverse market movement.
 # This makes net_edge reflect post-slippage expected profit.
-EXECUTION_SLIPPAGE_BUDGET = float(os.getenv("EXECUTION_SLIPPAGE_BUDGET", "0.02"))  # 2 cents/contract
+EXECUTION_SLIPPAGE_BUDGET = float(os.getenv("EXECUTION_SLIPPAGE_BUDGET", "0.01"))  # 1 cent/contract (reduced: orderbook-based unwind pricing)
 
 
 # Kalshi public base + endpoints are documented here:
@@ -205,10 +205,10 @@ MAX_CONSECUTIVE_UNWINDS = int(os.getenv("MAX_CONSECUTIVE_UNWINDS", "3"))
 GUARANTEED_TRADES_PER_COIN = int(os.getenv("GUARANTEED_TRADES_PER_COIN", "3"))
 AVG_EDGE_GATE = float(os.getenv("AVG_EDGE_GATE", "0.045"))  # 4.5%
 
-# 2-phase window startup: block trading for the first N seconds of each 15m window
-# to let orderbooks settle. Phase 1 (0-90s) = Kalshi connections + strikes load,
-# Phase 2 (90-120s) = Poly scrape stabilizes, trading opens at 120s.
-WINDOW_STARTUP_DELAY_S = float(os.getenv("WINDOW_STARTUP_DELAY_S", "120"))  # 120 seconds
+# Window startup: block trading for the first N seconds of each 15m window
+# to let orderbooks settle. Kalshi connections + strikes load in ~60s,
+# Poly scrape stabilizes shortly after. 75s balances reliability vs. opportunity.
+WINDOW_STARTUP_DELAY_S = float(os.getenv("WINDOW_STARTUP_DELAY_S", "75"))  # 75 seconds
 
 
 # -----------------------------
@@ -4200,6 +4200,9 @@ def main() -> None:
     print(f"  Per-coin trade cap: {MAX_TRADES_PER_COIN} trades/coin (incl. unwinds)")
     print(f"  Per-window cap:     {MAX_TRADES_PER_COIN_PER_WINDOW} trades/coin/window (resets each 15m)")
     print(f"  Max consec unwinds: {MAX_CONSECUTIVE_UNWINDS}/coin before stopping")
+    print(f"  Startup delay:      {WINDOW_STARTUP_DELAY_S:.0f}s per window (orderbook settling)")
+    print(f"  Window align tol:   {WINDOW_ALIGN_TOLERANCE_SECONDS}s (cross-exchange close time)")
+    print(f"  Slippage budget:    ${EXECUTION_SLIPPAGE_BUDGET:.2f}/contract (subtracted from net edge)")
 
     # Start Polymarket CLOB WebSocket for real-time orderbook data
     global _poly_ws
@@ -4462,7 +4465,7 @@ def main() -> None:
 
             window_trades = []
             current_window_close_ts = None  # Will be set from next market data
-            window_open_utc = None  # Reset so 2-phase startup triggers for new window
+            window_open_utc = None  # Reset so startup delay triggers for new window
             # Reset per-window trade limits and edge history so coins can trade again
             for c in coin_window_trade_counts:
                 coin_window_trade_counts[c] = 0
@@ -4574,17 +4577,15 @@ def main() -> None:
             print(f"  [startup] New window detected (closes {current_window_close_ts.strftime('%H:%M:%S')} UTC) "
                   f"— {WINDOW_STARTUP_DELAY_S:.0f}s startup delay begins")
 
-        # 2-phase startup: skip trading until WINDOW_STARTUP_DELAY_S has elapsed since window open
+        # Startup delay: skip trading until WINDOW_STARTUP_DELAY_S has elapsed since window open
         window_startup_active = False
         if window_open_utc is not None:
             window_age_s = (datetime.now(timezone.utc) - window_open_utc).total_seconds()
             if window_age_s < WINDOW_STARTUP_DELAY_S:
                 window_startup_active = True
                 remaining_startup = WINDOW_STARTUP_DELAY_S - window_age_s
-                phase = 1 if window_age_s < 90 else 2
-                print(f"  ⏳ Phase {phase} — {remaining_startup:.0f}s until trading opens "
-                      f"(Kalshi {'loading' if phase == 1 else 'ready'}, "
-                      f"Poly {'waiting' if phase == 1 else 'settling'})")
+                print(f"  [startup] {remaining_startup:.0f}s until trading opens "
+                      f"(orderbooks settling)")
 
         best_global: Optional[HedgeCandidate] = None
         best_global_poly: Optional[PolyMarketQuote] = None
@@ -4604,7 +4605,7 @@ def main() -> None:
             # --- Determine skip reason (if any) before printing ---
             skip = None  # (reason_key, display_text) or None
 
-            # 2-phase startup delay: block all trading until window has settled
+            # Startup delay: block all trading until window has settled
             if window_startup_active:
                 skip = ("window_startup", "Window startup delay — orderbooks settling")
 
