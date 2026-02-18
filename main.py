@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.63"
+VERSION = "1.1.64"
 VERSION_DATE = "2026-02-18 UTC"
 
 import requests
@@ -105,13 +105,13 @@ MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
 # Fees (paper-trade model)
 # -----------------------------
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
-PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "7"))
+PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "1"))
 
 # Cap trade size to this fraction of Poly book depth (0.5 = use at most 50% of visible depth)
 POLY_DEPTH_CAP_RATIO = float(os.getenv("POLY_DEPTH_CAP_RATIO", "0.5"))
 
 # Minimum contracts after depth-capping (skip trade if book can't support this many)
-MIN_CONTRACTS = int(os.getenv("MIN_CONTRACTS", "3"))
+MIN_CONTRACTS = int(os.getenv("MIN_CONTRACTS", "1"))
 
 # Pre-scan minimum: skip coin entirely if Poly book has fewer than this many contracts.
 # Should be >= PAPER_CONTRACTS / POLY_DEPTH_CAP_RATIO so the depth-cap won't reduce size.
