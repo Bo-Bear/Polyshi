@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.56"
+VERSION = "1.1.57"
 VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
@@ -2965,11 +2965,6 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
             print(f"Hedge mismatches:  {len(mismatches)} (BOTH legs lost — strike mismatch risk!)")
         else:
             print(f"Hedge mismatches:  0 (all hedges consistent)")
-        # Show Poly outcome verification source breakdown
-        poly_api_count = sum(1 for r in verified if r.get("poly_outcome_source") == "poly_api")
-        kalshi_derived_count = sum(1 for r in verified if r.get("poly_outcome_source") == "kalshi_derived")
-        if poly_api_count > 0 or kalshi_derived_count > 0:
-            print(f"Poly verification: {poly_api_count} via Poly API, {kalshi_derived_count} Kalshi-derived")
         # Show hedged vs unhedged P&L breakdown
         hedged_pnl_total = sum(r.get("hedged_pnl", 0) for r in verified)
         unhedged_pnl_total = sum(r.get("unhedged_pnl", 0) for r in verified)
@@ -3061,6 +3056,26 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
         if len(unwind_coins) > 1:
             coin_str = "  ".join(f"{c}={n}" for c, n in sorted(unwind_coins.items(), key=lambda x: -x[1]))
             print(f"  By coin:        {coin_str}")
+
+    # Poly API outcome verification reliability
+    poly_api_rows = [r for r in log_rows if r.get("poly_outcome_source") is not None]
+    if poly_api_rows:
+        api_ok = [r for r in poly_api_rows if r["poly_outcome_source"] == "poly_api"]
+        api_fail = [r for r in poly_api_rows if r["poly_outcome_source"] == "kalshi_derived"]
+        total_attempts = sum(r.get("poly_api_attempts", 0) for r in poly_api_rows)
+        print(f"\n--- Poly API Outcome Verification ---")
+        print(f"  Success:   {len(api_ok)}/{len(poly_api_rows)} trades verified via Poly API")
+        if api_fail:
+            print(f"  Fallback:  {len(api_fail)} trades used Kalshi-derived outcome (BLIND TO STRIKE MISMATCH)")
+            # Group failure reasons
+            fail_reasons: Dict[str, int] = {}
+            for r in api_fail:
+                reason = r.get("poly_api_fail_reason") or "unknown"
+                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+            for reason, count in sorted(fail_reasons.items(), key=lambda x: -x[1]):
+                print(f"    {reason}: {count}")
+        avg_attempts = total_attempts / len(poly_api_rows) if poly_api_rows else 0
+        print(f"  Avg attempts/trade: {avg_attempts:.1f}  (total API calls: {total_attempts})")
 
     print(f"\n--- Recent Trades ---")
     for r in log_rows[-5:]:
@@ -4826,39 +4841,54 @@ def _poll_kalshi_result(ticker: str, max_retries: int = 6, poll_interval: float 
     return None
 
 
-def _poll_poly_result(token_id: str, max_retries: int = 4, poll_interval: float = 10.0) -> Optional[str]:
+def _poll_poly_result(token_id: str, max_retries: int = 4, poll_interval: float = 10.0) -> Tuple[Optional[str], int, Optional[str]]:
     """Poll Polymarket Gamma API for market resolution.
-    Returns 'up', 'down', or None if still unsettled.
-    Uses outcomePrices from the Gamma API — the winning outcome has price ~1.0."""
+    Returns (result, attempts, fail_reason):
+      result: 'up', 'down', or None if still unsettled
+      attempts: number of API calls made
+      fail_reason: None on success, or description of why it failed"""
+    last_fail = None
     for attempt in range(max_retries):
         try:
             url = f"{POLY_GAMMA_BASE}/markets"
             r = _get_session().get(url, params={"clob_token_ids": str(token_id)}, timeout=10)
             r.raise_for_status()
             markets = r.json()
-            if markets and len(markets) > 0:
-                m = markets[0]
-                outcomes_raw = m.get("outcomes")
-                prices_raw = m.get("outcomePrices")
-                if outcomes_raw and prices_raw:
-                    try:
-                        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-                        if isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) == len(prices):
-                            for outcome, price_str in zip(outcomes, prices):
-                                try:
-                                    price = float(price_str)
-                                    if price >= 0.95:  # winner (resolved markets show ~1.0)
-                                        return outcome.strip().lower()  # "up" or "down"
-                                except (ValueError, TypeError):
-                                    continue
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-        except Exception:
-            pass
+            if not markets or len(markets) == 0:
+                last_fail = "empty_response"
+                if attempt < max_retries - 1:
+                    time.sleep(poll_interval)
+                continue
+            m = markets[0]
+            outcomes_raw = m.get("outcomes")
+            prices_raw = m.get("outcomePrices")
+            if not outcomes_raw or not prices_raw:
+                last_fail = "no_outcome_prices"
+                if attempt < max_retries - 1:
+                    time.sleep(poll_interval)
+                continue
+            try:
+                outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                if isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) == len(prices):
+                    for outcome, price_str in zip(outcomes, prices):
+                        try:
+                            price = float(price_str)
+                            if price >= 0.95:  # winner (resolved markets show ~1.0)
+                                return outcome.strip().lower(), attempt + 1, None
+                        except (ValueError, TypeError):
+                            continue
+                    # No outcome had price >= 0.95 — market not yet resolved
+                    last_fail = "not_resolved"
+                else:
+                    last_fail = "malformed_outcomes"
+            except (json.JSONDecodeError, TypeError):
+                last_fail = "json_parse_error"
+        except Exception as e:
+            last_fail = f"http_error:{type(e).__name__}"
         if attempt < max_retries - 1:
             time.sleep(poll_interval)
-    return None
+    return None, max_retries, last_fail
 
 
 def verify_trade_outcomes(trades: List[dict], logfile: str) -> List[dict]:
@@ -4908,11 +4938,17 @@ def verify_trade_outcomes(trades: List[dict], logfile: str) -> List[dict]:
         poly_token = row.get("poly_up_token_id") or ""
         if poly_token and poly_token not in poly_results:
             print(f"  Polling Poly {poly_token[:16]}...", end=" ", flush=True)
-            pr = _poll_poly_result(poly_token)
-            poly_results[poly_token] = pr
-            print(f"result={pr or 'UNKNOWN'}")
-        poly_api_result = poly_results.get(poly_token)
+            pr, pr_attempts, pr_fail = _poll_poly_result(poly_token)
+            poly_results[poly_token] = (pr, pr_attempts, pr_fail)
+            if pr:
+                print(f"result={pr} (attempt {pr_attempts})")
+            else:
+                print(f"result=UNKNOWN after {pr_attempts} attempts ({pr_fail})")
+        poly_cached = poly_results.get(poly_token, (None, 0, None))
+        poly_api_result, poly_attempts, poly_fail_reason = poly_cached
         row["poly_result"] = poly_api_result
+        row["poly_api_attempts"] = poly_attempts
+        row["poly_api_fail_reason"] = poly_fail_reason
 
         if kalshi_result in ("yes", "no"):
             # Kalshi side outcome
