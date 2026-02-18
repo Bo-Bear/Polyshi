@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.55"
+VERSION = "1.1.56"
 VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
@@ -92,8 +92,11 @@ MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.15"))  # 15 perc
 
 # Maximum allowed divergence between Kalshi strike and spot price (as a fraction).
 # Kalshi uses a fixed $ strike; Polymarket uses "up/down from window start."
-# When strike ≠ spot, both hedge legs can lose. 0.15% = ~$100 on BTC.
-MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.003"))
+# When strike != spot, a "dead zone" exists where BOTH sides lose: price lands
+# between the Poly reference and Kalshi strike. With BTC 15-min volatility ~0.3%,
+# a 0.3% dead zone (~$285) means ~33% of trades have both sides lose.
+# At 0.1% (~$95 on BTC), both-lose probability drops to ~12%.
+MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.001"))
 
 # Minimum account balance — stop session if either exchange drops below this ($)
 MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
@@ -2962,9 +2965,19 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
             print(f"Hedge mismatches:  {len(mismatches)} (BOTH legs lost — strike mismatch risk!)")
         else:
             print(f"Hedge mismatches:  0 (all hedges consistent)")
+        # Show Poly outcome verification source breakdown
+        poly_api_count = sum(1 for r in verified if r.get("poly_outcome_source") == "poly_api")
+        kalshi_derived_count = sum(1 for r in verified if r.get("poly_outcome_source") == "kalshi_derived")
+        if poly_api_count > 0 or kalshi_derived_count > 0:
+            print(f"Poly verification: {poly_api_count} via Poly API, {kalshi_derived_count} Kalshi-derived")
+        # Show hedged vs unhedged P&L breakdown
+        hedged_pnl_total = sum(r.get("hedged_pnl", 0) for r in verified)
+        unhedged_pnl_total = sum(r.get("unhedged_pnl", 0) for r in verified)
+        if any(r.get("hedged_pnl") is not None for r in verified):
+            print(f"P&L breakdown:     hedged=${hedged_pnl_total:+.4f}  unhedged=${unhedged_pnl_total:+.4f}")
 
         pnl_label = "P&L" if EXEC_MODE == "live" else "Paper P&L"
-        print(f"\n--- {pnl_label} ({int(PAPER_CONTRACTS)} contracts/trade) ---")
+        print(f"\n--- {pnl_label} ---")
         print(f"Total P&L:         ${total_pnl:+.4f}")
         print(f"Avg P&L/trade:     ${total_pnl / len(verified):+.4f}")
         if wins:
@@ -3171,16 +3184,21 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
             append_log(logfile, session_diag)
 
     # Position & Potential Payout
-    # Each hedged contract pair pays $1.00 on resolution (one side wins).
-    total_contracts = 0
+    # Each hedged contract pair pays $1.00 on resolution IF both exchanges agree
+    # on the outcome. If strike/reference prices differ, both sides can lose ($0).
+    total_hedged = 0.0
+    total_unhedged_poly = 0.0
+    total_unhedged_kalshi = 0.0
     total_cost_basis = 0.0
+    total_unhedged_cost = 0.0
     total_fees_all = 0.0
 
     if exec_rows:
         # Live mode: use actual fill data
         for r in exec_rows:
-            k_filled = p_filled = 0
+            k_filled = p_filled = 0.0
             k_cost = p_cost = 0.0
+            k_px = p_px = 0.0
             for leg in (1, 2):
                 filled = r.get(f"exec_leg{leg}_filled_qty", 0) or 0
                 actual_px = r.get(f"exec_leg{leg}_actual_price") or 0
@@ -3188,37 +3206,58 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
                 if "kalshi" in exch:
                     k_filled = filled
                     k_cost = filled * actual_px
+                    k_px = actual_px
                 elif "poly" in exch:
                     p_filled = filled
                     p_cost = filled * actual_px
+                    p_px = actual_px
             hedged = min(k_filled, p_filled)
-            total_contracts += hedged
-            total_cost_basis += k_cost + p_cost
+            p_excess = max(0.0, p_filled - k_filled)
+            k_excess = max(0.0, k_filled - p_filled)
+            total_hedged += hedged
+            total_unhedged_poly += p_excess
+            total_unhedged_kalshi += k_excess
+            total_cost_basis += hedged * (k_px + p_px) if hedged > 0 else 0
+            total_unhedged_cost += p_excess * p_px + k_excess * k_px
             total_fees_all += r.get("poly_fee", 0) + r.get("kalshi_fee", 0) + r.get("extras", 0)
     else:
         # Paper mode: each trade = PAPER_CONTRACTS hedged pairs
         contracts = int(PAPER_CONTRACTS)
         for r in log_rows:
-            total_contracts += contracts
+            total_hedged += contracts
             total_cost_basis += r["total_cost"] * contracts
             total_fees_all += r.get("poly_fee", 0) + r.get("kalshi_fee", 0) + r.get("extras", 0)
 
-    if total_contracts > 0:
-        payout = total_contracts * 1.0  # $1 per winning contract
-        expected_profit = payout - total_cost_basis - total_fees_all
-        max_loss = total_cost_basis + total_fees_all  # if somehow both sides lose (mismatch)
-        avg_cost_per_pair = (total_cost_basis + total_fees_all) / total_contracts
+    if total_hedged > 0 or total_unhedged_poly > 0 or total_unhedged_kalshi > 0:
+        total_invested = total_cost_basis + total_unhedged_cost + total_fees_all
+        best_payout = total_hedged * 1.0  # $1 per hedged pair (assumes no strike mismatch)
+        expected_profit = best_payout - total_cost_basis - total_fees_all
+        max_loss = total_invested  # if all hedges have strike mismatch (both sides lose)
+        avg_cost_per_pair = (total_cost_basis + total_fees_all) / total_hedged if total_hedged > 0 else 0
 
         print(f"\n--- Position & Potential Payout ---")
-        print(f"  Hedged contract pairs:   {total_contracts}")
-        print(f"  Total cost basis:        ${total_cost_basis:.2f}")
+        print(f"  Hedged contract pairs:   {total_hedged:.1f}")
+        if total_unhedged_poly > 0 or total_unhedged_kalshi > 0:
+            print(f"  Unhedged contracts:      {total_unhedged_poly:.1f} Poly + {total_unhedged_kalshi:.1f} Kalshi"
+                  f"  (${total_unhedged_cost:.2f} at risk)")
+        print(f"  Total cost basis:        ${total_cost_basis:.2f}  (hedged pairs)")
         print(f"  Total fees:              ${total_fees_all:.2f}")
-        print(f"  Total invested:          ${total_cost_basis + total_fees_all:.2f}")
-        print(f"  Avg cost per pair:       ${avg_cost_per_pair:.4f}")
-        print(f"  Payout on resolution:    ${payout:.2f}  ($1.00 x {total_contracts})")
-        print(f"  Expected profit:         ${expected_profit:+.2f}  ({expected_profit / (total_cost_basis + total_fees_all) * 100:+.1f}% ROI)")
+        print(f"  Total invested:          ${total_invested:.2f}")
+        if total_hedged > 0:
+            print(f"  Avg cost per pair:       ${avg_cost_per_pair:.4f}")
+            print(f"  Best-case payout:        ${best_payout:.2f}  ($1.00 x {total_hedged:.1f} hedged pairs)")
+            print(f"  Best-case profit:        ${expected_profit:+.2f}  ({expected_profit / total_invested * 100:+.1f}% ROI)")
         if max_loss > 0:
-            print(f"  Max loss (hedge fail):   ${-max_loss:.2f}")
+            print(f"  Max loss (all fail):     ${-max_loss:.2f}")
+        # Warn about strike mismatch risk
+        strike_risk_trades = [r for r in exec_rows
+                              if r.get("strike_spot_divergence_pct") is not None
+                              and r["strike_spot_divergence_pct"] > 0]
+        if strike_risk_trades:
+            avg_div = sum(r["strike_spot_divergence_pct"] for r in strike_risk_trades) / len(strike_risk_trades)
+            max_div = max(r["strike_spot_divergence_pct"] for r in strike_risk_trades)
+            print(f"  Strike divergence:       avg={avg_div:.3f}%  max={max_div:.3f}%  ({len(strike_risk_trades)} trades)")
+            print(f"  WARNING: strike!=spot creates a dead zone where BOTH sides lose")
 
     # Balance summary (live mode)
     if start_balances:
@@ -4787,8 +4826,43 @@ def _poll_kalshi_result(ticker: str, max_retries: int = 6, poll_interval: float 
     return None
 
 
+def _poll_poly_result(token_id: str, max_retries: int = 4, poll_interval: float = 10.0) -> Optional[str]:
+    """Poll Polymarket Gamma API for market resolution.
+    Returns 'up', 'down', or None if still unsettled.
+    Uses outcomePrices from the Gamma API — the winning outcome has price ~1.0."""
+    for attempt in range(max_retries):
+        try:
+            url = f"{POLY_GAMMA_BASE}/markets"
+            r = _get_session().get(url, params={"clob_token_ids": str(token_id)}, timeout=10)
+            r.raise_for_status()
+            markets = r.json()
+            if markets and len(markets) > 0:
+                m = markets[0]
+                outcomes_raw = m.get("outcomes")
+                prices_raw = m.get("outcomePrices")
+                if outcomes_raw and prices_raw:
+                    try:
+                        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                        if isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) == len(prices):
+                            for outcome, price_str in zip(outcomes, prices):
+                                try:
+                                    price = float(price_str)
+                                    if price >= 0.95:  # winner (resolved markets show ~1.0)
+                                        return outcome.strip().lower()  # "up" or "down"
+                                except (ValueError, TypeError):
+                                    continue
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+        except Exception:
+            pass
+        if attempt < max_retries - 1:
+            time.sleep(poll_interval)
+    return None
+
+
 def verify_trade_outcomes(trades: List[dict], logfile: str) -> List[dict]:
-    """Wait for windows to close, poll Kalshi for results, compute actual P&L."""
+    """Wait for windows to close, poll Kalshi AND Poly for results, compute actual P&L."""
     if not trades:
         return trades
 
@@ -4814,10 +4888,12 @@ def verify_trade_outcomes(trades: List[dict], logfile: str) -> List[dict]:
 
     print(f"\n  Checking {len(trades)} trade outcomes...\n")
 
-    # Cache Kalshi results per ticker (multiple trades may share same window)
+    # Cache results per ticker/token (multiple trades may share same window)
     kalshi_results: Dict[str, Optional[str]] = {}
+    poly_results: Dict[str, Optional[str]] = {}
 
     for row in trades:
+        # --- Kalshi outcome (existing) ---
         ticker = row["kalshi_ref"]
         if ticker not in kalshi_results:
             print(f"  Polling Kalshi {ticker}...", end=" ", flush=True)
@@ -4825,42 +4901,100 @@ def verify_trade_outcomes(trades: List[dict], logfile: str) -> List[dict]:
             kalshi_results[ticker] = result
             print(f"result={result or 'UNKNOWN'}")
 
-        result = kalshi_results[ticker]
-        row["kalshi_result"] = result
+        kalshi_result = kalshi_results[ticker]
+        row["kalshi_result"] = kalshi_result
 
-        if result in ("yes", "no"):
-            price_went_up = (result == "yes")
+        # --- Poly outcome (independent verification) ---
+        poly_token = row.get("poly_up_token_id") or ""
+        if poly_token and poly_token not in poly_results:
+            print(f"  Polling Poly {poly_token[:16]}...", end=" ", flush=True)
+            pr = _poll_poly_result(poly_token)
+            poly_results[poly_token] = pr
+            print(f"result={pr or 'UNKNOWN'}")
+        poly_api_result = poly_results.get(poly_token)
+        row["poly_result"] = poly_api_result
 
-            poly_won = (row["poly_side"] == "UP" and price_went_up) or \
-                       (row["poly_side"] == "DOWN" and not price_went_up)
-            kalshi_won = (row["kalshi_side"] == "UP" and price_went_up) or \
-                         (row["kalshi_side"] == "DOWN" and not price_went_up)
+        if kalshi_result in ("yes", "no"):
+            # Kalshi side outcome
+            kalshi_price_went_up = (kalshi_result == "yes")
+            kalshi_won = (row["kalshi_side"] == "UP" and kalshi_price_went_up) or \
+                         (row["kalshi_side"] == "DOWN" and not kalshi_price_went_up)
 
-            payout = (1.0 if poly_won else 0.0) + (1.0 if kalshi_won else 0.0)
-            # Use actual fill prices for live trades (accounts for slippage)
-            actual_poly = row.get("exec_leg1_actual_price")
-            actual_kalshi = row.get("exec_leg2_actual_price")
-            if actual_poly is not None and actual_kalshi is not None:
-                cost = actual_poly + actual_kalshi
+            # Poly side: use independent Poly API result when available
+            if poly_api_result in ("up", "down"):
+                poly_price_went_up = (poly_api_result == "up")
+                poly_won = (row["poly_side"] == "UP" and poly_price_went_up) or \
+                           (row["poly_side"] == "DOWN" and not poly_price_went_up)
+                poly_source = "poly_api"
             else:
-                cost = row["total_cost"]
-            fees_pc = (row["poly_fee"] + row["kalshi_fee"] + row["extras"]) / PAPER_CONTRACTS
-            actual_pnl_pc = payout - cost - fees_pc
-            actual_pnl_total = actual_pnl_pc * PAPER_CONTRACTS
+                # Fallback: derive from Kalshi (old behavior — flag it)
+                poly_won = (row["poly_side"] == "UP" and kalshi_price_went_up) or \
+                           (row["poly_side"] == "DOWN" and not kalshi_price_went_up)
+                poly_source = "kalshi_derived"
+
+            # --- Actual fill quantities (leg1=Poly, leg2=Kalshi) ---
+            p_filled = row.get("exec_leg1_filled_qty", 0) or 0
+            k_filled = row.get("exec_leg2_filled_qty", 0) or 0
+            hedged = min(p_filled, k_filled) if (p_filled > 0 and k_filled > 0) else PAPER_CONTRACTS
+
+            # Per-pair payout: $1 from the winning side, $0 from the losing side
+            payout_per_pair = (1.0 if poly_won else 0.0) + (1.0 if kalshi_won else 0.0)
+
+            # Per-pair cost using actual fill prices (accounts for slippage)
+            actual_poly_px = row.get("exec_leg1_actual_price")
+            actual_kalshi_px = row.get("exec_leg2_actual_price")
+            if actual_poly_px is not None and actual_kalshi_px is not None:
+                cost_per_pair = actual_poly_px + actual_kalshi_px
+            else:
+                cost_per_pair = row["total_cost"]
+                actual_poly_px = row.get("poly_price", 0)
+                actual_kalshi_px = row.get("kalshi_price", 0)
+
+            # Fees: scale to actual fill counts (fees scale linearly with contracts)
+            planned = PAPER_CONTRACTS if PAPER_CONTRACTS > 0 else 1
+            actual_poly_fee = row.get("poly_fee", 0) * (p_filled / planned) if p_filled > 0 else 0
+            actual_kalshi_fee = row.get("kalshi_fee", 0) * (k_filled / planned) if k_filled > 0 else 0
+            actual_extras = row.get("extras", 0)
+            total_actual_fees = actual_poly_fee + actual_kalshi_fee + actual_extras
+
+            # Hedged P&L: min(poly_filled, kalshi_filled) contract pairs
+            hedged_pnl = hedged * (payout_per_pair - cost_per_pair)
+
+            # Unhedged P&L: excess contracts carry directional risk
+            p_excess = max(0.0, p_filled - k_filled)
+            k_excess = max(0.0, k_filled - p_filled)
+            unhedged_pnl = 0.0
+            if p_excess > 0:
+                poly_payout = 1.0 if poly_won else 0.0
+                unhedged_pnl += p_excess * (poly_payout - actual_poly_px)
+            if k_excess > 0:
+                kalshi_payout = 1.0 if kalshi_won else 0.0
+                unhedged_pnl += k_excess * (kalshi_payout - actual_kalshi_px)
+
+            actual_pnl_total = round(hedged_pnl + unhedged_pnl - total_actual_fees, 4)
 
             row["poly_won"] = poly_won
             row["kalshi_won"] = kalshi_won
-            row["payout_per_contract"] = payout
-            row["actual_pnl_total"] = round(actual_pnl_total, 4)
+            row["payout_per_contract"] = payout_per_pair
+            row["actual_pnl_total"] = actual_pnl_total
             row["hedge_consistent"] = (poly_won != kalshi_won)  # exactly one should win
+            row["poly_outcome_source"] = poly_source
+            row["hedged_contracts"] = round(hedged, 4)
+            row["unhedged_poly"] = round(p_excess, 4)
+            row["unhedged_kalshi"] = round(k_excess, 4)
+            row["hedged_pnl"] = round(hedged_pnl - total_actual_fees, 4)
+            row["unhedged_pnl"] = round(unhedged_pnl, 4)
 
             tag = "WIN" if actual_pnl_total > 0 else ("LOSS" if actual_pnl_total < 0 else "BREAK-EVEN")
             hedge_tag = "OK" if row["hedge_consistent"] else "BOTH-LOST" if not poly_won and not kalshi_won else "BOTH-WON"
+            source_tag = f" [poly:{poly_source}]" if poly_source != "poly_api" else ""
 
-            print(f"  [{row['ts']}] {row['coin']} | Kalshi: {result} | "
+            print(f"  [{row['ts']}] {row['coin']} | Kalshi: {kalshi_result} | Poly: {poly_api_result or 'N/A'} | "
                   f"Poly {row['poly_side']}: {'WON' if poly_won else 'LOST'} | "
                   f"Kalshi {row['kalshi_side']}: {'WON' if kalshi_won else 'LOST'} | "
-                  f"Hedge: {hedge_tag} | P&L: ${actual_pnl_total:+.4f} ({tag})")
+                  f"Hedge: {hedge_tag} | "
+                  f"P&L=${actual_pnl_total:+.4f} (hedged={hedged:.1f} unhedged={p_excess + k_excess:.1f})"
+                  f"{source_tag} ({tag})")
         else:
             row["actual_pnl_total"] = None
             row["hedge_consistent"] = None
