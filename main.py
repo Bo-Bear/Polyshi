@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.59"
+VERSION = "1.1.61"
 VERSION_DATE = "2026-02-18 UTC"
 
 import requests
@@ -3939,6 +3939,18 @@ def _poly_avg_fill_price(order: dict, fallback: float) -> float:
     return float(order.get("price", fallback))
 
 
+def _is_fill_complete(filled: float, target: float, tol: float = 0.5) -> bool:
+    """Check if filled quantity is close enough to target to count as complete.
+
+    Polymarket's CLOB API can return size_matched as a float slightly below
+    the ordered quantity (e.g. 6.999 instead of 7.0) due to floating-point
+    representation.  Real partial fills differ by at least 1 whole contract,
+    so a tolerance of 0.5 safely distinguishes precision artifacts from
+    genuine partial fills.
+    """
+    return filled >= target - tol
+
+
 def _execute_poly_leg(side: str, planned_price: float, contracts: float,
                       token_id: str, timeout: float = None) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
     """Place and poll a Polymarket CLOB limit order. Returns (order_id, actual_price, filled, status, error)."""
@@ -4072,7 +4084,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                     avg_price = _poly_avg_fill_price(prev_o, planned_price)
                     cumulative_filled += prev_trades_size
                     latency = (time.monotonic() - t0) * 1000
-                    status = "filled" if cumulative_filled >= contracts else "partial"
+                    status = "filled" if _is_fill_complete(cumulative_filled, contracts) else "partial"
                     print(f"  [poly-retry]   Previous order {prev_id[:12]} actually filled! "
                           f"{prev_trades_size} contracts (cumulative {cumulative_filled:.1f}/{contracts:.0f})")
                     if cumulative_filled >= contracts * 0.9:
@@ -4098,7 +4110,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                     # Full or near-full fill detected — stop retrying
                     latency = (time.monotonic() - t0) * 1000
                     actual_filled = max(cumulative_filled, delta_shares)
-                    status = "filled" if actual_filled >= contracts else "partial"
+                    status = "filled" if _is_fill_complete(actual_filled, contracts) else "partial"
                     print(f"  [poly-retry]   ON-CHAIN GUARD: balance delta={delta_shares:.2f} "
                           f"shows previous order(s) filled — aborting retries")
                     if delta_shares > contracts * 1.1:
@@ -4222,7 +4234,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                     if filled_size > 0:
                         avg_price = _poly_avg_fill_price(o, planned_price)
                         latency = (time.monotonic() - t0) * 1000
-                        status = "filled" if filled_size >= contracts else "partial"
+                        status = "filled" if _is_fill_complete(filled_size, contracts) else "partial"
                         print(f"  [poly-retry]   Canceled but {filled_size} contracts matched (trades_size={trades_size})")
                         return LegFill(
                             exchange="poly", side=side,
@@ -4260,7 +4272,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                                else float(o.get("original_size", contracts)))
                 avg_price = _poly_avg_fill_price(o, planned_price)
                 latency = (time.monotonic() - t0) * 1000
-                status = "filled" if filled_size >= contracts else "partial"
+                status = "filled" if _is_fill_complete(filled_size, contracts) else "partial"
                 print(f"  [poly-retry]   Order was actually {status}! {filled_size} contracts @ ~${avg_price:.4f}")
                 return LegFill(
                     exchange="poly", side=side,
@@ -4278,7 +4290,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
     if cumulative_filled > 0:
         capped = min(cumulative_filled, contracts)
         latency = (time.monotonic() - t0) * 1000
-        status = "filled" if capped >= contracts else "partial"
+        status = "filled" if _is_fill_complete(capped, contracts) else "partial"
         print(f"  [poly-retry] Cumulative fills from retry loop: {capped:.1f}/{contracts:.0f}")
         return LegFill(
             exchange="poly", side=side,
@@ -4319,7 +4331,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                 print(f"  [poly-retry]   GHOST FILL WARNING: sweep found {sweep_total:.1f} "
                       f"but target was {contracts:.0f} — reporting actual fills")
             latency = (time.monotonic() - t0) * 1000
-            status = "filled" if sweep_total >= contracts else "partial"
+            status = "filled" if _is_fill_complete(sweep_total, contracts) else "partial"
             return LegFill(
                 exchange="poly", side=side,
                 planned_price=planned_price, actual_price=sweep_avg_price,
@@ -4339,7 +4351,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             print(f"  [poly-retry]   GHOST FILL WARNING: ledger shows {ledger_size} "
                   f"but target was {contracts} — reporting actual fills")
         latency = (time.monotonic() - t0) * 1000
-        status = "filled" if ledger_size >= contracts else "partial"
+        status = "filled" if _is_fill_complete(ledger_size, contracts) else "partial"
         print(f"  [poly-retry]   TRADES LEDGER: found {ledger_size} contracts @ ~${ledger_price:.4f}!")
         return LegFill(
             exchange="poly", side=side,
@@ -4367,7 +4379,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                           f"untracked exposure")
                 # Report ACTUAL on-chain fills, not capped — ghost fills must be tracked
                 latency = (time.monotonic() - t0) * 1000
-                status = "filled" if delta_shares >= contracts else "partial"
+                status = "filled" if _is_fill_complete(delta_shares, contracts) else "partial"
                 print(f"  [poly-retry]   ON-CHAIN CONFIRMED: {delta_shares:.2f} contracts filled!")
                 return LegFill(
                     exchange="poly", side=side,
@@ -4509,6 +4521,13 @@ def execute_hedge(candidate: HedgeCandidate,
     slip_poly = (leg1.actual_price - leg1.planned_price) if leg1.actual_price is not None else 0.0
     slip_kalshi = (leg2.actual_price - leg2.planned_price) if leg2.actual_price is not None else 0.0
     both_filled = (leg1.status == "filled" and leg2.status == "filled")
+    # Safety net: treat as both_filled if quantities match even when status
+    # strings are "partial" due to floating-point precision in fill sizes.
+    if not both_filled:
+        l1_ok = _is_fill_complete(leg1.filled_contracts, leg1.planned_contracts)
+        l2_ok = _is_fill_complete(leg2.filled_contracts, leg2.planned_contracts)
+        if l1_ok and l2_ok:
+            both_filled = True
 
     result = ExecutionResult(
         leg1=leg1, leg2=leg2,
@@ -4578,6 +4597,16 @@ def execute_hedge(candidate: HedgeCandidate,
         # Use filled_contracts instead of status to handle "partial" fills
         kalshi_excess = leg2.filled_contracts - leg1.filled_contracts
         poly_excess = leg1.filled_contracts - leg2.filled_contracts
+
+        # Skip unwind for sub-contract excess — this is a floating-point
+        # artifact, not a real imbalance.  Sending 0-contract orders to
+        # exchange APIs causes rejections and false unwind failures.
+        if kalshi_excess > 0 and kalshi_excess < 1.0:
+            print(f"  [unwind] Skipping Kalshi unwind — excess {kalshi_excess:.3f} < 1 contract (fp artifact)")
+            kalshi_excess = 0.0
+        if poly_excess > 0 and poly_excess < 1.0:
+            print(f"  [unwind] Skipping Poly unwind — excess {poly_excess:.3f} < 1 contract (fp artifact)")
+            poly_excess = 0.0
 
         if kalshi_excess > 0:
             unwind_buy = leg2.actual_price or leg2.planned_price
