@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.64"
+VERSION = "1.1.65"
 VERSION_DATE = "2026-02-18 UTC"
 
 import requests
@@ -106,6 +106,9 @@ MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
 # -----------------------------
 # Size we assume for fee calculations (both venues). Polymarket fee table is for 100 shares. :contentReference[oaicite:3]{index=3}
 PAPER_CONTRACTS = float(os.getenv("PAPER_CONTRACTS", "1"))
+
+# Polymarket minimum order notional ($). Orders below this are rejected by the CLOB API.
+POLY_MIN_ORDER_NOTIONAL = float(os.getenv("POLY_MIN_ORDER_NOTIONAL", "1.0"))
 
 # Cap trade size to this fraction of Poly book depth (0.5 = use at most 50% of visible depth)
 POLY_DEPTH_CAP_RATIO = float(os.getenv("POLY_DEPTH_CAP_RATIO", "0.5"))
@@ -3382,6 +3385,7 @@ def print_session_diagnostics(
     print(f"  LIVE_PRICE_BUFFER:   ${LIVE_PRICE_BUFFER:.3f}")
     print(f"  POLY_FILL_RETRIES:   {POLY_FILL_MAX_RETRIES}")
     print(f"  POLY_DEPTH_CAP:      {POLY_DEPTH_CAP_RATIO:.0%}")
+    print(f"  POLY_MIN_NOTIONAL:   ${POLY_MIN_ORDER_NOTIONAL:.2f}")
     print(f"  SLIPPAGE_BUDGET:     ${EXECUTION_SLIPPAGE_BUDGET:.3f}/contract")
 
     # --- Per-Trade Execution Log ---
@@ -3591,6 +3595,7 @@ def print_session_diagnostics(
             "LIVE_PRICE_BUFFER": LIVE_PRICE_BUFFER,
             "POLY_FILL_MAX_RETRIES": POLY_FILL_MAX_RETRIES,
             "POLY_DEPTH_CAP_RATIO": POLY_DEPTH_CAP_RATIO,
+            "POLY_MIN_ORDER_NOTIONAL": POLY_MIN_ORDER_NOTIONAL,
             "EXECUTION_SLIPPAGE_BUDGET": EXECUTION_SLIPPAGE_BUDGET,
             "MIN_WINDOW_REMAINING_S": MIN_WINDOW_REMAINING_S,
             "WINDOW_STARTUP_DELAY_S": WINDOW_STARTUP_DELAY_S,
@@ -3694,6 +3699,7 @@ def replay_session_diagnostics(diag: dict, trade_rows: List[dict]) -> None:
     print(f"  LIVE_PRICE_BUFFER:   ${cfg.get('LIVE_PRICE_BUFFER', 0):.3f}")
     print(f"  POLY_FILL_RETRIES:   {cfg.get('POLY_FILL_MAX_RETRIES', 0)}")
     print(f"  POLY_DEPTH_CAP:      {cfg.get('POLY_DEPTH_CAP_RATIO', 0):.0%}")
+    print(f"  POLY_MIN_NOTIONAL:   ${cfg.get('POLY_MIN_ORDER_NOTIONAL', 1.0):.2f}")
     print(f"  SLIPPAGE_BUDGET:     ${cfg.get('EXECUTION_SLIPPAGE_BUDGET', 0):.3f}/contract")
 
     # --- Per-Trade Execution Log ---
@@ -4424,6 +4430,18 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
         # Use best ask + small buffer, but cap at planned_price + max slippage
         limit_price = min(round(best_ask + LIVE_PRICE_BUFFER, 2), round(max_acceptable, 2), 0.99)
         order_size = remaining
+
+        # Enforce Poly minimum order notional — if remaining contracts × price
+        # still falls below $1 (e.g. after Kalshi partial fill), abort early.
+        notional = order_size * limit_price
+        if notional < POLY_MIN_ORDER_NOTIONAL:
+            last_error = (f"retry {attempt}: notional ${notional:.2f} "
+                          f"({int(order_size)}x @ ${limit_price:.2f}) below "
+                          f"${POLY_MIN_ORDER_NOTIONAL:.2f} minimum")
+            print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
+                  f"SKIP — notional ${notional:.2f} < ${POLY_MIN_ORDER_NOTIONAL:.2f} min")
+            break  # no point retrying at same size
+
         print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
               f"{int(order_size)}x @ ${limit_price:.2f} (best ask ${best_ask:.3f})")
 
@@ -4697,6 +4715,19 @@ def execute_hedge(candidate: HedgeCandidate,
     """
     # Cap contracts to available Poly book depth to reduce partial fills
     contracts = PAPER_CONTRACTS
+
+    # Enforce Polymarket minimum order notional ($1).
+    # At low per-contract prices (e.g. $0.33), we need ceil($1 / price) contracts
+    # to meet the CLOB's minimum marketable order size.
+    poly_price_est = candidate.poly_price
+    if poly_price_est > 0:
+        min_for_notional = math.ceil(POLY_MIN_ORDER_NOTIONAL / poly_price_est)
+        if min_for_notional > contracts:
+            print(f"  [min-notional] Poly price ${poly_price_est:.3f} × {int(contracts)} "
+                  f"= ${poly_price_est * contracts:.2f} < ${POLY_MIN_ORDER_NOTIONAL:.2f} min — "
+                  f"raising to {min_for_notional} contracts")
+            contracts = float(min_for_notional)
+
     if poly_depth and poly_depth.get("total_size", 0) > 0:
         depth_cap = int(poly_depth["total_size"] * POLY_DEPTH_CAP_RATIO)
         if depth_cap < contracts:
@@ -5761,6 +5792,7 @@ def main() -> None:
     print(f"  Balance floor:      ${MIN_ACCOUNT_BALANCE:.2f} per account (stop if either drops below)")
     print(f"  Consec loss stop:   2 losing 15m windows in a row → stop")
     print(f"  Depth cap ratio:    {POLY_DEPTH_CAP_RATIO:.0%} of Poly book (min {MIN_CONTRACTS} contracts)")
+    print(f"  Poly min notional:  ${POLY_MIN_ORDER_NOTIONAL:.2f} (auto-raises contract count)")
     print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s per attempt (3-pass unwind: best_bid → best_bid-$0.02 → $0.01 floor)")
     print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
     print(f"  Poly fill retries:  {POLY_FILL_MAX_RETRIES} attempts x {POLY_FILL_RETRY_TIMEOUT_S:.0f}s each")
@@ -6401,7 +6433,7 @@ def main() -> None:
                 "poly_book_size": poly_depth["total_size"] if poly_depth else None,
                 "poly_book_notional_usd": poly_depth["total_notional_usd"] if poly_depth else None,
                 "poly_ws_staleness_s": round(poly_staleness_s, 1) if poly_staleness_s is not None else None,
-                "depth_capped_contracts": int(min(PAPER_CONTRACTS, int(poly_depth["total_size"] * POLY_DEPTH_CAP_RATIO))) if poly_depth and poly_depth.get("total_size", 0) > 0 else int(PAPER_CONTRACTS),
+                "depth_capped_contracts": int(min(max(PAPER_CONTRACTS, math.ceil(POLY_MIN_ORDER_NOTIONAL / best_global.poly_price) if best_global.poly_price > 0 else PAPER_CONTRACTS), int(poly_depth["total_size"] * POLY_DEPTH_CAP_RATIO))) if poly_depth and poly_depth.get("total_size", 0) > 0 else int(max(PAPER_CONTRACTS, math.ceil(POLY_MIN_ORDER_NOTIONAL / best_global.poly_price) if best_global.poly_price > 0 else PAPER_CONTRACTS)),
                 # Timing
                 "scan_ms": round(scan_ms, 1),
                 "gamma_ms": round(gamma_ms, 1),
