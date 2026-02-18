@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.62"
+VERSION = "1.1.63"
 VERSION_DATE = "2026-02-18 UTC"
 
 import requests
@@ -1489,6 +1489,10 @@ def review_session_history() -> None:
         first_ts = None
         last_ts = None
         exec_mode = "paper"
+        diag_version = None
+        diag_duration = None
+        diag_end_reason = None
+        diag_filled = None
         try:
             with open(lf, "r") as f:
                 for line in f:
@@ -1514,6 +1518,11 @@ def review_session_history() -> None:
                             exec_mode = row["exec_mode"]
                     elif lt == "skip":
                         skips += 1
+                    elif lt == "session_diagnostics_dump":
+                        diag_version = row.get("version")
+                        diag_duration = row.get("session_duration_s")
+                        diag_end_reason = row.get("end_reason")
+                        diag_filled = row.get("trades_filled")
         except Exception:
             continue
 
@@ -1526,6 +1535,10 @@ def review_session_history() -> None:
             "first_ts": first_ts,
             "last_ts": last_ts,
             "exec_mode": exec_mode,
+            "version": diag_version,
+            "duration_s": diag_duration,
+            "end_reason": diag_end_reason,
+            "filled": diag_filled,
         })
 
     print(f"\nSESSION HISTORY")
@@ -1536,7 +1549,11 @@ def review_session_history() -> None:
         coins_str = ",".join(s["coins"]) if s["coins"] else "none"
         mode_tag = "LIVE" if s["exec_mode"] == "live" else "PAPER"
         ts_str = s["first_ts"][:19] if s["first_ts"] else "?"
-        print(f"  {i+1}) {ts_str}  [{mode_tag}]  {s['trades']} trades, {s['skips']} skips  ({coins_str})")
+        filled_str = f"{s['filled']} filled" if s["filled"] is not None else f"{s['trades']} trades"
+        dur_str = f"  {s['duration_s']/60:.0f}m" if s["duration_s"] else ""
+        ver_str = f"  v{s['version']}" if s["version"] else ""
+        print(f"  {i+1}) {ts_str}  [{mode_tag}]  {filled_str}/{s['trades']} attempted, "
+              f"{s['skips']} skips{dur_str}{ver_str}  ({coins_str})")
 
     print(f"\n  0) Exit")
 
@@ -1559,6 +1576,7 @@ def review_session_history() -> None:
     trade_rows: List[dict] = []
     skip_counts: Dict[str, int] = {}
     balance_checks: List[dict] = []
+    session_diag: Optional[dict] = None
 
     with open(selected["path"], "r") as f:
         for line in f:
@@ -1577,6 +1595,8 @@ def review_session_history() -> None:
                 skip_counts[reason] = skip_counts.get(reason, 0) + 1
             elif lt == "balance_check":
                 balance_checks.append(row)
+            elif lt == "session_diagnostics_dump":
+                session_diag = row
 
     # Determine start/end balances from balance_check entries
     start_balances: Optional[Dict[str, float]] = None
@@ -1590,6 +1610,13 @@ def review_session_history() -> None:
 
     # Determine coins from the trade rows
     coins_in_session = sorted(set(r.get("coin", "") for r in trade_rows)) if trade_rows else AVAILABLE_COINS
+
+    # Replay session diagnostics if available (printed before trade summary,
+    # same order as live sessions)
+    if session_diag:
+        replay_session_diagnostics(session_diag, trade_rows)
+    elif trade_rows:
+        print("\n  (no diagnostics dump found in this session log)")
 
     # Reuse the existing summarize() function
     summarize(trade_rows, coins_in_session, skip_counts=skip_counts,
@@ -3622,6 +3649,235 @@ def print_session_diagnostics(
         diag_row["start_balances"] = start_balances
     append_log(logfile, diag_row)
     print(f"\n  [diagnostics] Written to {logfile}")
+
+
+def replay_session_diagnostics(diag: dict, trade_rows: List[dict]) -> None:
+    """Replay a stored session_diagnostics_dump when reviewing past sessions.
+
+    Uses the stored config/metadata from the diagnostics JSON and recomputes
+    per-trade and exchange reliability details from the raw trade rows.
+    """
+    W = 60
+    sep = "=" * W
+
+    print(f"\n{sep}")
+    print(f"  SESSION DIAGNOSTICS (replay)")
+    print(sep)
+
+    cfg = diag.get("config", {})
+    coins = diag.get("coins", [])
+    dur = diag.get("session_duration_s", 0)
+    trades_attempted = diag.get("trades_attempted", len(trade_rows))
+    trades_filled = diag.get("trades_filled", 0)
+    total_unwinds = diag.get("total_unwinds", 0)
+
+    # --- Config Snapshot ---
+    print(f"\n--- Config Snapshot ---")
+    print(f"  Version:             {diag.get('version', '?')}")
+    print(f"  Mode:                {diag.get('exec_mode', '?')}")
+    print(f"  Coins:               {', '.join(coins)}")
+    print(f"  Duration:            {dur:.0f}s ({dur / 60:.0f}m)")
+    contracts = cfg.get("PAPER_CONTRACTS", 0)
+    print(f"  Contracts:           {int(contracts)}")
+    print(f"  End reason:          {diag.get('end_reason', '?')}")
+    print(f"  Total scans:         {diag.get('total_scans', 0)}")
+    _fmt_pct = lambda x: f"{x*100:.2f}%"
+    print(f"  MIN_NET_EDGE:        {_fmt_pct(cfg.get('MIN_NET_EDGE', 0))}")
+    print(f"  MAX_NET_EDGE:        {_fmt_pct(cfg.get('MAX_NET_EDGE', 0))}")
+    print(f"  MAX_TOTAL_COST:      {cfg.get('MAX_TOTAL_COST', 0):.3f}")
+    print(f"  MIN_WINDOW_REMAINING:{cfg.get('MIN_WINDOW_REMAINING_S', 0):.0f}s")
+    print(f"  WINDOW_STARTUP_DELAY:{cfg.get('WINDOW_STARTUP_DELAY_S', 0):.0f}s")
+    print(f"  MAX_SPREAD:          {_fmt_pct(cfg.get('MAX_SPREAD', 0))}")
+    print(f"  PRICE_FLOOR/CEILING: {cfg.get('PRICE_FLOOR', 0):.2f} / {cfg.get('PRICE_CEILING', 0):.2f}")
+    print(f"  MAX_STRIKE_SPOT_DIV: {_fmt_pct(cfg.get('MAX_STRIKE_SPOT_DIVERGENCE', 0))}")
+    print(f"  ORDER_TIMEOUT_S:     {cfg.get('ORDER_TIMEOUT_S', 0):.0f}s")
+    print(f"  LIVE_PRICE_BUFFER:   ${cfg.get('LIVE_PRICE_BUFFER', 0):.3f}")
+    print(f"  POLY_FILL_RETRIES:   {cfg.get('POLY_FILL_MAX_RETRIES', 0)}")
+    print(f"  POLY_DEPTH_CAP:      {cfg.get('POLY_DEPTH_CAP_RATIO', 0):.0%}")
+    print(f"  SLIPPAGE_BUDGET:     ${cfg.get('EXECUTION_SLIPPAGE_BUDGET', 0):.3f}/contract")
+
+    # --- Per-Trade Execution Log ---
+    print(f"\n--- Execution Log ({trades_attempted} trades, {trades_filled} filled, {total_unwinds} unwinds) ---")
+    if not trade_rows:
+        print("  (no trades attempted)")
+    for i, r in enumerate(trade_rows, 1):
+        both = r.get("exec_both_filled", False)
+        status_tag = "FILLED" if both else "INCOMPLETE"
+        print(f"\n  Trade #{i}  [{r.get('ts', '?')}]  {r.get('coin', '?')}  [{status_tag}]")
+        print(f"    Direction:     Poly {r.get('poly_side', '?')} + Kalshi {r.get('kalshi_side', '?')}")
+        print(f"    Edge:          net {_fmt_pct(r.get('net_edge', 0))} (gross {_fmt_pct(r.get('gross_edge', 0))})")
+        print(f"    Total cost:    {r.get('total_cost', 0):.3f}")
+        print(f"    Fees:          poly={r.get('poly_fee', 0):.4f}  kalshi={r.get('kalshi_fee', 0):.4f}  extras={r.get('extras', 0):.4f}")
+
+        # Leg 1
+        l1_exch = r.get("exec_leg1_exchange", "?")
+        l1_status = r.get("exec_leg1_status", "?")
+        l1_planned_px = r.get("poly_price") if l1_exch == "poly" else r.get("kalshi_price")
+        l1_actual_px = r.get("exec_leg1_actual_price")
+        l1_planned_qty = r.get("exec_leg1_planned_qty", 0)
+        l1_filled_qty = r.get("exec_leg1_filled_qty", 0)
+        l1_latency = r.get("exec_leg1_latency_ms", 0)
+        l1_error = r.get("exec_leg1_error")
+        actual_str1 = f"${l1_actual_px:.3f}" if l1_actual_px is not None else "N/A"
+        planned_str1 = f"${l1_planned_px:.3f}" if l1_planned_px is not None else "N/A"
+        print(f"    Leg1 ({l1_exch:6s}): {planned_str1} planned -> {actual_str1} actual | "
+              f"{l1_filled_qty:.0f}/{l1_planned_qty:.0f} filled | {l1_status} | {l1_latency:.0f}ms")
+        if l1_error:
+            print(f"                    error: {l1_error}")
+
+        # Leg 2
+        l2_exch = r.get("exec_leg2_exchange", "?")
+        l2_status = r.get("exec_leg2_status", "?")
+        l2_planned_px = r.get("kalshi_price") if l2_exch == "kalshi" else r.get("poly_price")
+        l2_actual_px = r.get("exec_leg2_actual_price")
+        l2_planned_qty = r.get("exec_leg2_planned_qty", 0)
+        l2_filled_qty = r.get("exec_leg2_filled_qty", 0)
+        l2_latency = r.get("exec_leg2_latency_ms", 0)
+        l2_error = r.get("exec_leg2_error")
+        actual_str2 = f"${l2_actual_px:.3f}" if l2_actual_px is not None else "N/A"
+        planned_str2 = f"${l2_planned_px:.3f}" if l2_planned_px is not None else "N/A"
+        print(f"    Leg2 ({l2_exch:6s}): {planned_str2} planned -> {actual_str2} actual | "
+              f"{l2_filled_qty:.0f}/{l2_planned_qty:.0f} filled | {l2_status} | {l2_latency:.0f}ms")
+        if l2_error:
+            print(f"                    error: {l2_error}")
+
+        # Slippage
+        slip_p = r.get("exec_slippage_poly", 0)
+        slip_k = r.get("exec_slippage_kalshi", 0)
+        if slip_p != 0 or slip_k != 0:
+            print(f"    Slippage:      poly {slip_p:+.4f}  kalshi {slip_k:+.4f}")
+
+        # Depth
+        if r.get("poly_book_levels") is not None:
+            print(f"    Poly depth:    {r['poly_book_levels']} levels, "
+                  f"{r.get('poly_book_size', 0)} contracts, "
+                  f"${r.get('poly_book_notional_usd', 0):.0f} notional")
+        if r.get("depth_capped_contracts") is not None:
+            print(f"    Depth-capped:  {r['depth_capped_contracts']} contracts")
+
+        # Spot/strike
+        if r.get("kalshi_strike") is not None:
+            print(f"    Kalshi strike:  ${r['kalshi_strike']}  (spot ${r.get('spot_price', '?')}  "
+                  f"div={r.get('strike_spot_divergence_pct', 0):.3f}%)")
+
+        # Unwind
+        if r.get("unwind_attempted"):
+            uw_exch = r.get("unwind_exchange", "?")
+            uw_success = r.get("unwind_success", False)
+            uw_contracts = r.get("unwind_contracts", 0)
+            uw_buy = r.get("unwind_buy_price", 0)
+            uw_sell = r.get("unwind_sell_price")
+            uw_loss = r.get("unwind_loss")
+            sell_str = f"${uw_sell:.3f}" if uw_sell is not None else "FAILED"
+            loss_str = f"${uw_loss:.4f}" if uw_loss is not None else "UNKNOWN"
+            print(f"    Unwind:        {uw_exch} {uw_contracts:.0f}x @ ${uw_buy:.3f} -> {sell_str} "
+                  f"| loss={loss_str} | {'OK' if uw_success else 'FAILED'}")
+
+        # Timing
+        total_ms = r.get("exec_total_ms", 0)
+        scan_ms = r.get("scan_ms", 0)
+        print(f"    Timing:        scan={scan_ms:.0f}ms  exec={total_ms:.0f}ms  total={scan_ms + total_ms:.0f}ms")
+
+    # --- Exchange Reliability (recomputed from trade rows) ---
+    print(f"\n--- Exchange Reliability ---")
+    kalshi_attempts = 0
+    kalshi_fills = 0
+    kalshi_latencies: List[float] = []
+    kalshi_errors: Dict[str, int] = {}
+    poly_attempts = 0
+    poly_fills = 0
+    poly_latencies: List[float] = []
+    poly_errors: Dict[str, int] = {}
+
+    for r in trade_rows:
+        for leg in (1, 2):
+            exch = r.get(f"exec_leg{leg}_exchange", "")
+            status = r.get(f"exec_leg{leg}_status", "")
+            latency = r.get(f"exec_leg{leg}_latency_ms", 0) or 0
+            filled = r.get(f"exec_leg{leg}_filled_qty", 0) or 0
+            error = r.get(f"exec_leg{leg}_error")
+
+            if "kalshi" in exch:
+                if status != "skipped":
+                    kalshi_attempts += 1
+                    kalshi_latencies.append(latency)
+                if filled > 0:
+                    kalshi_fills += 1
+                if error:
+                    kalshi_errors[error] = kalshi_errors.get(error, 0) + 1
+            elif "poly" in exch:
+                if status != "skipped":
+                    poly_attempts += 1
+                    poly_latencies.append(latency)
+                if filled > 0:
+                    poly_fills += 1
+                if error:
+                    poly_errors[error] = poly_errors.get(error, 0) + 1
+
+    if kalshi_attempts > 0:
+        avg_k_lat = sum(kalshi_latencies) / len(kalshi_latencies) if kalshi_latencies else 0
+        print(f"  Kalshi: {kalshi_attempts} attempts, {kalshi_fills} fills "
+              f"({kalshi_fills/kalshi_attempts*100:.0f}% fill rate)")
+        print(f"    Avg latency: {avg_k_lat:.0f}ms  "
+              f"Min: {min(kalshi_latencies):.0f}ms  Max: {max(kalshi_latencies):.0f}ms")
+        if kalshi_errors:
+            for err, cnt in sorted(kalshi_errors.items(), key=lambda x: -x[1]):
+                print(f"    Error: {err} ({cnt}x)")
+    else:
+        print(f"  Kalshi: 0 attempts")
+
+    if poly_attempts > 0:
+        avg_p_lat = sum(poly_latencies) / len(poly_latencies) if poly_latencies else 0
+        print(f"  Poly:   {poly_attempts} attempts, {poly_fills} fills "
+              f"({poly_fills/poly_attempts*100:.0f}% fill rate)")
+        print(f"    Avg latency: {avg_p_lat:.0f}ms  "
+              f"Min: {min(poly_latencies):.0f}ms  Max: {max(poly_latencies):.0f}ms")
+        if poly_errors:
+            for err, cnt in sorted(poly_errors.items(), key=lambda x: -x[1]):
+                print(f"    Error: {err} ({cnt}x)")
+    else:
+        skipped_poly = sum(1 for r in trade_rows if r.get("exec_leg1_status") == "skipped" or r.get("exec_leg2_status") == "skipped")
+        print(f"  Poly:   0 attempts ({skipped_poly} skipped due to Kalshi failure)")
+
+    # --- Per-Coin Status ---
+    coin_trade_counts = diag.get("coin_trade_counts", {})
+    coin_consecutive_unwinds = diag.get("coin_consecutive_unwinds", {})
+    coins_stopped = diag.get("coins_stopped", {})
+    print(f"\n--- Per-Coin Status ---")
+    for coin in coins:
+        trades = coin_trade_counts.get(coin, 0)
+        unwinds = coin_consecutive_unwinds.get(coin, 0)
+        stopped = coins_stopped.get(coin)
+        stopped_str = f"  STOPPED: {stopped}" if stopped else ""
+        print(f"  {coin:4s}: {trades} trades, {unwinds} consecutive unwinds{stopped_str}")
+
+    # --- Scan Efficiency ---
+    stored_skips = diag.get("skip_counts", {})
+    total_evals = sum(stored_skips.values()) + trades_attempted
+    print(f"\n--- Scan Efficiency ---")
+    print(f"  Total coin-level evaluations: {total_evals}")
+    print(f"  Trades attempted:  {trades_attempted}")
+    print(f"  Opportunity rate:  {trades_attempted/total_evals*100:.2f}%" if total_evals > 0 else "  Opportunity rate:  N/A")
+    if stored_skips:
+        total_skips = sum(stored_skips.values())
+        print(f"  Skip breakdown ({total_skips} total):")
+        for reason, count in sorted(stored_skips.items(), key=lambda x: -x[1]):
+            print(f"    {reason:30s} {count:5d} ({count/total_skips*100:5.1f}%)")
+
+    # --- Session State ---
+    print(f"\n--- Session State ---")
+    print(f"  Consecutive losing windows: {diag.get('consecutive_losing_windows', 0)}/2")
+    print(f"  Pending unwinds:            {diag.get('pending_unwinds_remaining', 0)}")
+    if coins_stopped:
+        coins_stopped_list = [f"{c} ({r})" for c, r in coins_stopped.items()]
+        print(f"  Coins stopped:              {', '.join(coins_stopped_list)}")
+    else:
+        print(f"  Coins stopped:              none")
+    sb = diag.get("start_balances")
+    if sb:
+        print(f"  Start balances:             "
+              f"Kalshi=${sb.get('kalshi', -1):.2f}  "
+              f"Poly=${sb.get('poly', -1):.2f}")
 
 
 # -----------------------------
