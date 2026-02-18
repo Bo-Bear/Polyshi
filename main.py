@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.54"
+VERSION = "1.1.55"
 VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
@@ -1714,6 +1714,162 @@ def _check_session_positions_onchain(trade_rows: List[dict]) -> None:
         print(f"\n  No unredeemed positions found (all settled or tokens already burned)")
 
 
+def check_onchain_positions() -> None:
+    """Scan all session logs for token IDs and display current on-chain Polymarket holdings."""
+    from eth_account import Account
+    import glob as glob_mod
+
+    if not POLY_PRIVATE_KEY:
+        print("  POLY_PRIVATE_KEY not set — cannot check on-chain positions")
+        return
+
+    acct = Account.from_key(POLY_PRIVATE_KEY)
+    addr = acct.address
+
+    # Collect all unique token pairs from log files
+    log_dir = os.getenv("LOG_DIR", "logs")
+    log_files = sorted(glob_mod.glob(os.path.join(log_dir, "arb_logs_*.jsonl")))
+    if not log_files:
+        print("\n  No session logs found — nothing to check")
+        return
+
+    print(f"\n  Scanning {len(log_files)} log file(s) for token IDs...")
+
+    seen: set = set()
+    token_pairs: List[Tuple[str, str]] = []
+
+    for lf in log_files:
+        try:
+            with open(lf, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    up_tid = row.get("poly_up_token_id") or ""
+                    down_tid = row.get("poly_down_token_id") or ""
+                    if not up_tid:
+                        for coin_key in AVAILABLE_COINS:
+                            quotes = (row.get("all_coin_quotes") or {}).get(coin_key, {})
+                            poly_q = quotes.get("poly", {})
+                            if poly_q.get("up_token_id"):
+                                up_tid = str(poly_q["up_token_id"])
+                                down_tid = str(poly_q.get("down_token_id", ""))
+                                if up_tid and down_tid and up_tid not in seen:
+                                    seen.add(up_tid)
+                                    token_pairs.append((up_tid, down_tid))
+                    if up_tid and down_tid and up_tid not in seen:
+                        seen.add(up_tid)
+                        token_pairs.append((up_tid, down_tid))
+        except Exception:
+            continue
+
+    if not token_pairs:
+        print("  No token IDs found in logs")
+        return
+
+    print(f"  Found {len(token_pairs)} unique market(s) — checking on-chain balances...")
+
+    # Batch-check all balances
+    all_token_ids = []
+    for up_tid, down_tid in token_pairs:
+        all_token_ids.append(up_tid)
+        all_token_ids.append(down_tid)
+
+    balances = _get_ctf_balances_batch(addr, all_token_ids)
+
+    # Filter to non-zero holdings
+    held: List[Tuple[str, str, int, int]] = []
+    for up_tid, down_tid in token_pairs:
+        up_bal = balances.get(up_tid, 0)
+        down_bal = balances.get(down_tid, 0)
+        if up_bal > 0 or down_bal > 0:
+            held.append((up_tid, down_tid, up_bal, down_bal))
+
+    print(f"\n{'=' * 64}")
+    print("  ON-CHAIN POLYMARKET POSITIONS")
+    print(f"{'=' * 64}")
+    print(f"  Wallet: {addr}")
+
+    if not held:
+        print(f"\n  No tokens held — all positions settled or redeemed")
+        print(f"  (checked {len(token_pairs)} market(s))")
+        return
+
+    print(f"  Holdings: {len(held)} market(s) with tokens\n")
+
+    unredeemed = []
+    total_tokens = 0
+
+    for i, (up_tid, down_tid, up_bal, down_bal) in enumerate(held):
+        up_shares = up_bal / 1e6
+        down_shares = down_bal / 1e6
+
+        # Get market info from Gamma API
+        condition_id, neg_risk = _get_market_info_for_token(up_tid)
+        resolved = _is_condition_resolved(condition_id) if condition_id else None
+        resolved_str = "RESOLVED" if resolved else ("ACTIVE" if resolved is False else "UNKNOWN")
+
+        # Try to get market title from Gamma API
+        title = ""
+        try:
+            r = _get_session().get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"clob_token_ids": str(up_tid)}, timeout=10)
+            r.raise_for_status()
+            markets = r.json()
+            if markets and len(markets) > 0:
+                title = markets[0].get("question", "") or markets[0].get("title", "")
+                if len(title) > 60:
+                    title = title[:57] + "..."
+        except Exception:
+            title = f"token {up_tid[:16]}..."
+
+        parts = []
+        if up_shares > 0:
+            parts.append(f"{up_shares:,.1f} UP")
+        if down_shares > 0:
+            parts.append(f"{down_shares:,.1f} DOWN")
+        held_str = " + ".join(parts)
+        total_tokens += up_shares + down_shares
+
+        print(f"  {i+1}) {title}")
+        print(f"     Tokens: {held_str}  |  Status: {resolved_str}")
+
+        if resolved and condition_id:
+            unredeemed.append({
+                "up_tid": up_tid, "down_tid": down_tid,
+                "up_bal": up_bal, "down_bal": down_bal,
+                "condition_id": condition_id, "neg_risk": neg_risk,
+                "title": title,
+            })
+
+    print(f"\n  Total: {total_tokens:,.1f} tokens across {len(held)} market(s)")
+
+    if unredeemed:
+        print(f"\n  {len(unredeemed)} market(s) resolved and redeemable!")
+        ans = input("  Redeem now? [y/N]: ").strip().lower()
+        if ans == "y":
+            redeemed = 0
+            for um in unredeemed:
+                try:
+                    tx_hash, _, payout = _redeem_positions(
+                        um["condition_id"], um["up_bal"], um["down_bal"],
+                        neg_risk=um["neg_risk"])
+                    if tx_hash:
+                        payout_str = f" (+${payout / 1e6:.2f})" if payout > 0 else ""
+                        print(f"    Redeemed: {um['title']}{payout_str}  tx={tx_hash}")
+                        redeemed += 1
+                    else:
+                        print(f"    Failed: {um['title']}")
+                except Exception as e:
+                    print(f"    Error: {um['title']}: {e}")
+            print(f"\n  Redeemed {redeemed}/{len(unredeemed)} market(s)")
+
+
 def prompt_execution_mode() -> str:
     """Prompt user to choose between live trading and paper testing."""
     print("\nSELECT EXECUTION MODE")
@@ -1722,6 +1878,7 @@ def prompt_execution_mode() -> str:
     print("2) Live Trading    — real orders on Kalshi & Polymarket")
     print("3) Redeem Positions — collect unredeemed Polymarket winnings")
     print("4) Session History  — review past session trade summaries")
+    print("5) Check Positions  — view current on-chain Poly holdings")
 
     while True:
         choice = input("\nSelect mode [1]: ").strip()
@@ -1733,7 +1890,9 @@ def prompt_execution_mode() -> str:
             return "redeem"
         if choice == "4":
             return "history"
-        print("Invalid selection. Enter 1, 2, 3, or 4.")
+        if choice == "5":
+            return "positions"
+        print("Invalid selection. Enter 1, 2, 3, 4, or 5.")
 
 
 def prompt_coin_selection(available: List[str]) -> List[str]:
@@ -4759,6 +4918,11 @@ def main() -> None:
     # Session history mode: review past session summaries and exit
     if EXEC_MODE == "history":
         review_session_history()
+        return
+
+    # Check positions mode: display on-chain Polymarket holdings and exit
+    if EXEC_MODE == "positions":
+        check_onchain_positions()
         return
 
     market_type = prompt_market_type()
