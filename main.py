@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.57"
-VERSION_DATE = "2026-02-17 03:30 UTC"
+VERSION = "1.1.59"
+VERSION_DATE = "2026-02-18 UTC"
 
 import requests
 from dotenv import load_dotenv
@@ -3302,6 +3302,329 @@ def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict
 
 
 # -----------------------------
+# Session diagnostics dump
+# -----------------------------
+def print_session_diagnostics(
+    logged: List[dict],
+    skip_counts: Dict[str, int],
+    selected_coins: List[str],
+    scan_count: int,
+    session_duration_s: float,
+    successful_trades: int,
+    total_unwinds: int,
+    coin_trade_counts: Dict[str, int],
+    coin_consecutive_unwinds: Dict[str, int],
+    coin_stopped: Dict[str, str],
+    pending_unwinds: list,
+    start_balances: Optional[Dict[str, float]],
+    end_reason: str,
+    consecutive_losing_windows: int,
+    logfile: str,
+) -> None:
+    """Print a comprehensive diagnostics dump before the trade summary.
+
+    Captures everything needed to debug session behavior: config snapshot,
+    per-trade execution details (including errors), exchange reliability
+    stats, and session state.
+    """
+    W = 60
+    sep = "=" * W
+
+    print(f"\n{sep}")
+    print(f"  SESSION DIAGNOSTICS")
+    print(sep)
+
+    # --- Config Snapshot ---
+    print(f"\n--- Config Snapshot ---")
+    print(f"  Version:             {VERSION}")
+    print(f"  Mode:                {EXEC_MODE}")
+    print(f"  Coins:               {', '.join(selected_coins)}")
+    print(f"  Duration:            {session_duration_s:.0f}s ({session_duration_s / 60:.0f}m)")
+    print(f"  Contracts:           {int(PAPER_CONTRACTS)}")
+    print(f"  End reason:          {end_reason}")
+    print(f"  Total scans:         {scan_count}")
+    print(f"  MIN_NET_EDGE:        {pct(MIN_NET_EDGE)}")
+    print(f"  MAX_NET_EDGE:        {pct(MAX_NET_EDGE)}")
+    print(f"  MAX_TOTAL_COST:      {MAX_TOTAL_COST:.3f}")
+    print(f"  MIN_WINDOW_REMAINING:{MIN_WINDOW_REMAINING_S:.0f}s")
+    print(f"  WINDOW_STARTUP_DELAY:{WINDOW_STARTUP_DELAY_S:.0f}s")
+    print(f"  MAX_SPREAD:          {pct(MAX_SPREAD)}")
+    print(f"  PRICE_FLOOR/CEILING: {PRICE_FLOOR:.2f} / {PRICE_CEILING:.2f}")
+    print(f"  MAX_STRIKE_SPOT_DIV: {pct(MAX_STRIKE_SPOT_DIVERGENCE)}")
+    print(f"  ORDER_TIMEOUT_S:     {ORDER_TIMEOUT_S:.0f}s")
+    print(f"  LIVE_PRICE_BUFFER:   ${LIVE_PRICE_BUFFER:.3f}")
+    print(f"  POLY_FILL_RETRIES:   {POLY_FILL_MAX_RETRIES}")
+    print(f"  POLY_DEPTH_CAP:      {POLY_DEPTH_CAP_RATIO:.0%}")
+    print(f"  SLIPPAGE_BUDGET:     ${EXECUTION_SLIPPAGE_BUDGET:.3f}/contract")
+
+    # --- Per-Trade Execution Log ---
+    print(f"\n--- Execution Log ({len(logged)} trades, {successful_trades} filled, {total_unwinds} unwinds) ---")
+    if not logged:
+        print("  (no trades attempted)")
+    for i, r in enumerate(logged, 1):
+        both = r.get("exec_both_filled", False)
+        status_tag = "FILLED" if both else "INCOMPLETE"
+        print(f"\n  Trade #{i}  [{r.get('ts', '?')}]  {r.get('coin', '?')}  [{status_tag}]")
+        print(f"    Direction:     Poly {r.get('poly_side', '?')} + Kalshi {r.get('kalshi_side', '?')}")
+        print(f"    Edge:          net {pct(r.get('net_edge', 0))} (gross {pct(r.get('gross_edge', 0))})")
+        print(f"    Total cost:    {r.get('total_cost', 0):.3f}")
+        print(f"    Fees:          poly={r.get('poly_fee', 0):.4f}  kalshi={r.get('kalshi_fee', 0):.4f}  extras={r.get('extras', 0):.4f}")
+
+        # Leg 1 (Poly)
+        l1_exch = r.get("exec_leg1_exchange", "?")
+        l1_status = r.get("exec_leg1_status", "?")
+        l1_planned_px = r.get("poly_price") if l1_exch == "poly" else r.get("kalshi_price")
+        l1_actual_px = r.get("exec_leg1_actual_price")
+        l1_planned_qty = r.get("exec_leg1_planned_qty", 0)
+        l1_filled_qty = r.get("exec_leg1_filled_qty", 0)
+        l1_latency = r.get("exec_leg1_latency_ms", 0)
+        l1_error = r.get("exec_leg1_error")
+        actual_str1 = f"${l1_actual_px:.3f}" if l1_actual_px is not None else "N/A"
+        planned_str1 = f"${l1_planned_px:.3f}" if l1_planned_px is not None else "N/A"
+        print(f"    Leg1 ({l1_exch:6s}): {planned_str1} planned -> {actual_str1} actual | "
+              f"{l1_filled_qty:.0f}/{l1_planned_qty:.0f} filled | {l1_status} | {l1_latency:.0f}ms")
+        if l1_error:
+            print(f"                    error: {l1_error}")
+
+        # Leg 2 (Kalshi)
+        l2_exch = r.get("exec_leg2_exchange", "?")
+        l2_status = r.get("exec_leg2_status", "?")
+        l2_planned_px = r.get("kalshi_price") if l2_exch == "kalshi" else r.get("poly_price")
+        l2_actual_px = r.get("exec_leg2_actual_price")
+        l2_planned_qty = r.get("exec_leg2_planned_qty", 0)
+        l2_filled_qty = r.get("exec_leg2_filled_qty", 0)
+        l2_latency = r.get("exec_leg2_latency_ms", 0)
+        l2_error = r.get("exec_leg2_error")
+        actual_str2 = f"${l2_actual_px:.3f}" if l2_actual_px is not None else "N/A"
+        planned_str2 = f"${l2_planned_px:.3f}" if l2_planned_px is not None else "N/A"
+        print(f"    Leg2 ({l2_exch:6s}): {planned_str2} planned -> {actual_str2} actual | "
+              f"{l2_filled_qty:.0f}/{l2_planned_qty:.0f} filled | {l2_status} | {l2_latency:.0f}ms")
+        if l2_error:
+            print(f"                    error: {l2_error}")
+
+        # Slippage
+        slip_p = r.get("exec_slippage_poly", 0)
+        slip_k = r.get("exec_slippage_kalshi", 0)
+        if slip_p != 0 or slip_k != 0:
+            print(f"    Slippage:      poly {slip_p:+.4f}  kalshi {slip_k:+.4f}")
+
+        # Depth at trade time
+        if r.get("poly_book_levels") is not None:
+            print(f"    Poly depth:    {r['poly_book_levels']} levels, "
+                  f"{r.get('poly_book_size', 0)} contracts, "
+                  f"${r.get('poly_book_notional_usd', 0):.0f} notional")
+        if r.get("depth_capped_contracts") is not None:
+            print(f"    Depth-capped:  {r['depth_capped_contracts']} contracts")
+
+        # Spot/strike info
+        if r.get("kalshi_strike") is not None:
+            print(f"    Kalshi strike:  ${r['kalshi_strike']}  (spot ${r.get('spot_price', '?')}  "
+                  f"div={r.get('strike_spot_divergence_pct', 0):.3f}%)")
+
+        # Unwind details
+        if r.get("unwind_attempted"):
+            uw_exch = r.get("unwind_exchange", "?")
+            uw_success = r.get("unwind_success", False)
+            uw_contracts = r.get("unwind_contracts", 0)
+            uw_buy = r.get("unwind_buy_price", 0)
+            uw_sell = r.get("unwind_sell_price")
+            uw_loss = r.get("unwind_loss")
+            sell_str = f"${uw_sell:.3f}" if uw_sell is not None else "FAILED"
+            loss_str = f"${uw_loss:.4f}" if uw_loss is not None else "UNKNOWN"
+            print(f"    Unwind:        {uw_exch} {uw_contracts:.0f}x @ ${uw_buy:.3f} -> {sell_str} "
+                  f"| loss={loss_str} | {'OK' if uw_success else 'FAILED'}")
+
+        # Timing
+        total_ms = r.get("exec_total_ms", 0)
+        scan_ms = r.get("scan_ms", 0)
+        print(f"    Timing:        scan={scan_ms:.0f}ms  exec={total_ms:.0f}ms  total={scan_ms + total_ms:.0f}ms")
+
+    # --- Exchange Reliability ---
+    print(f"\n--- Exchange Reliability ---")
+    kalshi_attempts = 0
+    kalshi_fills = 0
+    kalshi_latencies: List[float] = []
+    kalshi_errors: Dict[str, int] = {}
+    poly_attempts = 0
+    poly_fills = 0
+    poly_latencies: List[float] = []
+    poly_errors: Dict[str, int] = {}
+
+    for r in logged:
+        for leg in (1, 2):
+            exch = r.get(f"exec_leg{leg}_exchange", "")
+            status = r.get(f"exec_leg{leg}_status", "")
+            latency = r.get(f"exec_leg{leg}_latency_ms", 0) or 0
+            filled = r.get(f"exec_leg{leg}_filled_qty", 0) or 0
+            error = r.get(f"exec_leg{leg}_error")
+
+            if "kalshi" in exch:
+                if status != "skipped":
+                    kalshi_attempts += 1
+                    kalshi_latencies.append(latency)
+                if filled > 0:
+                    kalshi_fills += 1
+                if error:
+                    kalshi_errors[error] = kalshi_errors.get(error, 0) + 1
+            elif "poly" in exch:
+                if status != "skipped":
+                    poly_attempts += 1
+                    poly_latencies.append(latency)
+                if filled > 0:
+                    poly_fills += 1
+                if error:
+                    poly_errors[error] = poly_errors.get(error, 0) + 1
+
+    if kalshi_attempts > 0:
+        avg_k_lat = sum(kalshi_latencies) / len(kalshi_latencies) if kalshi_latencies else 0
+        print(f"  Kalshi: {kalshi_attempts} attempts, {kalshi_fills} fills "
+              f"({kalshi_fills/kalshi_attempts*100:.0f}% fill rate)")
+        print(f"    Avg latency: {avg_k_lat:.0f}ms  "
+              f"Min: {min(kalshi_latencies):.0f}ms  Max: {max(kalshi_latencies):.0f}ms")
+        if kalshi_errors:
+            for err, cnt in sorted(kalshi_errors.items(), key=lambda x: -x[1]):
+                print(f"    Error: {err} ({cnt}x)")
+    else:
+        print(f"  Kalshi: 0 attempts")
+
+    if poly_attempts > 0:
+        avg_p_lat = sum(poly_latencies) / len(poly_latencies) if poly_latencies else 0
+        print(f"  Poly:   {poly_attempts} attempts, {poly_fills} fills "
+              f"({poly_fills/poly_attempts*100:.0f}% fill rate)")
+        print(f"    Avg latency: {avg_p_lat:.0f}ms  "
+              f"Min: {min(poly_latencies):.0f}ms  Max: {max(poly_latencies):.0f}ms")
+        if poly_errors:
+            for err, cnt in sorted(poly_errors.items(), key=lambda x: -x[1]):
+                print(f"    Error: {err} ({cnt}x)")
+    else:
+        skipped_poly = sum(1 for r in logged if r.get("exec_leg1_status") == "skipped" or r.get("exec_leg2_status") == "skipped")
+        print(f"  Poly:   0 attempts ({skipped_poly} skipped due to Kalshi failure)")
+
+    # --- Per-Coin Status ---
+    print(f"\n--- Per-Coin Status ---")
+    for coin in selected_coins:
+        trades = coin_trade_counts.get(coin, 0)
+        unwinds = coin_consecutive_unwinds.get(coin, 0)
+        stopped = coin_stopped.get(coin)
+        stopped_str = f"  STOPPED: {stopped}" if stopped else ""
+        print(f"  {coin:4s}: {trades} trades, {unwinds} consecutive unwinds{stopped_str}")
+
+    # --- Scan Efficiency ---
+    total_evals = sum(skip_counts.values()) + len(logged)
+    print(f"\n--- Scan Efficiency ---")
+    print(f"  Total coin-level evaluations: {total_evals}")
+    print(f"  Trades attempted:  {len(logged)}")
+    print(f"  Opportunity rate:  {len(logged)/total_evals*100:.2f}%" if total_evals > 0 else "  Opportunity rate:  N/A")
+    if skip_counts:
+        total_skips = sum(skip_counts.values())
+        print(f"  Skip breakdown ({total_skips} total):")
+        for reason, count in sorted(skip_counts.items(), key=lambda x: -x[1]):
+            print(f"    {reason:30s} {count:5d} ({count/total_skips*100:5.1f}%)")
+
+    # --- Session State ---
+    print(f"\n--- Session State ---")
+    print(f"  Consecutive losing windows: {consecutive_losing_windows}/2")
+    print(f"  Pending unwinds:            {len(pending_unwinds)}")
+    if pending_unwinds:
+        for pu in pending_unwinds:
+            print(f"    {pu.coin} {pu.exchange} {pu.side} {pu.contracts:.0f}x "
+                  f"(bought @ ${pu.buy_price:.2f}, {pu.attempts} retries)")
+    coins_stopped_list = [f"{c} ({r})" for c, r in coin_stopped.items()]
+    print(f"  Coins stopped:              {', '.join(coins_stopped_list) if coins_stopped_list else 'none'}")
+    if start_balances:
+        print(f"  Start balances:             "
+              f"Kalshi=${start_balances.get('kalshi', -1):.2f}  "
+              f"Poly=${start_balances.get('poly', -1):.2f}")
+
+    # --- Write diagnostics to JSONL log ---
+    diag_row = {
+        "log_type": "session_diagnostics_dump",
+        "ts": utc_ts(),
+        "version": VERSION,
+        "exec_mode": EXEC_MODE,
+        "coins": selected_coins,
+        "session_duration_s": session_duration_s,
+        "total_scans": scan_count,
+        "end_reason": end_reason,
+        "trades_attempted": len(logged),
+        "trades_filled": successful_trades,
+        "total_unwinds": total_unwinds,
+        "consecutive_losing_windows": consecutive_losing_windows,
+        "pending_unwinds_remaining": len(pending_unwinds),
+        "coins_stopped": dict(coin_stopped),
+        "coin_trade_counts": dict(coin_trade_counts),
+        "coin_consecutive_unwinds": dict(coin_consecutive_unwinds),
+        "skip_counts": dict(skip_counts),
+        "config": {
+            "MIN_NET_EDGE": MIN_NET_EDGE,
+            "MAX_NET_EDGE": MAX_NET_EDGE,
+            "MAX_TOTAL_COST": MAX_TOTAL_COST,
+            "PAPER_CONTRACTS": PAPER_CONTRACTS,
+            "ORDER_TIMEOUT_S": ORDER_TIMEOUT_S,
+            "LIVE_PRICE_BUFFER": LIVE_PRICE_BUFFER,
+            "POLY_FILL_MAX_RETRIES": POLY_FILL_MAX_RETRIES,
+            "POLY_DEPTH_CAP_RATIO": POLY_DEPTH_CAP_RATIO,
+            "EXECUTION_SLIPPAGE_BUDGET": EXECUTION_SLIPPAGE_BUDGET,
+            "MIN_WINDOW_REMAINING_S": MIN_WINDOW_REMAINING_S,
+            "WINDOW_STARTUP_DELAY_S": WINDOW_STARTUP_DELAY_S,
+            "MAX_SPREAD": MAX_SPREAD,
+            "PRICE_FLOOR": PRICE_FLOOR,
+            "PRICE_CEILING": PRICE_CEILING,
+            "MAX_STRIKE_SPOT_DIVERGENCE": MAX_STRIKE_SPOT_DIVERGENCE,
+            "MAX_PROB_DIVERGENCE": MAX_PROB_DIVERGENCE,
+        },
+        "exchange_reliability": {
+            "kalshi_attempts": kalshi_attempts,
+            "kalshi_fills": kalshi_fills,
+            "kalshi_errors": kalshi_errors,
+            "kalshi_avg_latency_ms": sum(kalshi_latencies) / len(kalshi_latencies) if kalshi_latencies else 0,
+            "poly_attempts": poly_attempts,
+            "poly_fills": poly_fills,
+            "poly_errors": poly_errors,
+            "poly_avg_latency_ms": sum(poly_latencies) / len(poly_latencies) if poly_latencies else 0,
+        },
+        "trades": [
+            {
+                "ts": r.get("ts"),
+                "coin": r.get("coin"),
+                "poly_side": r.get("poly_side"),
+                "kalshi_side": r.get("kalshi_side"),
+                "net_edge": r.get("net_edge"),
+                "gross_edge": r.get("gross_edge"),
+                "total_cost": r.get("total_cost"),
+                "both_filled": r.get("exec_both_filled"),
+                "leg1_exchange": r.get("exec_leg1_exchange"),
+                "leg1_status": r.get("exec_leg1_status"),
+                "leg1_filled_qty": r.get("exec_leg1_filled_qty", 0),
+                "leg1_planned_qty": r.get("exec_leg1_planned_qty", 0),
+                "leg1_error": r.get("exec_leg1_error"),
+                "leg1_latency_ms": r.get("exec_leg1_latency_ms", 0),
+                "leg2_exchange": r.get("exec_leg2_exchange"),
+                "leg2_status": r.get("exec_leg2_status"),
+                "leg2_filled_qty": r.get("exec_leg2_filled_qty", 0),
+                "leg2_planned_qty": r.get("exec_leg2_planned_qty", 0),
+                "leg2_error": r.get("exec_leg2_error"),
+                "leg2_latency_ms": r.get("exec_leg2_latency_ms", 0),
+                "unwind_attempted": r.get("unwind_attempted", False),
+                "unwind_success": r.get("unwind_success"),
+                "unwind_exchange": r.get("unwind_exchange"),
+                "unwind_loss": r.get("unwind_loss"),
+                "poly_book_levels": r.get("poly_book_levels"),
+                "poly_book_notional_usd": r.get("poly_book_notional_usd"),
+                "spot_price": r.get("spot_price"),
+                "kalshi_strike": r.get("kalshi_strike"),
+                "strike_spot_divergence_pct": r.get("strike_spot_divergence_pct"),
+            }
+            for r in logged
+        ],
+    }
+    if start_balances:
+        diag_row["start_balances"] = start_balances
+    append_log(logfile, diag_row)
+    print(f"\n  [diagnostics] Written to {logfile}")
+
+
+# -----------------------------
 # Parallel fetch helper
 # -----------------------------
 def _fetch_coin_quotes(coin: str, poly_events: List[dict]) -> dict:
@@ -5804,6 +6127,7 @@ def main() -> None:
             row["exec_leg1_planned_qty"] = exec_result.leg1.planned_contracts
             row["exec_leg1_filled_qty"] = exec_result.leg1.filled_contracts
             row["exec_leg1_latency_ms"] = round(exec_result.leg1.latency_ms, 1)
+            row["exec_leg1_error"] = exec_result.leg1.error
             row["exec_leg2_exchange"] = exec_result.leg2.exchange
             row["exec_leg2_order_id"] = exec_result.leg2.order_id
             row["exec_leg2_status"] = exec_result.leg2.status
@@ -5811,6 +6135,7 @@ def main() -> None:
             row["exec_leg2_planned_qty"] = exec_result.leg2.planned_contracts
             row["exec_leg2_filled_qty"] = exec_result.leg2.filled_contracts
             row["exec_leg2_latency_ms"] = round(exec_result.leg2.latency_ms, 1)
+            row["exec_leg2_error"] = exec_result.leg2.error
 
             # Attach unwind details to trade row for summary aggregation
             if exec_result.unwind_attempted:
@@ -6207,6 +6532,24 @@ def main() -> None:
                 print(f"\n  [redeem] No positions to redeem (tokens may not have settled yet)")
         except Exception as e:
             print(f"\n  [redeem] Auto-redemption failed: {e}")
+
+    print_session_diagnostics(
+        logged=logged,
+        skip_counts=skip_counts,
+        selected_coins=selected_coins,
+        scan_count=scan_i,
+        session_duration_s=session_duration_s,
+        successful_trades=successful_trades,
+        total_unwinds=total_unwinds,
+        coin_trade_counts=coin_trade_counts,
+        coin_consecutive_unwinds=coin_consecutive_unwinds,
+        coin_stopped=coin_stopped,
+        pending_unwinds=pending_unwinds,
+        start_balances=balances,
+        end_reason=end_reason,
+        consecutive_losing_windows=consecutive_losing_windows,
+        logfile=logfile,
+    )
 
     summarize(logged, selected_coins, skip_counts=skip_counts,
              start_balances=balances, logfile=logfile)
