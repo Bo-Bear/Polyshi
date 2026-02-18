@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.53"
+VERSION = "1.1.54"
 VERSION_DATE = "2026-02-17 03:30 UTC"
 
 import requests
@@ -497,16 +497,24 @@ def _get_condition_id_for_token(token_id: str) -> Optional[str]:
     return cid
 
 
-def _get_ctf_balance(owner: str, token_id: str) -> int:
-    """Check ERC-1155 CTF token balance on-chain. Returns raw balance."""
+def _get_ctf_balance(owner: str, token_id: str, retries: int = 3) -> int:
+    """Check ERC-1155 CTF token balance on-chain. Returns raw balance.
+    Retries on RPC failure to avoid returning 0 for transient network errors."""
     owner_padded = owner.lower().replace("0x", "").zfill(64)
     id_hex = hex(int(token_id))[2:].zfill(64)
     calldata = _BALANCE_OF_SELECTOR + owner_padded + id_hex
-    try:
-        result = _polygon_rpc("eth_call", [{"to": _POLY_CTF, "data": calldata}, "latest"])
-        return int(result, 16) if result else 0
-    except Exception:
-        return 0
+    last_err = None
+    for attempt in range(retries):
+        try:
+            result = _polygon_rpc("eth_call", [{"to": _POLY_CTF, "data": calldata}, "latest"])
+            return int(result, 16) if result else 0
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1 * (attempt + 1))  # 1s, 2s backoff
+    print(f"  [balance] WARNING: CTF balance check failed after {retries} attempts "
+          f"for token {token_id[:20]}...: {last_err}")
+    return 0
 
 
 _BALANCE_OF_BATCH_SELECTOR = "0x4e1273f4"  # balanceOfBatch(address[],uint256[])
@@ -534,21 +542,30 @@ def _get_ctf_balances_batch(owner: str, token_ids: List[str], batch_size: int = 
         calldata = (_BALANCE_OF_BATCH_SELECTOR + accounts_offset + ids_offset +
                     accounts_len + accounts_data + ids_len + ids_data)
 
-        try:
-            result = _polygon_rpc("eth_call", [{"to": _POLY_CTF, "data": calldata}, "latest"])
-            if result and result != "0x":
-                # Decode: offset(32) + length(32) + n × uint256
-                raw = result.replace("0x", "")
-                # First 64 chars = offset to array, next 64 = array length, then values
-                data_start = 128  # skip offset + length (64+64 hex chars)
-                for i, tid in enumerate(batch):
-                    val_hex = raw[data_start + i * 64: data_start + (i + 1) * 64]
-                    results[tid] = int(val_hex, 16) if val_hex else 0
-            else:
-                for tid in batch:
-                    results[tid] = 0
-        except Exception as e:
-            print(f"  [redeem] Batch balance check failed, falling back to individual: {e}")
+        batch_ok = False
+        for rpc_attempt in range(3):
+            try:
+                result = _polygon_rpc("eth_call", [{"to": _POLY_CTF, "data": calldata}, "latest"])
+                if result and result != "0x":
+                    # Decode: offset(32) + length(32) + n × uint256
+                    raw = result.replace("0x", "")
+                    # First 64 chars = offset to array, next 64 = array length, then values
+                    data_start = 128  # skip offset + length (64+64 hex chars)
+                    for i, tid in enumerate(batch):
+                        val_hex = raw[data_start + i * 64: data_start + (i + 1) * 64]
+                        results[tid] = int(val_hex, 16) if val_hex else 0
+                else:
+                    for tid in batch:
+                        results[tid] = 0
+                batch_ok = True
+                break
+            except Exception as e:
+                if rpc_attempt < 2:
+                    time.sleep(1 * (rpc_attempt + 1))
+                else:
+                    print(f"  [redeem] Batch balance check failed after 3 attempts, "
+                          f"falling back to individual: {e}")
+        if not batch_ok:
             for tid in batch:
                 results[tid] = _get_ctf_balance(owner, tid)
                 time.sleep(1)
@@ -1574,6 +1591,127 @@ def review_session_history() -> None:
     # Reuse the existing summarize() function
     summarize(trade_rows, coins_in_session, skip_counts=skip_counts,
               start_balances=start_balances, logfile=None)
+
+    # Offer on-chain position check for live sessions
+    if trade_rows and any(r.get("poly_up_token_id") for r in trade_rows):
+        ans = input("\nCheck on-chain Poly positions for this session? [y/N]: ").strip().lower()
+        if ans == "y":
+            _check_session_positions_onchain(trade_rows)
+
+
+def _check_session_positions_onchain(trade_rows: List[dict]) -> None:
+    """Cross-check session trades against on-chain CTF token balances.
+    Detects unredeemed winning positions and ghost fills."""
+    from eth_account import Account
+
+    if not POLY_PRIVATE_KEY:
+        print("  [onchain] POLY_PRIVATE_KEY not set — cannot check on-chain")
+        return
+
+    acct = Account.from_key(POLY_PRIVATE_KEY)
+    addr = acct.address
+
+    # Collect unique token pairs and aggregate tracked data per market
+    seen: set = set()
+    markets: List[dict] = []
+    for row in trade_rows:
+        up_tid = row.get("poly_up_token_id") or ""
+        down_tid = row.get("poly_down_token_id") or ""
+        if not up_tid or not down_tid or up_tid in seen:
+            continue
+        seen.add(up_tid)
+
+        # Aggregate tracked contracts and cost for this market
+        tracked_contracts = 0.0
+        tracked_cost = 0.0
+        poly_side = None
+        coin = None
+        for r in trade_rows:
+            if r.get("poly_up_token_id") == up_tid:
+                fc = r.get("exec_leg1_filled", r.get("filled_contracts", PAPER_CONTRACTS))
+                if isinstance(fc, (int, float)):
+                    tracked_contracts += fc
+                else:
+                    tracked_contracts += PAPER_CONTRACTS
+                pp = r.get("exec_leg1_actual_price", r.get("poly_price", 0))
+                tracked_cost += float(pp) * tracked_contracts if pp else 0
+                poly_side = r.get("poly_side")
+                coin = r.get("coin")
+
+        markets.append({
+            "up_tid": up_tid, "down_tid": down_tid,
+            "coin": coin, "poly_side": poly_side,
+            "tracked_contracts": tracked_contracts,
+        })
+
+    if not markets:
+        print("  [onchain] No token IDs found in session trades")
+        return
+
+    print(f"\n{'=' * 60}")
+    print("  ON-CHAIN POSITION CHECK")
+    print(f"{'=' * 60}")
+    print(f"  Wallet: {addr}")
+    print(f"  Checking {len(markets)} market(s)...\n")
+
+    unredeemed_markets = []
+
+    for m in markets:
+        up_bal = _get_ctf_balance(addr, m["up_tid"])
+        down_bal = _get_ctf_balance(addr, m["down_tid"])
+        up_shares = up_bal / 1e6 if up_bal > 0 else 0
+        down_shares = down_bal / 1e6 if down_bal > 0 else 0
+
+        # Check resolution status
+        condition_id, neg_risk = _get_market_info_for_token(m["up_tid"])
+        resolved = _is_condition_resolved(condition_id) if condition_id else None
+        resolved_str = "YES" if resolved else ("NO" if resolved is False else "UNKNOWN")
+
+        status_parts = []
+        if up_shares > 0:
+            status_parts.append(f"{up_shares:.1f} UP tokens")
+        if down_shares > 0:
+            status_parts.append(f"{down_shares:.1f} DOWN tokens")
+        if not status_parts:
+            status_parts.append("no tokens held")
+
+        held_str = ", ".join(status_parts)
+        tracked_str = f"{m['tracked_contracts']:.1f} {m['poly_side'] or '?'}"
+
+        print(f"  {m['coin'] or '?'}: tracked={tracked_str} | on-chain={held_str} | resolved={resolved_str}")
+
+        if (up_shares > 0 or down_shares > 0) and resolved:
+            unredeemed_markets.append({
+                **m, "up_bal": up_bal, "down_bal": down_bal,
+                "condition_id": condition_id, "neg_risk": neg_risk,
+            })
+
+        # Warn about ghost fills
+        total_held = up_shares + down_shares
+        if total_held > m["tracked_contracts"] * 1.1:  # >10% more than tracked
+            print(f"    WARNING: on-chain holds {total_held:.1f} but bot only tracked "
+                  f"{m['tracked_contracts']:.1f} — possible ghost fills")
+
+    if unredeemed_markets:
+        print(f"\n  Found {len(unredeemed_markets)} market(s) with unredeemed tokens!")
+        ans = input("  Redeem now? [y/N]: ").strip().lower()
+        if ans == "y":
+            redeemed = 0
+            for um in unredeemed_markets:
+                try:
+                    tx_hash, _, payout = _redeem_positions(
+                        um["condition_id"], um["up_bal"], um["down_bal"],
+                        neg_risk=um["neg_risk"])
+                    if tx_hash:
+                        print(f"    Redeemed {um['coin']}! tx={tx_hash}")
+                        redeemed += 1
+                    else:
+                        print(f"    Redemption failed for {um['coin']}")
+                except Exception as e:
+                    print(f"    Error redeeming {um['coin']}: {e}")
+            print(f"\n  Redeemed {redeemed}/{len(unredeemed_markets)} market(s)")
+    else:
+        print(f"\n  No unredeemed positions found (all settled or tokens already burned)")
 
 
 def prompt_execution_mode() -> str:
@@ -3420,16 +3558,20 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             try:
                 current_bal = _get_ctf_balance(_owner_addr, token_id)
                 delta_shares = (current_bal - _ctf_balance_before) / 1e6
-                if delta_shares >= contracts * 0.5:  # catch partial fills early (was 0.9)
+                if delta_shares >= remaining * 0.9:
+                    # Full or near-full fill detected — stop retrying
                     latency = (time.monotonic() - t0) * 1000
-                    capped = min(delta_shares, contracts)
-                    status = "filled" if capped >= contracts else "partial"
+                    actual_filled = max(cumulative_filled, delta_shares)
+                    status = "filled" if actual_filled >= contracts else "partial"
                     print(f"  [poly-retry]   ON-CHAIN GUARD: balance delta={delta_shares:.2f} "
                           f"shows previous order(s) filled — aborting retries")
+                    if delta_shares > contracts * 1.1:
+                        print(f"  [poly-retry]   WARNING: on-chain delta ({delta_shares:.1f}) exceeds "
+                              f"target ({contracts:.0f}) — possible ghost fills from prior retry")
                     return LegFill(
                         exchange="poly", side=side,
                         planned_price=planned_price, actual_price=planned_price,
-                        planned_contracts=contracts, filled_contracts=capped,
+                        planned_contracts=contracts, filled_contracts=actual_filled,
                         order_id=placed_order_ids[-1], fill_ts=utc_ts(),
                         latency_ms=latency, status=status, error=None,
                     )
@@ -3439,8 +3581,13 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                     remaining = contracts - cumulative_filled
                     print(f"  [poly-retry]   ON-CHAIN: {delta_shares:.1f} already filled, "
                           f"reducing order to {remaining:.0f}")
-            except Exception:
-                pass
+            except Exception as e:
+                # Balance check failed even after retries — do NOT silently continue
+                # placing orders, as this risks ghost fills
+                print(f"  [poly-retry]   WARNING: on-chain guard failed: {e}")
+                print(f"  [poly-retry]   Skipping this retry to avoid potential ghost fill")
+                last_error = f"retry {attempt}: on-chain guard RPC failure"
+                continue
 
         if remaining < 1:
             break
@@ -3557,8 +3704,8 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
         print(f"  [poly-retry]   Timeout, canceling order {order_id}...")
         try:
             client.cancel(order_id)
-        except Exception:
-            pass
+        except Exception as cancel_err:
+            print(f"  [poly-retry]   Cancel failed: {cancel_err} — order may still fill on-chain")
 
         # Post-cancel check: order may have matched on-chain before cancel was processed.
         # Add a short delay so the CLOB API has time to reflect on-chain state.
@@ -3632,15 +3779,15 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             except Exception as e:
                 print(f"  [poly-retry]   Final sweep error for {oid[:12]}: {e}")
         if sweep_total > 0:
-            capped = min(sweep_total, contracts)
-            if sweep_total > contracts:
-                print(f"  [poly-retry]   WARNING: sweep found {sweep_total:.1f} but target was {contracts:.0f} — capping")
+            if sweep_total > contracts * 1.1:
+                print(f"  [poly-retry]   GHOST FILL WARNING: sweep found {sweep_total:.1f} "
+                      f"but target was {contracts:.0f} — reporting actual fills")
             latency = (time.monotonic() - t0) * 1000
-            status = "filled" if capped >= contracts else "partial"
+            status = "filled" if sweep_total >= contracts else "partial"
             return LegFill(
                 exchange="poly", side=side,
                 planned_price=planned_price, actual_price=sweep_avg_price,
-                planned_contracts=contracts, filled_contracts=capped,
+                planned_contracts=contracts, filled_contracts=sweep_total,
                 order_id=sweep_last_oid, fill_ts=utc_ts(),
                 latency_ms=latency, status=status, error=None,
             )
@@ -3652,17 +3799,16 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
     print(f"  [poly-retry] Trades-ledger fallback: querying get_trades(asset_id={token_id[:12]}..., after={epoch_before})...")
     ledger_size, ledger_price = _poly_query_recent_fills(client, token_id, epoch_before)
     if ledger_size > 0:
-        # Cap to target to prevent overfill from aggregating multiple retry orders
-        capped_size = min(ledger_size, contracts)
-        if ledger_size > contracts:
-            print(f"  [poly-retry]   WARNING: ledger shows {ledger_size} but target was {contracts} — capping")
+        if ledger_size > contracts * 1.1:
+            print(f"  [poly-retry]   GHOST FILL WARNING: ledger shows {ledger_size} "
+                  f"but target was {contracts} — reporting actual fills")
         latency = (time.monotonic() - t0) * 1000
-        status = "filled" if capped_size >= contracts else "partial"
-        print(f"  [poly-retry]   TRADES LEDGER: found {capped_size} contracts @ ~${ledger_price:.4f}!")
+        status = "filled" if ledger_size >= contracts else "partial"
+        print(f"  [poly-retry]   TRADES LEDGER: found {ledger_size} contracts @ ~${ledger_price:.4f}!")
         return LegFill(
             exchange="poly", side=side,
             planned_price=planned_price, actual_price=ledger_price,
-            planned_contracts=contracts, filled_contracts=capped_size,
+            planned_contracts=contracts, filled_contracts=ledger_size,
             order_id=placed_order_ids[-1] if placed_order_ids else None,
             fill_ts=utc_ts(),
             latency_ms=latency, status=status, error=None,
@@ -3679,15 +3825,18 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             print(f"  [poly-retry] On-chain balance fallback: before={_ctf_balance_before} "
                   f"after={_ctf_balance_after} delta={delta_shares:.2f} shares")
             if delta_shares > 0:
-                # Cap to target to prevent overfill
-                capped_shares = min(delta_shares, contracts)
+                if delta_shares > contracts * 1.1:
+                    print(f"  [poly-retry]   GHOST FILL WARNING: on-chain delta ({delta_shares:.1f}) "
+                          f"exceeds target ({contracts:.0f}) — reporting ACTUAL fills to prevent "
+                          f"untracked exposure")
+                # Report ACTUAL on-chain fills, not capped — ghost fills must be tracked
                 latency = (time.monotonic() - t0) * 1000
-                status = "filled" if capped_shares >= contracts else "partial"
-                print(f"  [poly-retry]   ON-CHAIN CONFIRMED: {capped_shares:.2f} contracts filled!")
+                status = "filled" if delta_shares >= contracts else "partial"
+                print(f"  [poly-retry]   ON-CHAIN CONFIRMED: {delta_shares:.2f} contracts filled!")
                 return LegFill(
                     exchange="poly", side=side,
                     planned_price=planned_price, actual_price=planned_price,
-                    planned_contracts=contracts, filled_contracts=capped_shares,
+                    planned_contracts=contracts, filled_contracts=delta_shares,
                     order_id=placed_order_ids[-1] if placed_order_ids else None,
                     fill_ts=utc_ts(),
                     latency_ms=latency, status=status, error=None,
