@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.61"
+VERSION = "1.1.62"
 VERSION_DATE = "2026-02-18 UTC"
 
 import requests
@@ -4256,8 +4256,11 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
             print(f"  [poly-retry]   Cancel failed: {cancel_err} — order may still fill on-chain")
 
         # Post-cancel check: order may have matched on-chain before cancel was processed.
-        # Add a short delay so the CLOB API has time to reflect on-chain state.
-        time.sleep(1.0)
+        # Wait 4s (~2 Polygon blocks) so both the CLOB API and on-chain state have
+        # time to reflect fills that were in-flight when the cancel was sent.
+        # Previously 1s — too short, causing ghost fills when the retry placed a
+        # new order before the previous fill settled on-chain.
+        time.sleep(4.0)
         try:
             o = client.get_order(order_id)
             o_status = (o.get("status") or "").lower()
@@ -4283,6 +4286,28 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                 )
         except Exception as e:
             print(f"  [poly-retry]   Post-cancel check failed: {e}")
+
+        # On-chain balance check before next retry — catches fills the CLOB API
+        # missed due to sync lag, preventing ghost fills from redundant orders.
+        if _owner_addr:
+            try:
+                current_bal = _get_ctf_balance(_owner_addr, token_id)
+                delta_shares = (current_bal - _ctf_balance_before) / 1e6
+                if delta_shares > 0:
+                    actual_filled = max(cumulative_filled, delta_shares)
+                    latency = (time.monotonic() - t0) * 1000
+                    status = "filled" if _is_fill_complete(actual_filled, contracts) else "partial"
+                    print(f"  [poly-retry]   POST-CANCEL ON-CHAIN: delta={delta_shares:.2f} shares "
+                          f"— fill detected, stopping retries")
+                    return LegFill(
+                        exchange="poly", side=side,
+                        planned_price=planned_price, actual_price=planned_price,
+                        planned_contracts=contracts, filled_contracts=actual_filled,
+                        order_id=order_id, fill_ts=utc_ts(),
+                        latency_ms=latency, status=status, error=None,
+                    )
+            except Exception as e:
+                print(f"  [poly-retry]   Post-cancel on-chain check failed: {e}")
 
         last_error = f"retry {attempt}: not filled within {POLY_FILL_RETRY_TIMEOUT_S}s"
 
