@@ -342,7 +342,8 @@ def _polygon_rpc(method: str, params: list, _retries: int = 3) -> dict:
         }, timeout=15)
         data = r.json()
         if "error" in data:
-            err_msg = str(data["error"].get("message", ""))
+            err_obj = data["error"]
+            err_msg = str(err_obj.get("message", "")) if isinstance(err_obj, dict) else str(err_obj)
             if "rate limit" in err_msg.lower() and attempt < _retries:
                 wait = 2 ** attempt * 5  # 5s, 10s, 20s
                 print(f"  [rpc] Rate limited, retrying in {wait}s...")
@@ -419,6 +420,15 @@ def _approve_poly_contracts():
 
     acct = Account.from_key(POLY_PRIVATE_KEY)
     addr = acct.address
+
+    # Check POL balance for gas before attempting any approvals
+    pol_balance_hex = _polygon_rpc("eth_getBalance", [addr, "latest"])
+    pol_balance_wei = int(pol_balance_hex, 16)
+    pol_balance = pol_balance_wei / 1e18
+    if pol_balance < 0.01:
+        raise RuntimeError(
+            f"Insufficient POL for gas: {pol_balance:.6f} POL "
+            f"(need ~0.01 POL). Send POL to {addr}")
 
     nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "latest"])
     nonce = int(nonce_hex, 16)
