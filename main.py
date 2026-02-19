@@ -4128,8 +4128,13 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
     if result is not None:
         return result
 
-    # Poll for fill — check immediately, then at intervals
+    # Poll for fill — check immediately, then at intervals.
+    # A crossing limit should fill within 1-2s on Kalshi.  If the order is
+    # still 'resting' after KALSHI_CROSS_DEADLINE_S, it didn't cross — cancel
+    # early rather than wasting the full 15s timeout.
+    KALSHI_CROSS_DEADLINE_S = 3.0
     deadline = time.monotonic() + fill_timeout
+    cross_deadline = time.monotonic() + KALSHI_CROSS_DEADLINE_S
     first_poll = True
     while time.monotonic() < deadline:
         try:
@@ -4138,6 +4143,17 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
             result = _kalshi_order_is_filled(o, contracts, planned_price, order_id)
             if result is not None:
                 return result
+
+            # Early exit: if order is still resting after cross deadline, it
+            # didn't cross the spread — cancel now instead of waiting 15s.
+            o_status_lower = (o.get("status") or "").lower()
+            if (time.monotonic() > cross_deadline
+                    and o_status_lower in ("resting", "open", "pending", "")):
+                fill_count = float(o.get("fill_count", 0))
+                if fill_count == 0:
+                    print(f"  [kalshi-poll] Order still resting after {KALSHI_CROSS_DEADLINE_S}s "
+                          f"— canceling early (didn't cross)")
+                    break  # fall through to timeout/cancel logic below
         except Exception as poll_err:
             print(f"  [kalshi-poll] Poll error (will retry): {poll_err}")
 
@@ -4836,6 +4852,55 @@ def execute_hedge(candidate: HedgeCandidate,
 
     # --- STEP 1: Execute Kalshi FIRST (fast, deterministic fills) ---
     t_total = time.monotonic()
+
+    # Pre-flight: verify Kalshi orderbook has resting liquidity at our price.
+    # The quoted yes_ask/no_ask are indicative — they may be stale or represent
+    # a single contract.  If the book is empty at our price, the limit order
+    # will just rest and time out after 15s, wasting the entire execution window.
+    try:
+        k_ob = kalshi_get_orderbook(kalshi_quote.ticker)
+        k_up_asks, k_down_asks = kalshi_asks_from_orderbook(k_ob)
+        k_asks = k_up_asks if candidate.direction_on_kalshi == "UP" else k_down_asks
+
+        if k_asks:
+            k_best_ask = k_asks[0][0]
+            k_total_size = sum(s for _, s in k_asks)
+            buffered_price = min(candidate.kalshi_price + LIVE_PRICE_BUFFER, 0.99)
+            # Count contracts available at or below our limit price
+            k_crossable = sum(s for p, s in k_asks if p <= buffered_price)
+            print(f"  [exec] Kalshi book: best ask ${k_best_ask:.3f}, "
+                  f"{k_total_size:.0f} total, {k_crossable:.0f} crossable @ ≤${buffered_price:.2f}")
+            if k_crossable < contracts * 0.5:
+                print(f"  [exec] WARNING: Kalshi book only has {k_crossable:.0f} crossable contracts "
+                      f"(need {int(contracts)}) — order likely to rest and timeout")
+                if k_crossable < 1:
+                    # No crossable liquidity at all — skip this trade entirely
+                    print(f"  [exec] No crossable Kalshi liquidity — aborting trade")
+                    skip_fill = LegFill(
+                        exchange="poly", side=candidate.direction_on_poly,
+                        planned_price=candidate.poly_price, actual_price=None,
+                        planned_contracts=0, filled_contracts=0.0,
+                        order_id=None, fill_ts=None,
+                        latency_ms=0.0, status="skipped", error="kalshi book empty",
+                    )
+                    kalshi_skip = LegFill(
+                        exchange="kalshi", side=candidate.direction_on_kalshi,
+                        planned_price=candidate.kalshi_price, actual_price=None,
+                        planned_contracts=0, filled_contracts=0.0,
+                        order_id=None, fill_ts=None,
+                        latency_ms=0.0, status="skipped", error="kalshi book empty",
+                    )
+                    return ExecutionResult(
+                        leg1=skip_fill, leg2=kalshi_skip,
+                        total_latency_ms=0.0,
+                        slippage_poly=0.0, slippage_kalshi=0.0,
+                        both_filled=False,
+                    )
+        else:
+            print(f"  [exec] WARNING: Kalshi orderbook has no ask levels — order may rest")
+    except Exception as e:
+        print(f"  [exec] Kalshi orderbook pre-check failed ({e}), proceeding with order")
+
     print(f"  [exec] STEP 1: KALSHI — Placing {int(contracts)}x "
           f"{'YES' if candidate.direction_on_kalshi == 'UP' else 'NO'} "
           f"@ ${candidate.kalshi_price:.2f}...")
