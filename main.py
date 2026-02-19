@@ -2045,6 +2045,42 @@ def vwap_price_for_notional_asks(levels: List[Tuple[float, float]], target_cost:
     return (avg_price, filled_cost, filled_contracts)
 
 
+def vwap_price_for_n_contracts(levels: List[Tuple[float, float]], target_contracts: float) -> Optional[Tuple[float, float, float]]:
+    """Walk the ask-side book and compute the VWAP to fill *target_contracts* contracts.
+
+    levels: list of (price, size_contracts) sorted best→worst
+    target_contracts: number of contracts to fill
+
+    Returns:
+      (avg_price, filled_cost, filled_contracts)  or  None if insufficient liquidity.
+    """
+    if target_contracts <= 0:
+        return None
+
+    remaining = target_contracts
+    filled_cost = 0.0
+    filled_contracts = 0.0
+
+    for price, size in levels:
+        if price <= 0 or size <= 0:
+            continue
+
+        take = min(size, remaining)
+        cost_here = take * price
+        filled_cost += cost_here
+        filled_contracts += take
+        remaining -= take
+
+        if remaining <= 1e-9:
+            break
+
+    if filled_contracts + 1e-9 < target_contracts:
+        return None
+
+    avg_price = filled_cost / filled_contracts
+    return (avg_price, filled_cost, filled_contracts)
+
+
 # -----------------------------
 # Fee helpers
 # -----------------------------
@@ -4307,11 +4343,16 @@ def _execute_poly_leg(side: str, planned_price: float, contracts: float,
 
 
 def _execute_poly_with_retries(side: str, planned_price: float, contracts: float,
-                               token_id: str) -> LegFill:
+                               token_id: str, edge_price: Optional[float] = None) -> LegFill:
     """Execute Poly leg with fresh orderbook fetches and retries.
 
     On each attempt: fetch fresh asks, place limit at best ask + buffer, poll for fill.
     Returns LegFill with aggregate result across all attempts.
+
+    edge_price: the Poly price the edge was originally calculated on.  When
+        provided, the hard slippage cap is anchored to this price instead of
+        ``planned_price`` (which may have been refreshed to the current
+        best-ask and therefore lost the link to the edge calculation).
     """
     t0 = time.monotonic()
     epoch_before = int(time.time())  # Unix timestamp for get_trades() fallback
@@ -4427,18 +4468,36 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
 
         best_ask = asks[0][0]
 
-        # Enforce slippage cap: reject if market moved too far from planned price
-        max_acceptable = planned_price + POLY_MAX_SLIPPAGE
+        # Enforce slippage cap anchored to the EDGE-CALCULATION price, not the
+        # refreshed best-ask.  This prevents the cap from drifting: if the book
+        # moved 10c between scan and execution, the cap still protects the edge.
+        _cap_anchor = edge_price if edge_price is not None else planned_price
+        max_acceptable = _cap_anchor + POLY_MAX_SLIPPAGE
+
+        # VWAP check: walk the fresh book for the remaining contracts to get
+        # the realistic average fill price.  If VWAP exceeds the cap, skip.
+        vwap_result = vwap_price_for_n_contracts(asks, remaining)
+        if vwap_result is not None:
+            vwap_avg, _, _ = vwap_result
+            if vwap_avg > max_acceptable:
+                last_error = (f"retry {attempt}: VWAP ${vwap_avg:.3f} for {int(remaining)} contracts "
+                              f"exceeds cap ${max_acceptable:.3f} (edge ${_cap_anchor:.3f} + "
+                              f"${POLY_MAX_SLIPPAGE:.3f})")
+                print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
+                      f"SKIP — VWAP ${vwap_avg:.3f} > cap ${max_acceptable:.3f}")
+                time.sleep(0.5)
+                continue
+
         if best_ask > max_acceptable:
             last_error = (f"retry {attempt}: best ask ${best_ask:.3f} exceeds "
-                          f"max acceptable ${max_acceptable:.3f} (planned ${planned_price:.3f} + "
+                          f"max acceptable ${max_acceptable:.3f} (edge ${_cap_anchor:.3f} + "
                           f"${POLY_MAX_SLIPPAGE:.3f} cap)")
             print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
                   f"SKIP — best ask ${best_ask:.3f} > cap ${max_acceptable:.3f}")
             time.sleep(0.5)
             continue
 
-        # Use best ask + small buffer, but cap at planned_price + max slippage
+        # Use best ask + small buffer, but cap at edge_price + max slippage
         limit_price = min(round(best_ask + LIVE_PRICE_BUFFER, 2), round(max_acceptable, 2), 0.99)
         order_size = remaining
 
@@ -4805,26 +4864,56 @@ def execute_hedge(candidate: HedgeCandidate,
             print(f"  [exec] Adjusting Poly target: {int(contracts)} → {int(poly_target)} "
                   f"(matching Kalshi actual fill)")
 
-        # Refresh Poly planned_price from live orderbook so the slippage cap
-        # in _execute_poly_with_retries operates against CURRENT market prices,
-        # not the 30-50s stale scan price.  Re-validate edge before proceeding.
+        # Refresh Poly planned_price from live orderbook.  Use contract-count
+        # VWAP (not just best-ask) so the planned price reflects what we'll
+        # actually pay for poly_target contracts.  The ORIGINAL scan price
+        # (candidate.poly_price) is passed separately as edge_price to anchor
+        # the hard slippage cap in the retry loop.
         fresh_poly_price = candidate.poly_price  # fallback to scan price
+        kalshi_actual = kalshi_fill.actual_price if kalshi_fill.actual_price is not None else candidate.kalshi_price
         try:
             fresh_asks = poly_clob_get_asks(str(poly_token))
             if fresh_asks:
-                fresh_best = fresh_asks[0][0]
-                kalshi_actual = kalshi_fill.actual_price if kalshi_fill.actual_price is not None else candidate.kalshi_price
-                fresh_total = fresh_best + kalshi_actual
-                fresh_gross_edge = 1.0 - fresh_total
-                # Quick edge check: gross edge must cover fees + slippage budget
-                if fresh_gross_edge >= MIN_NET_EDGE * 0.5:  # use half MIN as floor since fees not recalculated
-                    if fresh_best != candidate.poly_price:
-                        print(f"  [exec] Poly price refreshed: ${candidate.poly_price:.3f} → ${fresh_best:.3f} "
-                              f"(Δ${fresh_best - candidate.poly_price:+.3f}, fresh edge {fresh_gross_edge*100:.1f}%)")
-                    fresh_poly_price = fresh_best
+                # Walk the book for the actual number of contracts we'll order
+                vwap_res = vwap_price_for_n_contracts(fresh_asks, poly_target)
+                if vwap_res is not None:
+                    fresh_vwap, _, _ = vwap_res
+                    fresh_total = fresh_vwap + kalshi_actual
+                    fresh_gross_edge = 1.0 - fresh_total
+                    if fresh_gross_edge >= MIN_NET_EDGE * 0.5:
+                        if abs(fresh_vwap - candidate.poly_price) > 0.001:
+                            print(f"  [exec] Poly VWAP refreshed: ${candidate.poly_price:.3f} → "
+                                  f"${fresh_vwap:.3f} for {int(poly_target)} contracts "
+                                  f"(Δ${fresh_vwap - candidate.poly_price:+.3f}, fresh edge {fresh_gross_edge*100:.1f}%)")
+                        fresh_poly_price = fresh_vwap
+                    else:
+                        print(f"  [exec] Fresh VWAP ${fresh_vwap:.3f} + Kalshi ${kalshi_actual:.3f} = "
+                              f"${fresh_total:.3f} — edge gone ({fresh_gross_edge*100:.1f}%), aborting Poly leg")
+                        # Edge is gone — don't place the order, trigger unwind instead
+                        poly_fill = LegFill(
+                            exchange="poly", side=candidate.direction_on_poly,
+                            planned_price=candidate.poly_price, actual_price=None,
+                            planned_contracts=poly_target, filled_contracts=0.0,
+                            order_id=None, fill_ts=None,
+                            latency_ms=0.0, status="skipped",
+                            error=f"fresh VWAP edge gone ({fresh_gross_edge*100:.1f}%)",
+                        )
+                        total_ms = (time.monotonic() - t_total) * 1000
+                        leg1 = poly_fill
+                        leg2 = kalshi_fill
+                        slip_poly = 0.0
+                        slip_kalshi = (leg2.actual_price - leg2.planned_price) if leg2.actual_price is not None else 0.0
+                        return ExecutionResult(
+                            leg1=leg1, leg2=leg2,
+                            total_latency_ms=total_ms,
+                            slippage_poly=slip_poly, slippage_kalshi=slip_kalshi,
+                            both_filled=False,
+                        )
                 else:
-                    print(f"  [exec] Fresh Poly ask ${fresh_best:.3f} + Kalshi ${kalshi_actual:.3f} = "
-                          f"${fresh_total:.3f} — edge gone ({fresh_gross_edge*100:.1f}%), using scan price")
+                    # Not enough liquidity for poly_target contracts
+                    fresh_best = fresh_asks[0][0]
+                    print(f"  [exec] Poly book too thin for {int(poly_target)} contracts "
+                          f"(best ask ${fresh_best:.3f}), using scan price")
         except Exception as e:
             print(f"  [exec] Poly price refresh failed ({e}), using scan price ${candidate.poly_price:.3f}")
 
@@ -4832,6 +4921,7 @@ def execute_hedge(candidate: HedgeCandidate,
         poly_fill = _execute_poly_with_retries(
             candidate.direction_on_poly, fresh_poly_price,
             poly_target, poly_token,
+            edge_price=candidate.poly_price,
         )
 
     total_ms = (time.monotonic() - t_total) * 1000
