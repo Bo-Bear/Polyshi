@@ -211,6 +211,11 @@ MAX_TRADES_PER_COIN = int(os.getenv("MAX_TRADES_PER_COIN", "5"))
 MAX_TRADES_PER_COIN_PER_WINDOW = int(os.getenv("MAX_TRADES_PER_COIN_PER_WINDOW", "6"))
 MAX_CONSECUTIVE_UNWINDS = int(os.getenv("MAX_CONSECUTIVE_UNWINDS", "5"))
 
+# Per-strike concentration limit: max trades on a single Kalshi strike per session.
+# Prevents repeatedly hammering the same strike, which concentrates risk on one
+# settlement outcome and depletes the Poly orderbook at that price level.
+MAX_TRADES_PER_STRIKE = int(os.getenv("MAX_TRADES_PER_STRIKE", "3"))
+
 # Maximum per-coin contract imbalance (Kalshi fills - Poly fills) allowed within a window.
 # If a coin's cumulative imbalance exceeds this, skip new trades for that coin until
 # the window resets.  Prevents compounding directional exposure from repeated partial fills.
@@ -3434,6 +3439,7 @@ def print_session_diagnostics(
     print(f"  POLY_DEPTH_CAP:      {POLY_DEPTH_CAP_RATIO:.0%}")
     print(f"  POLY_MIN_NOTIONAL:   ${POLY_MIN_ORDER_NOTIONAL:.2f}")
     print(f"  SLIPPAGE_BUDGET:     ${EXECUTION_SLIPPAGE_BUDGET:.3f}/contract")
+    print(f"  MAX_TRADES/STRIKE:   {MAX_TRADES_PER_STRIKE}")
 
     # --- Per-Trade Execution Log ---
     print(f"\n--- Execution Log ({len(logged)} trades, {successful_trades} filled, {total_unwinds} unwinds) ---")
@@ -3651,6 +3657,7 @@ def print_session_diagnostics(
             "PRICE_CEILING": PRICE_CEILING,
             "MAX_STRIKE_SPOT_DIVERGENCE": MAX_STRIKE_SPOT_DIVERGENCE,
             "MAX_PROB_DIVERGENCE": MAX_PROB_DIVERGENCE,
+            "MAX_TRADES_PER_STRIKE": MAX_TRADES_PER_STRIKE,
         },
         "exchange_reliability": {
             "kalshi_attempts": kalshi_attempts,
@@ -4382,6 +4389,14 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
 
     cumulative_filled = 0.0  # Track fills across retries to prevent overfill
 
+    # Conservative price estimate for fallback paths where real fill price is
+    # unknown (on-chain balance checks, cumulative tracking).  The limit price
+    # is always capped at cap_anchor + POLY_MAX_SLIPPAGE, so the actual fill
+    # cannot exceed this.  Using this as the fallback prevents inflated
+    # actual_price reports when the refreshed planned_price exceeds the cap.
+    _cap_anchor = edge_price if edge_price is not None else planned_price
+    _fallback_price = min(planned_price, _cap_anchor + POLY_MAX_SLIPPAGE)
+
     for attempt in range(1, POLY_FILL_MAX_RETRIES + 1):
         remaining = contracts - cumulative_filled
         if remaining < 1:
@@ -4432,7 +4447,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                               f"target ({contracts:.0f}) — possible ghost fills from prior retry")
                     return LegFill(
                         exchange="poly", side=side,
-                        planned_price=planned_price, actual_price=planned_price,
+                        planned_price=planned_price, actual_price=_fallback_price,
                         planned_contracts=contracts, filled_contracts=actual_filled,
                         order_id=placed_order_ids[-1], fill_ts=utc_ts(),
                         latency_ms=latency, status=status, error=None,
@@ -4645,7 +4660,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                           f"— fill detected, stopping retries")
                     return LegFill(
                         exchange="poly", side=side,
-                        planned_price=planned_price, actual_price=planned_price,
+                        planned_price=planned_price, actual_price=_fallback_price,
                         planned_contracts=contracts, filled_contracts=actual_filled,
                         order_id=order_id, fill_ts=utc_ts(),
                         latency_ms=latency, status=status, error=None,
@@ -4663,7 +4678,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
         print(f"  [poly-retry] Cumulative fills from retry loop: {capped:.1f}/{contracts:.0f}")
         return LegFill(
             exchange="poly", side=side,
-            planned_price=planned_price, actual_price=planned_price,
+            planned_price=planned_price, actual_price=_fallback_price,
             planned_contracts=contracts, filled_contracts=capped,
             order_id=placed_order_ids[-1] if placed_order_ids else None,
             fill_ts=utc_ts(),
@@ -4752,7 +4767,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                 print(f"  [poly-retry]   ON-CHAIN CONFIRMED: {delta_shares:.2f} contracts filled!")
                 return LegFill(
                     exchange="poly", side=side,
-                    planned_price=planned_price, actual_price=planned_price,
+                    planned_price=planned_price, actual_price=_fallback_price,
                     planned_contracts=contracts, filled_contracts=delta_shares,
                     order_id=placed_order_ids[-1] if placed_order_ids else None,
                     fill_ts=utc_ts(),
@@ -5899,6 +5914,7 @@ def main() -> None:
     print(f"  Poly fill retries:  {POLY_FILL_MAX_RETRIES} attempts x {POLY_FILL_RETRY_TIMEOUT_S:.0f}s each")
     print(f"  Per-coin trade cap: {MAX_TRADES_PER_COIN} trades/coin (incl. unwinds)")
     print(f"  Per-window cap:     {MAX_TRADES_PER_COIN_PER_WINDOW} trades/coin/window (resets each 15m)")
+    print(f"  Per-strike cap:     {MAX_TRADES_PER_STRIKE} trades/strike (concentration limit)")
     print(f"  Max consec unwinds: {MAX_CONSECUTIVE_UNWINDS}/coin before stopping")
     print(f"  Unwind retry sweep: up to {UNWIND_RETRY_MAX_ATTEMPTS} retries, every {UNWIND_RETRY_INTERVAL_S:.0f}s, {UNWIND_RETRY_POLL_S:.0f}s fill timeout")
     print(f"  Startup delay:      {WINDOW_STARTUP_DELAY_S:.0f}s per window (orderbook settling)")
@@ -6024,6 +6040,7 @@ def main() -> None:
     consecutive_skips = 0
 
     # Per-coin tracking
+    strike_trade_counts: Dict[str, int] = {}  # "COIN:strike" -> trade count (per-strike concentration)
     coin_trade_counts: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}
     coin_window_trade_counts: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}  # resets each 15m window
     coin_consecutive_unwinds: Dict[str, int] = {c: 0 for c in AVAILABLE_COINS}
@@ -6351,6 +6368,14 @@ def main() -> None:
                     skip = (skip[0], f"Kalshi fetch failed: {cd['kalshi_err'][:60]}")
                 elif cd["poly_err"]:
                     skip = (skip[0], f"Poly fetch failed: {cd['poly_err'][:60]}")
+
+            # Per-strike concentration limit: avoid hammering the same Kalshi strike
+            if skip is None and kalshi is not None and kalshi.strike is not None:
+                strike_key = f"{coin}:{kalshi.strike}"
+                if strike_trade_counts.get(strike_key, 0) >= MAX_TRADES_PER_STRIKE:
+                    skip = ("strike_concentration",
+                            f"{coin} hit {MAX_TRADES_PER_STRIKE} trades on strike "
+                            f"${float(kalshi.strike):,.2f} — diversifying")
 
             remaining_s = 0
             edge_str = ""
@@ -6784,6 +6809,15 @@ def main() -> None:
             coin_window_trade_counts[traded_coin] = coin_window_trade_counts.get(traded_coin, 0) + 1
             coin_window_edges[traded_coin].append(best_global.net_edge)
 
+            # Per-strike concentration tracking
+            if best_global_kalshi.strike is not None:
+                strike_key = f"{traded_coin}:{best_global_kalshi.strike}"
+                strike_trade_counts[strike_key] = strike_trade_counts.get(strike_key, 0) + 1
+                if strike_trade_counts[strike_key] >= MAX_TRADES_PER_STRIKE:
+                    print(f"  [strike-cap] {traded_coin} strike ${float(best_global_kalshi.strike):,.2f}: "
+                          f"{strike_trade_counts[strike_key]}/{MAX_TRADES_PER_STRIKE} trades — "
+                          f"will diversify to other strikes")
+
             # Track per-exchange fills for window imbalance detection
             # leg1=Poly, leg2=Kalshi (see line mapping after execute_hedge_pair)
             coin_window_kalshi_fills[traded_coin] = (
@@ -6801,8 +6835,8 @@ def main() -> None:
                       f"(Δ{imb:.1f} {heavy}-heavy"
                       f"{', NEAR CAP' if imb > MAX_WINDOW_IMBALANCE * 0.8 else ''})")
 
-            was_unwound = not exec_result.both_filled
-            if was_unwound:
+            if exec_result.unwind_attempted:
+                # Real unwind: one leg filled, other failed — position had to be reversed
                 total_unwinds += 1
                 coin_consecutive_unwinds[traded_coin] = coin_consecutive_unwinds.get(traded_coin, 0) + 1
                 print(f"  [unwind-track] UNWIND COUNT {traded_coin}: "
@@ -6834,6 +6868,11 @@ def main() -> None:
                     ))
                     print(f"  [sweep] Queued {traded_coin} {exec_result.unwind_exchange} "
                           f"{exec_result.unwind_contracts:.0f} contracts for background retry")
+            elif not exec_result.both_filled:
+                # Both legs failed (e.g. Kalshi timeout + Poly skipped) — no exposure
+                # created, so don't count as an unwind (no position to reverse).
+                # Don't increment coin_consecutive_unwinds since no risk was taken.
+                pass
             else:
                 coin_consecutive_unwinds[traded_coin] = 0  # reset on success
 
