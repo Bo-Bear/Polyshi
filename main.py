@@ -425,7 +425,8 @@ def _approve_poly_contracts():
     pol_balance_hex = _polygon_rpc("eth_getBalance", [addr, "latest"])
     pol_balance_wei = int(pol_balance_hex, 16)
     pol_balance = pol_balance_wei / 1e18
-    if pol_balance < 0.01:
+    print(f"         POL balance: {pol_balance:.4f} (for gas)")
+    if pol_balance < 0.005:
         raise RuntimeError(
             f"Insufficient POL for gas: {pol_balance:.6f} POL "
             f"(need ~0.01 POL). Send POL to {addr}")
