@@ -331,7 +331,7 @@ _POLY_SPENDERS = [
 
 # ERC-20 approve(address,uint256) selector: 0x095ea7b3
 # ERC-1155 setApprovalForAll(address,bool) selector: 0xa22cb465
-_POLYGON_RPC = "https://polygon-rpc.com"
+_POLYGON_RPC = os.getenv("POLYGON_RPC_URL", "https://rpc.ankr.com/polygon")
 
 
 def _polygon_rpc(method: str, params: list, _retries: int = 3) -> dict:
