@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.66"
+VERSION = "1.1.67"
 VERSION_DATE = "2026-02-19 UTC"
 
 import requests
