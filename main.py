@@ -98,6 +98,13 @@ MAX_PROB_DIVERGENCE = float(os.getenv("MAX_PROB_DIVERGENCE", "0.15"))  # 15 perc
 # At 0.1% (~$95 on BTC), both-lose probability drops to ~12%.
 MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.001"))
 
+# Maximum dead-zone gap (in dollars) between Kalshi strike and Poly reference price.
+# A "dead zone" is a price range where BOTH hedge legs lose.  It arises when the
+# chosen combo's win ranges don't overlap (e.g., K_DOWN wins if price < strike,
+# P_UP wins if price > ref, but strike < ref → gap).  Reject the combo if the gap
+# exceeds this tolerance.  Small default allows for minor rounding between exchanges.
+MAX_DEAD_ZONE_DOLLARS = float(os.getenv("MAX_DEAD_ZONE_DOLLARS", "0.25"))
+
 # Minimum account balance — stop session if either exchange drops below this ($)
 MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
 
@@ -1198,6 +1205,7 @@ class PolyMarketQuote:
     description: str = ""  # resolution criteria text (may contain reference price)
     up_token_id: str = ""   # CLOB token ID for UP outcome
     down_token_id: str = "" # CLOB token ID for DOWN outcome
+    ref_price: Optional[float] = None  # resolution reference price (parsed from description)
 
 
 @dataclass
@@ -1215,6 +1223,7 @@ class HedgeCandidate:
     extras: float
     poly_ref: str
     kalshi_ref: str
+    dead_zone_dollars: float = 0.0  # gap ($) where both legs lose; 0 = overlap or unknown
 
 
 @dataclass
@@ -2605,6 +2614,7 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
 
         # Try to extract description (may contain "price to beat" or reference price)
         desc = m0.get("description") or e.get("description") or ""
+        ref_price = _parse_price_from_description(desc)
 
         return PolyMarketQuote(
             event_slug=e.get("slug") or "",
@@ -2616,6 +2626,7 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
             description=desc,
             up_token_id=outcome_to_token["up"],
             down_token_id=outcome_to_token["down"],
+            ref_price=ref_price,
         )
 
 
@@ -2626,7 +2637,8 @@ def extract_poly_quote_for_coin(events: List[dict], coin: str) -> Optional[PolyM
 # -----------------------------
 # Hedge logic
 # -----------------------------
-def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQuote) -> Tuple[Optional[HedgeCandidate], List[HedgeCandidate]]:
+def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQuote,
+                        poly_ref_price: Optional[float] = None) -> Tuple[Optional[HedgeCandidate], List[HedgeCandidate]]:
     # Interpret Kalshi YES as "Up", NO as "Down" for Up/Down markets.
     kalshi_up = kalshi.yes_ask
     kalshi_down = kalshi.no_ask
@@ -2637,6 +2649,33 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
         poly_fee = poly_taker_fee_usdc(poly_price, PAPER_CONTRACTS) if INCLUDE_POLY_FEES else 0.0
         kalshi_fee = kalshi_taker_fee_usd(kalshi_price, PAPER_CONTRACTS) if INCLUDE_KALSHI_FEES else 0.0
         return poly_fee, kalshi_fee
+
+    # --- Dead-zone calculation setup ---
+    # Parse Kalshi strike as float for gap computation.
+    kalshi_strike: Optional[float] = None
+    if kalshi.strike is not None:
+        try:
+            kalshi_strike = float(kalshi.strike)
+        except (ValueError, TypeError):
+            pass
+    # Best reference price: explicit Poly ref → caller-supplied spot fallback.
+    ref = poly_ref_price
+
+    def _dead_zone(direction_on_kalshi: str) -> float:
+        """Return the dead-zone gap in dollars for a given combo.
+
+        K_DOWN (NO)  + P_UP:   K wins if price < strike, P wins if price > ref
+                                gap exists when strike < ref  → gap = ref - strike
+        K_UP   (YES) + P_DOWN: K wins if price ≥ strike, P wins if price ≤ ref
+                                gap exists when ref < strike  → gap = strike - ref
+        Returns 0.0 when strikes overlap or when we lack data to compute.
+        """
+        if kalshi_strike is None or ref is None:
+            return 0.0
+        if direction_on_kalshi == "DOWN":
+            return max(0.0, ref - kalshi_strike)
+        else:
+            return max(0.0, kalshi_strike - ref)
 
     cands: List[HedgeCandidate] = []
 
@@ -2661,6 +2700,7 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
             extras=extras,
             poly_ref=f"{poly.event_slug}/{poly.market_slug}",
             kalshi_ref=kalshi.ticker,
+            dead_zone_dollars=_dead_zone("DOWN"),
         )
     )
 
@@ -2685,13 +2725,15 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
             extras=extras,
             poly_ref=f"{poly.event_slug}/{poly.market_slug}",
             kalshi_ref=kalshi.ticker,
+            dead_zone_dollars=_dead_zone("UP"),
         )
     )
 
     # Fee-aware viability with execution safeguards:
     viable = [c for c in cands if c.total_cost < MAX_TOTAL_COST
               and c.net_edge >= MIN_NET_EDGE
-              and c.net_edge <= MAX_NET_EDGE]  # skip outliers (likely stale data)
+              and c.net_edge <= MAX_NET_EDGE      # skip outliers (likely stale data)
+              and c.dead_zone_dollars <= MAX_DEAD_ZONE_DOLLARS]  # reject gap trades
     if not viable:
         return None, cands
 
@@ -6619,7 +6661,10 @@ def main() -> None:
 
             # Compute edge if no safeguard skip
             if skip is None:
-                best_for_coin, all_combos = best_hedge_for_coin(coin, poly, kalshi)
+                # Best available Poly reference price: parsed from description → spot fallback
+                _poly_ref = poly.ref_price if poly.ref_price is not None else spot_prices.get(coin)
+                best_for_coin, all_combos = best_hedge_for_coin(coin, poly, kalshi,
+                                                                 poly_ref_price=_poly_ref)
                 if best_for_coin is None:
                     # Find best combo to show its edge even when skipping
                     best_combo_edge = max((c.net_edge for c in all_combos), default=0) if all_combos else 0
@@ -6627,8 +6672,22 @@ def main() -> None:
                     if best_combo:
                         strategy = f"K_{best_combo.direction_on_kalshi}+P_{best_combo.direction_on_poly}"
                         edge_str = f"{best_combo.net_edge * 100:+.1f}% via {strategy}"
-                    skip = ("no_viable_edge",
-                            f"Edge too low ({edge_str or 'none'} < {pct(MIN_NET_EDGE)} for {coin})")
+
+                    # Distinguish dead-zone rejection from low-edge rejection
+                    dz_rejected = [c for c in all_combos
+                                   if c.dead_zone_dollars > MAX_DEAD_ZONE_DOLLARS
+                                   and c.net_edge >= MIN_NET_EDGE
+                                   and c.total_cost < MAX_TOTAL_COST]
+                    if dz_rejected:
+                        worst_gap = max(c.dead_zone_dollars for c in dz_rejected)
+                        _k_str = f"K${float(kalshi.strike):,.2f}" if kalshi.strike else "K?"
+                        _p_str = f"P${_poly_ref:,.2f}" if _poly_ref else "P?"
+                        skip = ("dead_zone",
+                                f"Dead zone ${worst_gap:,.2f} > ${MAX_DEAD_ZONE_DOLLARS:.2f} "
+                                f"({_k_str} vs {_p_str}) — both legs can lose")
+                    else:
+                        skip = ("no_viable_edge",
+                                f"Edge too low ({edge_str or 'none'} < {pct(MIN_NET_EDGE)} for {coin})")
                 else:
                     strategy = f"K_{best_for_coin.direction_on_kalshi}+P_{best_for_coin.direction_on_poly}"
                     safe_tag = ""
