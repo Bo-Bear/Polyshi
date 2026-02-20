@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-VERSION = "1.1.67"
-VERSION_DATE = "2026-02-19 UTC"
+VERSION = "1.1.68"
+VERSION_DATE = "2026-02-20 UTC"
 
 import requests
 from dotenv import load_dotenv
@@ -203,6 +203,9 @@ LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.02"))  # 2 cents
 # Maximum slippage allowed above planned price on Polymarket.
 # If the best ask has moved more than this above planned_price, skip the fill attempt.
 POLY_MAX_SLIPPAGE = float(os.getenv("POLY_MAX_SLIPPAGE", "0.02"))  # 2 cents
+# Buffer added above the worst orderbook level when using VWAP pricing on Kalshi.
+# Covers book movement between VWAP calculation and order arrival.
+KALSHI_OB_BUFFER = float(os.getenv("KALSHI_OB_BUFFER", "0.02"))  # 2 cents
 
 # Poly orderbook-aware retry config (used when Kalshi fills first)
 POLY_FILL_MAX_RETRIES = int(os.getenv("POLY_FILL_MAX_RETRIES", "5"))
@@ -2057,14 +2060,15 @@ def vwap_price_for_notional_asks(levels: List[Tuple[float, float]], target_cost:
     return (avg_price, filled_cost, filled_contracts)
 
 
-def vwap_price_for_n_contracts(levels: List[Tuple[float, float]], target_contracts: float) -> Optional[Tuple[float, float, float]]:
+def vwap_price_for_n_contracts(levels: List[Tuple[float, float]], target_contracts: float) -> Optional[Tuple[float, float, float, float]]:
     """Walk the ask-side book and compute the VWAP to fill *target_contracts* contracts.
 
     levels: list of (price, size_contracts) sorted best→worst
     target_contracts: number of contracts to fill
 
     Returns:
-      (avg_price, filled_cost, filled_contracts)  or  None if insufficient liquidity.
+      (avg_price, filled_cost, filled_contracts, worst_price)  or  None if insufficient liquidity.
+      worst_price is the highest level price needed to complete the fill.
     """
     if target_contracts <= 0:
         return None
@@ -2072,6 +2076,7 @@ def vwap_price_for_n_contracts(levels: List[Tuple[float, float]], target_contrac
     remaining = target_contracts
     filled_cost = 0.0
     filled_contracts = 0.0
+    worst_price = 0.0
 
     for price, size in levels:
         if price <= 0 or size <= 0:
@@ -2081,6 +2086,7 @@ def vwap_price_for_n_contracts(levels: List[Tuple[float, float]], target_contrac
         cost_here = take * price
         filled_cost += cost_here
         filled_contracts += take
+        worst_price = price
         remaining -= take
 
         if remaining <= 1e-9:
@@ -2090,7 +2096,7 @@ def vwap_price_for_n_contracts(levels: List[Tuple[float, float]], target_contrac
         return None
 
     avg_price = filled_cost / filled_contracts
-    return (avg_price, filled_cost, filled_contracts)
+    return (avg_price, filled_cost, filled_contracts, worst_price)
 
 
 # -----------------------------
@@ -3442,6 +3448,7 @@ def print_session_diagnostics(
     print(f"  MAX_STRIKE_SPOT_DIV: {pct(MAX_STRIKE_SPOT_DIVERGENCE)}")
     print(f"  ORDER_TIMEOUT_S:     {ORDER_TIMEOUT_S:.0f}s")
     print(f"  LIVE_PRICE_BUFFER:   ${LIVE_PRICE_BUFFER:.3f}")
+    print(f"  KALSHI_OB_BUFFER:    ${KALSHI_OB_BUFFER:.3f}")
     print(f"  POLY_FILL_RETRIES:   {POLY_FILL_MAX_RETRIES}")
     print(f"  POLY_DEPTH_CAP:      {POLY_DEPTH_CAP_RATIO:.0%}")
     print(f"  POLY_MIN_NOTIONAL:   ${POLY_MIN_ORDER_NOTIONAL:.2f}")
@@ -3653,6 +3660,7 @@ def print_session_diagnostics(
             "PAPER_CONTRACTS": PAPER_CONTRACTS,
             "ORDER_TIMEOUT_S": ORDER_TIMEOUT_S,
             "LIVE_PRICE_BUFFER": LIVE_PRICE_BUFFER,
+            "KALSHI_OB_BUFFER": KALSHI_OB_BUFFER,
             "POLY_FILL_MAX_RETRIES": POLY_FILL_MAX_RETRIES,
             "POLY_DEPTH_CAP_RATIO": POLY_DEPTH_CAP_RATIO,
             "POLY_MIN_ORDER_NOTIONAL": POLY_MIN_ORDER_NOTIONAL,
@@ -3758,6 +3766,7 @@ def replay_session_diagnostics(diag: dict, trade_rows: List[dict]) -> None:
     print(f"  MAX_STRIKE_SPOT_DIV: {_fmt_pct(cfg.get('MAX_STRIKE_SPOT_DIVERGENCE', 0))}")
     print(f"  ORDER_TIMEOUT_S:     {cfg.get('ORDER_TIMEOUT_S', 0):.0f}s")
     print(f"  LIVE_PRICE_BUFFER:   ${cfg.get('LIVE_PRICE_BUFFER', 0):.3f}")
+    print(f"  KALSHI_OB_BUFFER:    ${cfg.get('KALSHI_OB_BUFFER', 0):.3f}")
     print(f"  POLY_FILL_RETRIES:   {cfg.get('POLY_FILL_MAX_RETRIES', 0)}")
     print(f"  POLY_DEPTH_CAP:      {cfg.get('POLY_DEPTH_CAP_RATIO', 0):.0%}")
     print(f"  POLY_MIN_NOTIONAL:   ${cfg.get('POLY_MIN_ORDER_NOTIONAL', 1.0):.2f}")
@@ -4123,18 +4132,20 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
         if asks:
             vwap_result = vwap_price_for_n_contracts(asks, contracts)
             if vwap_result is not None:
-                vwap_avg, _, _ = vwap_result
-                # Set limit at VWAP + 1 cent buffer to ensure we cross all levels
-                ob_price = min(vwap_avg + 0.01, 0.99)
+                vwap_avg, _, _, worst_lvl = vwap_result
+                # Set limit above the worst book level we need to cross, not the average.
+                # CLOB gives price improvement, so we'll still fill at VWAP or better.
+                ob_price = min(worst_lvl + KALSHI_OB_BUFFER, 0.99)
                 # Safety: don't let orderbook price exceed planned + max acceptable slippage
                 max_acceptable = planned_price + POLY_MAX_SLIPPAGE + LIVE_PRICE_BUFFER
                 if ob_price <= max_acceptable:
                     if abs(ob_price - buffered) > 0.001:
-                        print(f"  [kalshi-ob] Orderbook VWAP ${vwap_avg:.3f} for {int(contracts)} contracts — "
-                              f"limit ${ob_price:.3f} (was ${buffered:.3f}, Δ${ob_price - buffered:+.3f})")
+                        print(f"  [kalshi-ob] VWAP ${vwap_avg:.3f}, worst level ${worst_lvl:.3f} "
+                              f"for {int(contracts)} contracts — limit ${ob_price:.3f} "
+                              f"(was ${buffered:.3f}, Δ${ob_price - buffered:+.3f})")
                     buffered = ob_price
                 else:
-                    print(f"  [kalshi-ob] Orderbook VWAP ${vwap_avg:.3f} → limit ${ob_price:.3f} "
+                    print(f"  [kalshi-ob] Worst level ${worst_lvl:.3f} → limit ${ob_price:.3f} "
                           f"exceeds max ${max_acceptable:.3f} — using fallback ${buffered:.3f}")
             else:
                 print(f"  [kalshi-ob] Insufficient orderbook depth for {int(contracts)} contracts — "
@@ -4532,7 +4543,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
         # the realistic average fill price.  If VWAP exceeds the cap, skip.
         vwap_result = vwap_price_for_n_contracts(asks, remaining)
         if vwap_result is not None:
-            vwap_avg, _, _ = vwap_result
+            vwap_avg, _, _, _ = vwap_result
             if vwap_avg > max_acceptable:
                 last_error = (f"retry {attempt}: VWAP ${vwap_avg:.3f} for {int(remaining)} contracts "
                               f"exceeds cap ${max_acceptable:.3f} (edge ${_cap_anchor:.3f} + "
@@ -4916,7 +4927,7 @@ def execute_hedge(candidate: HedgeCandidate,
             preflight_cap = candidate.poly_price + POLY_MAX_SLIPPAGE
             preflight_vwap = vwap_price_for_n_contracts(preflight_asks, contracts)
             if preflight_vwap is not None:
-                pf_avg, _, _ = preflight_vwap
+                pf_avg, _, _, _ = preflight_vwap
                 if pf_avg > preflight_cap:
                     print(f"  [preflight] VWAP ${pf_avg:.3f} for {int(contracts)} contracts "
                           f"exceeds cap ${preflight_cap:.3f} (edge ${candidate.poly_price:.3f} + "
@@ -5016,7 +5027,7 @@ def execute_hedge(candidate: HedgeCandidate,
                 # Walk the book for the actual number of contracts we'll order
                 vwap_res = vwap_price_for_n_contracts(fresh_asks, poly_target)
                 if vwap_res is not None:
-                    fresh_vwap, _, _ = vwap_res
+                    fresh_vwap, _, _, _ = vwap_res
                     fresh_total = fresh_vwap + kalshi_actual
                     fresh_gross_edge = 1.0 - fresh_total
                     if fresh_gross_edge >= MIN_NET_EDGE * 0.5:
@@ -6053,6 +6064,7 @@ def main() -> None:
     print(f"  Min leg notional:   ${MIN_LEG_NOTIONAL:.0f} (skip thin books)")
     print(f"  Max slippage:       ${POLY_MAX_SLIPPAGE:.2f} (Poly fill rejection)")
     print(f"  Fill price buffer:  ${LIVE_PRICE_BUFFER:.2f} (limit order cushion)")
+    print(f"  Kalshi OB buffer:   ${KALSHI_OB_BUFFER:.2f} (above worst book level)")
     print(f"  Session drawdown:   ${MAX_SESSION_DRAWDOWN:.2f} max loss before auto-stop")
     print(f"  Balance floor:      ${MIN_ACCOUNT_BALANCE:.2f} per account (stop if either drops below)")
     print(f"  Consec loss stop:   2 losing 15m windows in a row → stop")
@@ -6810,6 +6822,7 @@ def main() -> None:
                     "INCLUDE_POLY_FEES": INCLUDE_POLY_FEES,
                     "INCLUDE_KALSHI_FEES": INCLUDE_KALSHI_FEES,
                     "USE_VWAP_DEPTH": USE_VWAP_DEPTH,
+                    "KALSHI_OB_BUFFER": KALSHI_OB_BUFFER,
                     "MIN_LEG_NOTIONAL": MIN_LEG_NOTIONAL,
                     "ORDER_TIMEOUT_S": ORDER_TIMEOUT_S,
                 },
