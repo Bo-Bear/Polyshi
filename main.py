@@ -101,6 +101,13 @@ MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.00
 # Minimum account balance — stop session if either exchange drops below this ($)
 MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
 
+# Dead zone hours (UTC) — low-volume, low-edge hours where new trading is not worthwhile.
+# Sessions won't start during these hours, and running sessions stop after the current
+# market window closes if the next window falls in dead hours.
+# Default: 6-20 UTC = 12AM-2PM CST (covers the 10AM-2PM dead zone with margin).
+_dead_zone_raw = os.getenv("DEAD_ZONE_HOURS_UTC", "6,7,8,9,10,11,12,13,14,15,16,17,18,19")
+DEAD_ZONE_HOURS_UTC: set[int] = set(int(h.strip()) for h in _dead_zone_raw.split(",") if h.strip()) if _dead_zone_raw.strip() else set()
+
 # -----------------------------
 # Fees (paper-trade model)
 # -----------------------------
@@ -5883,6 +5890,22 @@ def main() -> None:
 
     session_duration_s = prompt_session_duration()
 
+    # Dead zone guard: block session starts during low-volume hours
+    if DEAD_ZONE_HOURS_UTC:
+        current_hour_utc = datetime.now(timezone.utc).hour
+        if current_hour_utc in DEAD_ZONE_HOURS_UTC:
+            dz_sorted = sorted(DEAD_ZONE_HOURS_UTC)
+            print(f"\n*** DEAD ZONE — UTC hour {current_hour_utc} is in DEAD_ZONE_HOURS_UTC ***")
+            print(f"  Dead hours (UTC): {', '.join(f'{h:02d}:00' for h in dz_sorted)}")
+            # Find next allowed hour
+            all_hours = set(range(24))
+            allowed = sorted(all_hours - DEAD_ZONE_HOURS_UTC)
+            future_allowed = [h for h in allowed if h > current_hour_utc]
+            next_ok = future_allowed[0] if future_allowed else allowed[0]
+            print(f"  Next allowed start: {next_ok:02d}:00 UTC")
+            print(f"  Override with DEAD_ZONE_HOURS_UTC=\"\" to disable.")
+            return
+
     print("\nConfirm settings")
     print("=" * 45)
     mode_label = "*** LIVE TRADING ***" if EXEC_MODE == "live" else "Paper Testing"
@@ -5920,6 +5943,11 @@ def main() -> None:
     print(f"  Startup delay:      {WINDOW_STARTUP_DELAY_S:.0f}s per window (orderbook settling)")
     print(f"  Window align tol:   {WINDOW_ALIGN_TOLERANCE_SECONDS}s (cross-exchange close time)")
     print(f"  Slippage budget:    ${EXECUTION_SLIPPAGE_BUDGET:.2f}/contract (subtracted from net edge)")
+    if DEAD_ZONE_HOURS_UTC:
+        dz_sorted = sorted(DEAD_ZONE_HOURS_UTC)
+        print(f"  Dead zone (UTC):    {dz_sorted[0]:02d}:00-{dz_sorted[-1]:02d}:59 (stop at window close if in dead hours)")
+    else:
+        print(f"  Dead zone:          disabled")
 
     # Start Polymarket CLOB WebSocket for real-time orderbook data
     global _poly_ws
@@ -6194,6 +6222,13 @@ def main() -> None:
                 coin_window_edges[c] = []
                 coin_window_kalshi_fills[c] = 0.0
                 coin_window_poly_fills[c] = 0.0
+
+            # Dead zone check: if the next window falls in dead hours, stop gracefully
+            if not stop_reason and DEAD_ZONE_HOURS_UTC:
+                next_hour_utc = datetime.now(timezone.utc).hour
+                if next_hour_utc in DEAD_ZONE_HOURS_UTC:
+                    stop_reason = (f"dead_zone_reached: UTC hour {next_hour_utc} "
+                                   f"is in DEAD_ZONE_HOURS_UTC")
 
             if stop_reason:
                 print(f"\n*** {stop_reason} — stopping session ***")
