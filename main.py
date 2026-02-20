@@ -4873,6 +4873,74 @@ def execute_hedge(candidate: HedgeCandidate,
     else:
         poly_token = poly_quote.down_token_id
 
+    # --- PRE-FLIGHT: VWAP feasibility check BEFORE committing to Kalshi ---
+    # Verify that the Poly book can currently fill at a price within our
+    # slippage cap.  This prevents the scenario where Kalshi fills successfully
+    # but every Poly retry fails with "VWAP exceeds cap", forcing an unwind.
+    # Uses the WS-cached orderbook (near-zero latency).
+    try:
+        preflight_asks = poly_clob_get_asks(str(poly_token))
+        if preflight_asks:
+            preflight_cap = candidate.poly_price + POLY_MAX_SLIPPAGE
+            preflight_vwap = vwap_price_for_n_contracts(preflight_asks, contracts)
+            if preflight_vwap is not None:
+                pf_avg, _, _ = preflight_vwap
+                if pf_avg > preflight_cap:
+                    print(f"  [preflight] VWAP ${pf_avg:.3f} for {int(contracts)} contracts "
+                          f"exceeds cap ${preflight_cap:.3f} (edge ${candidate.poly_price:.3f} + "
+                          f"${POLY_MAX_SLIPPAGE:.3f}) — skipping trade to avoid unwind")
+                    skip_fill = LegFill(
+                        exchange="poly", side=candidate.direction_on_poly,
+                        planned_price=candidate.poly_price, actual_price=None,
+                        planned_contracts=contracts, filled_contracts=0.0,
+                        order_id=None, fill_ts=None,
+                        latency_ms=0.0, status="skipped",
+                        error=f"preflight: VWAP ${pf_avg:.3f} exceeds cap ${preflight_cap:.3f}",
+                    )
+                    kalshi_skip = LegFill(
+                        exchange="kalshi", side=candidate.direction_on_kalshi,
+                        planned_price=candidate.kalshi_price, actual_price=None,
+                        planned_contracts=contracts, filled_contracts=0.0,
+                        order_id=None, fill_ts=None,
+                        latency_ms=0.0, status="skipped",
+                        error="preflight: poly VWAP exceeds cap",
+                    )
+                    return ExecutionResult(
+                        leg1=skip_fill, leg2=kalshi_skip,
+                        total_latency_ms=0.0,
+                        slippage_poly=0.0, slippage_kalshi=0.0,
+                        both_filled=False,
+                    )
+                else:
+                    print(f"  [preflight] Poly VWAP ${pf_avg:.3f} within cap ${preflight_cap:.3f} — OK")
+            else:
+                print(f"  [preflight] Poly book can't fill {int(contracts)} contracts — "
+                      f"skipping trade to avoid unwind")
+                skip_fill = LegFill(
+                    exchange="poly", side=candidate.direction_on_poly,
+                    planned_price=candidate.poly_price, actual_price=None,
+                    planned_contracts=contracts, filled_contracts=0.0,
+                    order_id=None, fill_ts=None,
+                    latency_ms=0.0, status="skipped",
+                    error="preflight: insufficient poly liquidity",
+                )
+                kalshi_skip = LegFill(
+                    exchange="kalshi", side=candidate.direction_on_kalshi,
+                    planned_price=candidate.kalshi_price, actual_price=None,
+                    planned_contracts=contracts, filled_contracts=0.0,
+                    order_id=None, fill_ts=None,
+                    latency_ms=0.0, status="skipped",
+                    error="preflight: insufficient poly liquidity",
+                )
+                return ExecutionResult(
+                    leg1=skip_fill, leg2=kalshi_skip,
+                    total_latency_ms=0.0,
+                    slippage_poly=0.0, slippage_kalshi=0.0,
+                    both_filled=False,
+                )
+    except Exception as e:
+        print(f"  [preflight] VWAP check failed ({e}), proceeding with caution")
+
     # --- STEP 1: Execute Kalshi FIRST (fast, deterministic fills) ---
     t_total = time.monotonic()
     print(f"  [exec] STEP 1: KALSHI — Placing {int(contracts)}x "
