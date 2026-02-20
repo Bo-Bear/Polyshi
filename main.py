@@ -255,6 +255,19 @@ def _get_session() -> requests.Session:
     return _http_session
 
 
+def _reset_session() -> None:
+    """Close and discard the HTTP session so the next _get_session() creates
+    a fresh one with new TCP/TLS connections.  Call between market windows
+    to prevent stale keep-alive connections from degrading latency."""
+    global _http_session
+    if _http_session is not None:
+        try:
+            _http_session.close()
+        except Exception:
+            pass
+        _http_session = None
+
+
 _clob_working_route_idx: Optional[int] = None
 
 # -----------------------------
@@ -6354,6 +6367,9 @@ def main() -> None:
             window_trades = []
             current_window_close_ts = None  # Will be set from next market data
             window_open_utc = None  # Reset so startup delay triggers for new window
+            # Fresh HTTP connections for the new window — prevents stale keep-alive
+            # connections from degrading Kalshi/Poly API latency across windows.
+            _reset_session()
             # Reset per-window trade limits and edge history so coins can trade again
             for c in coin_window_trade_counts:
                 coin_window_trade_counts[c] = 0
