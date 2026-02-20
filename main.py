@@ -4481,7 +4481,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
         if not asks:
             last_error = f"retry {attempt}: empty orderbook"
             print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: no asks available")
-            time.sleep(0.5)
+            time.sleep(0.3)
             continue
 
         # Display orderbook levels (up to 3)
@@ -4507,7 +4507,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                               f"${POLY_MAX_SLIPPAGE:.3f})")
                 print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
                       f"SKIP — VWAP ${vwap_avg:.3f} > cap ${max_acceptable:.3f}")
-                time.sleep(0.5)
+                time.sleep(0.3)
                 continue
 
         if best_ask > max_acceptable:
@@ -4516,7 +4516,7 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
                           f"${POLY_MAX_SLIPPAGE:.3f} cap)")
             print(f"  [poly-retry] Attempt {attempt}/{POLY_FILL_MAX_RETRIES}: "
                   f"SKIP — best ask ${best_ask:.3f} > cap ${max_acceptable:.3f}")
-            time.sleep(0.5)
+            time.sleep(0.3)
             continue
 
         # Use best ask + small buffer, but cap at edge_price + max slippage
@@ -4621,59 +4621,76 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
         except Exception as cancel_err:
             print(f"  [poly-retry]   Cancel failed: {cancel_err} — order may still fill on-chain")
 
-        # Post-cancel check: order may have matched on-chain before cancel was processed.
-        # Wait 4s (~2 Polygon blocks) so both the CLOB API and on-chain state have
-        # time to reflect fills that were in-flight when the cancel was sent.
-        # Previously 1s — too short, causing ghost fills when the retry placed a
-        # new order before the previous fill settled on-chain.
-        time.sleep(4.0)
-        try:
-            o = client.get_order(order_id)
-            o_status = (o.get("status") or "").lower()
-            raw_matched = o.get("size_matched")
-            matched_size = float(raw_matched) if raw_matched and float(raw_matched) > 0 else 0.0
-            trades_size = _poly_fill_size_from_trades(o)
-            print(f"  [poly-retry]   Post-cancel status={o_status} size_matched={raw_matched} trades_size={trades_size}")
+        # Post-cancel settlement: poll CLOB API + on-chain balance every ~1s
+        # for up to 4s to detect in-flight fills.  Previously a flat 4s sleep —
+        # now breaks early once we get a definitive answer (fill or no-fill),
+        # saving 2-3s on the common path where the order simply didn't match.
+        _settle_deadline = time.monotonic() + 4.0
+        _settle_confirmed = False
+        _settle_pass = 0
+        while time.monotonic() < _settle_deadline:
+            _settle_pass += 1
+            time.sleep(1.0)  # Wait ~1 Polygon block between checks
 
-            if o_status in ("matched", "filled") or matched_size > 0 or trades_size > 0:
-                filled_size = (matched_size if matched_size > 0
-                               else trades_size if trades_size > 0
-                               else float(o.get("original_size", contracts)))
-                avg_price = _poly_avg_fill_price(o, planned_price)
-                latency = (time.monotonic() - t0) * 1000
-                status = "filled" if _is_fill_complete(filled_size, contracts) else "partial"
-                print(f"  [poly-retry]   Order was actually {status}! {filled_size} contracts @ ~${avg_price:.4f}")
-                return LegFill(
-                    exchange="poly", side=side,
-                    planned_price=planned_price, actual_price=avg_price,
-                    planned_contracts=contracts, filled_contracts=filled_size,
-                    order_id=order_id, fill_ts=utc_ts(),
-                    latency_ms=latency, status=status, error=None,
-                )
-        except Exception as e:
-            print(f"  [poly-retry]   Post-cancel check failed: {e}")
-
-        # On-chain balance check before next retry — catches fills the CLOB API
-        # missed due to sync lag, preventing ghost fills from redundant orders.
-        if _owner_addr:
+            # Check CLOB API for fill status
             try:
-                current_bal = _get_ctf_balance(_owner_addr, token_id)
-                delta_shares = (current_bal - _ctf_balance_before) / 1e6
-                if delta_shares > 0:
-                    actual_filled = max(cumulative_filled, delta_shares)
+                o = client.get_order(order_id)
+                o_status = (o.get("status") or "").lower()
+                raw_matched = o.get("size_matched")
+                matched_size = float(raw_matched) if raw_matched and float(raw_matched) > 0 else 0.0
+                trades_size = _poly_fill_size_from_trades(o)
+
+                if o_status in ("matched", "filled") or matched_size > 0 or trades_size > 0:
+                    filled_size = (matched_size if matched_size > 0
+                                   else trades_size if trades_size > 0
+                                   else float(o.get("original_size", contracts)))
+                    avg_price = _poly_avg_fill_price(o, planned_price)
                     latency = (time.monotonic() - t0) * 1000
-                    status = "filled" if _is_fill_complete(actual_filled, contracts) else "partial"
-                    print(f"  [poly-retry]   POST-CANCEL ON-CHAIN: delta={delta_shares:.2f} shares "
-                          f"— fill detected, stopping retries")
+                    status = "filled" if _is_fill_complete(filled_size, contracts) else "partial"
+                    print(f"  [poly-retry]   Post-cancel pass {_settle_pass}: {status}! "
+                          f"{filled_size} contracts @ ~${avg_price:.4f}")
                     return LegFill(
                         exchange="poly", side=side,
-                        planned_price=planned_price, actual_price=_fallback_price,
-                        planned_contracts=contracts, filled_contracts=actual_filled,
+                        planned_price=planned_price, actual_price=avg_price,
+                        planned_contracts=contracts, filled_contracts=filled_size,
                         order_id=order_id, fill_ts=utc_ts(),
                         latency_ms=latency, status=status, error=None,
                     )
+
+                # If API confirms canceled with zero fills, check on-chain and break early
+                if o_status in ("canceled", "cancelled") and matched_size == 0 and trades_size == 0:
+                    _settle_confirmed = True
             except Exception as e:
-                print(f"  [poly-retry]   Post-cancel on-chain check failed: {e}")
+                print(f"  [poly-retry]   Post-cancel check failed: {e}")
+
+            # On-chain balance check — catches fills CLOB API missed
+            if _owner_addr:
+                try:
+                    current_bal = _get_ctf_balance(_owner_addr, token_id, retries=1)
+                    delta_shares = (current_bal - _ctf_balance_before) / 1e6
+                    if delta_shares > 0:
+                        actual_filled = max(cumulative_filled, delta_shares)
+                        latency = (time.monotonic() - t0) * 1000
+                        status = "filled" if _is_fill_complete(actual_filled, contracts) else "partial"
+                        print(f"  [poly-retry]   Post-cancel on-chain pass {_settle_pass}: "
+                              f"delta={delta_shares:.2f} — fill detected")
+                        return LegFill(
+                            exchange="poly", side=side,
+                            planned_price=planned_price, actual_price=_fallback_price,
+                            planned_contracts=contracts, filled_contracts=actual_filled,
+                            order_id=order_id, fill_ts=utc_ts(),
+                            latency_ms=latency, status=status, error=None,
+                        )
+                    # API says canceled + on-chain confirms no balance change → safe to move on
+                    if _settle_confirmed:
+                        print(f"  [poly-retry]   Post-cancel pass {_settle_pass}: "
+                              f"API=canceled, on-chain=no change — skipping remaining wait")
+                        break
+                except Exception as e:
+                    print(f"  [poly-retry]   Post-cancel on-chain check failed: {e}")
+
+        if not _settle_confirmed:
+            print(f"  [poly-retry]   Post-cancel: 4s elapsed, no fill detected")
 
         last_error = f"retry {attempt}: not filled within {POLY_FILL_RETRY_TIMEOUT_S}s"
 
@@ -4697,8 +4714,8 @@ def _execute_poly_with_retries(side: str, planned_price: float, contracts: float
     # and then check every order we placed during this execution.
     # Aggregate fills across all orders to get the true total.
     if placed_order_ids:
-        print(f"  [poly-retry] Final sweep: checking {len(placed_order_ids)} order(s) after 2s delay...")
-        time.sleep(2.0)
+        print(f"  [poly-retry] Final sweep: checking {len(placed_order_ids)} order(s) after 1s delay...")
+        time.sleep(1.0)
         sweep_total = 0.0
         sweep_last_oid = None
         sweep_avg_price = planned_price
