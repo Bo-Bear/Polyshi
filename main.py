@@ -4110,8 +4110,40 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
     """Place and poll a Kalshi limit order. Returns (order_id, actual_price, filled, status, error)."""
     fill_timeout = timeout or ORDER_TIMEOUT_S
     kalshi_side = "yes" if side == "UP" else "no"
-    # Add buffer to limit price for better fill probability
-    buffered = min(planned_price + LIVE_PRICE_BUFFER, 0.99)
+
+    # --- Orderbook-aware pricing ---
+    # Fetch the live Kalshi orderbook and compute VWAP for our contract count.
+    # Set the limit at the VWAP + small buffer so we cross the spread and fill
+    # instantly, instead of blindly adding LIVE_PRICE_BUFFER to a stale scan price.
+    buffered = min(planned_price + LIVE_PRICE_BUFFER, 0.99)  # fallback
+    try:
+        ob = kalshi_get_orderbook(ticker)
+        up_asks, down_asks = kalshi_asks_from_orderbook(ob)
+        asks = up_asks if side == "UP" else down_asks
+        if asks:
+            vwap_result = vwap_price_for_n_contracts(asks, contracts)
+            if vwap_result is not None:
+                vwap_avg, _, _ = vwap_result
+                # Set limit at VWAP + 1 cent buffer to ensure we cross all levels
+                ob_price = min(vwap_avg + 0.01, 0.99)
+                # Safety: don't let orderbook price exceed planned + max acceptable slippage
+                max_acceptable = planned_price + POLY_MAX_SLIPPAGE + LIVE_PRICE_BUFFER
+                if ob_price <= max_acceptable:
+                    if abs(ob_price - buffered) > 0.001:
+                        print(f"  [kalshi-ob] Orderbook VWAP ${vwap_avg:.3f} for {int(contracts)} contracts — "
+                              f"limit ${ob_price:.3f} (was ${buffered:.3f}, Δ${ob_price - buffered:+.3f})")
+                    buffered = ob_price
+                else:
+                    print(f"  [kalshi-ob] Orderbook VWAP ${vwap_avg:.3f} → limit ${ob_price:.3f} "
+                          f"exceeds max ${max_acceptable:.3f} — using fallback ${buffered:.3f}")
+            else:
+                print(f"  [kalshi-ob] Insufficient orderbook depth for {int(contracts)} contracts — "
+                      f"using fallback ${buffered:.3f}")
+        else:
+            print(f"  [kalshi-ob] No ask levels on orderbook — using fallback ${buffered:.3f}")
+    except Exception as ob_err:
+        print(f"  [kalshi-ob] Orderbook fetch failed ({ob_err}) — using fallback ${buffered:.3f}")
+
     price_cents = int(round(buffered * 100))
     client_order_id = f"polyshi-{uuid.uuid4().hex[:12]}"
 
