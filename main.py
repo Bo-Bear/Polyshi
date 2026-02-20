@@ -5890,21 +5890,30 @@ def main() -> None:
 
     session_duration_s = prompt_session_duration()
 
-    # Dead zone guard: block session starts during low-volume hours
+    # Dead zone toggle: let user enable/disable per session
+    dead_zone_enabled = False
     if DEAD_ZONE_HOURS_UTC:
         current_hour_utc = datetime.now(timezone.utc).hour
-        if current_hour_utc in DEAD_ZONE_HOURS_UTC:
-            dz_sorted = sorted(DEAD_ZONE_HOURS_UTC)
-            print(f"\n*** DEAD ZONE — UTC hour {current_hour_utc} is in DEAD_ZONE_HOURS_UTC ***")
-            print(f"  Dead hours (UTC): {', '.join(f'{h:02d}:00' for h in dz_sorted)}")
-            # Find next allowed hour
-            all_hours = set(range(24))
-            allowed = sorted(all_hours - DEAD_ZONE_HOURS_UTC)
-            future_allowed = [h for h in allowed if h > current_hour_utc]
-            next_ok = future_allowed[0] if future_allowed else allowed[0]
-            print(f"  Next allowed start: {next_ok:02d}:00 UTC")
-            print(f"  Override with DEAD_ZONE_HOURS_UTC=\"\" to disable.")
-            return
+        in_dead_zone = current_hour_utc in DEAD_ZONE_HOURS_UTC
+        dz_sorted = sorted(DEAD_ZONE_HOURS_UTC)
+        print(f"\nDEAD ZONE CUTOFF")
+        print("=" * 45)
+        print(f"  Hours (UTC): {dz_sorted[0]:02d}:00-{dz_sorted[-1]:02d}:59")
+        if in_dead_zone:
+            print(f"  ⚠ Currently in dead zone (UTC hour {current_hour_utc})")
+        print(f"  1) Enabled — stop at window close if in dead hours (recommended)")
+        print(f"  2) Disabled — ignore dead zone, run full duration")
+        while True:
+            choice = input("\nDead zone cutoff [1]: ").strip()
+            if choice in ("", "1"):
+                dead_zone_enabled = True
+                print("\nDead zone cutoff: ENABLED")
+                break
+            elif choice == "2":
+                dead_zone_enabled = False
+                print("\nDead zone cutoff: DISABLED")
+                break
+            print("Invalid selection. Enter 1 or 2.")
 
     print("\nConfirm settings")
     print("=" * 45)
@@ -5943,7 +5952,7 @@ def main() -> None:
     print(f"  Startup delay:      {WINDOW_STARTUP_DELAY_S:.0f}s per window (orderbook settling)")
     print(f"  Window align tol:   {WINDOW_ALIGN_TOLERANCE_SECONDS}s (cross-exchange close time)")
     print(f"  Slippage budget:    ${EXECUTION_SLIPPAGE_BUDGET:.2f}/contract (subtracted from net edge)")
-    if DEAD_ZONE_HOURS_UTC:
+    if dead_zone_enabled:
         dz_sorted = sorted(DEAD_ZONE_HOURS_UTC)
         print(f"  Dead zone (UTC):    {dz_sorted[0]:02d}:00-{dz_sorted[-1]:02d}:59 (stop at window close if in dead hours)")
     else:
@@ -6224,7 +6233,7 @@ def main() -> None:
                 coin_window_poly_fills[c] = 0.0
 
             # Dead zone check: if the next window falls in dead hours, stop gracefully
-            if not stop_reason and DEAD_ZONE_HOURS_UTC:
+            if not stop_reason and dead_zone_enabled:
                 next_hour_utc = datetime.now(timezone.utc).hour
                 if next_hour_utc in DEAD_ZONE_HOURS_UTC:
                     stop_reason = (f"dead_zone_reached: UTC hour {next_hour_utc} "
