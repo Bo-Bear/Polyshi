@@ -10,15 +10,17 @@ Usage:
     python analyze_sessions.py --last 5          # last 5 sessions only
     python analyze_sessions.py --live             # only live-mode sessions
     python analyze_sessions.py --coin BTC         # filter to BTC trades only
+    python analyze_sessions.py --since-update     # sessions since last git pull
     python analyze_sessions.py --json             # machine-readable output
 """
 
 import argparse
 import json
 import os
+import subprocess
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -67,6 +69,40 @@ def bucket_hour(ts_str: str) -> Optional[int]:
         return int(ts_str[11:13])
     except (IndexError, ValueError, TypeError):
         return None
+
+
+def _session_start_ts(sess: dict) -> Optional[str]:
+    """Extract the earliest timestamp from a session (truncated to 19 chars)."""
+    diag = sess.get("session_diag") or {}
+    ts = diag.get("ts")
+    if ts:
+        return ts[:19]
+    for bucket in ("trades", "skips", "executions", "diagnostics"):
+        rows = sess.get(bucket, [])
+        if rows and rows[0].get("ts"):
+            return rows[0]["ts"][:19]
+    return None
+
+
+def _get_last_update_ts() -> Optional[str]:
+    """Get the ISO timestamp of the last code update (git HEAD commit).
+
+    Returns a 19-char ISO string (YYYY-MM-DDTHH:MM:SS) in UTC, or None
+    if the git timestamp cannot be determined.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%ct"],
+            capture_output=True, text=True,
+            cwd=str(Path(__file__).parent),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            epoch = int(result.stdout.strip())
+            dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    return None
 
 
 # ──────────────────────────────────────────────
@@ -856,10 +892,24 @@ def main() -> None:
     parser.add_argument("--live", action="store_true", help="Only analyze live-mode sessions")
     parser.add_argument("--paper", action="store_true", help="Only analyze paper-mode sessions")
     parser.add_argument("--coin", type=str, help="Filter to a specific coin (e.g., BTC)")
+    parser.add_argument("--since-update", action="store_true",
+                        help="Only analyze sessions run after the last code update (git HEAD)")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON instead of report")
     args = parser.parse_args()
 
     sessions = load_sessions(args.log_dir)
+
+    # Filter to sessions since last code update
+    if args.since_update:
+        update_ts = _get_last_update_ts()
+        if update_ts:
+            before_count = len(sessions)
+            sessions = [s for s in sessions
+                        if (_session_start_ts(s) or "") >= update_ts]
+            print(f"  Filtering to sessions after last update: {update_ts}Z "
+                  f"({len(sessions)}/{before_count} sessions)")
+        else:
+            print("Warning: could not determine last update time from git", file=sys.stderr)
 
     # Filter by mode
     if args.live:
@@ -919,6 +969,7 @@ def main() -> None:
     print(f"  Run with --json for machine-readable output")
     print(f"  Run with --coin BTC to focus on a single coin")
     print(f"  Run with --last 3 to analyze only recent sessions")
+    print(f"  Run with --since-update for sessions after last git pull")
     print(f"{'═' * 72}\n")
 
 
