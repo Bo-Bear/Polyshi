@@ -7,6 +7,7 @@ debugging — surfaces recurring problems before you need to grep for them.
 
 Usage:
     python analyze_sessions.py                   # all sessions
+    python analyze_sessions.py --latest           # most recent session only
     python analyze_sessions.py --last 5          # last 5 sessions only
     python analyze_sessions.py --live             # only live-mode sessions
     python analyze_sessions.py --coin BTC         # filter to BTC trades only
@@ -889,6 +890,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cross-session diagnostics analyzer for Polyshi")
     parser.add_argument("--log-dir", default="logs", help="Path to logs directory (default: logs)")
     parser.add_argument("--last", type=int, help="Only analyze the last N sessions")
+    parser.add_argument("--latest", action="store_true", help="Only analyze the most recent session (shortcut for --last 1)")
     parser.add_argument("--live", action="store_true", help="Only analyze live-mode sessions")
     parser.add_argument("--paper", action="store_true", help="Only analyze paper-mode sessions")
     parser.add_argument("--coin", type=str, help="Filter to a specific coin (e.g., BTC)")
@@ -898,6 +900,10 @@ def main() -> None:
     args = parser.parse_args()
 
     sessions = load_sessions(args.log_dir)
+
+    # --latest is shorthand for --last 1
+    if args.latest:
+        args.last = 1
 
     # Filter to sessions since last code update
     if args.since_update:
@@ -969,6 +975,7 @@ def main() -> None:
     print(f"  Run with --json for machine-readable output")
     print(f"  Run with --coin BTC to focus on a single coin")
     print(f"  Run with --last 3 to analyze only recent sessions")
+    print(f"  Run with --latest to analyze only the most recent session")
     print(f"  Run with --since-update for sessions after last git pull")
     print(f"{'═' * 72}\n")
 
