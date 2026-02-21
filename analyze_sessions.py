@@ -233,9 +233,9 @@ def analyze_session_overview(sessions: List[dict]) -> None:
     print_header("SESSION OVERVIEW")
     print(f"  Total sessions: {len(sessions)}")
     print()
-    fmt = "  {idx:>3}  {ts:19s}  {mode:6s}  {coins:16s}  {trades:>3} trades  {fills:>3} filled  {skips:>5} skips  {unwinds:>2} unwinds  {dur:>6s}"
-    print(f"  {'#':>3}  {'Timestamp':19s}  {'Mode':6s}  {'Coins':16s}  {'Trd':>3}         {'Fill':>3}         {'Skips':>5}         {'Unw':>2}          {'Dur':>6s}")
-    print(f"  {'─' * 3}  {'─' * 19}  {'─' * 6}  {'─' * 16}  {'─' * 10}  {'─' * 10}  {'─' * 12}  {'─' * 11}  {'─' * 6}")
+    fmt = "  {idx:>3}  {ts:19s}  {mode:6s}  {dur:>6s}  {coins:16s}  {trades:>3} trades  {fills:>3} filled  {unwinds:>2} unwinds  {skips:>5} skips"
+    print(f"  {'#':>3}  {'Timestamp':19s}  {'Mode':6s}  {'Dur':>6s}  {'Coins':16s}  {'Trd':>10s}  {'Fill':>10s}  {'Unw':>11s}  {'Skips':>11s}")
+    print(f"  {'─' * 3}  {'─' * 19}  {'─' * 6}  {'─' * 6}  {'─' * 16}  {'─' * 10}  {'─' * 10}  {'─' * 11}  {'─' * 11}")
 
     for i, s in enumerate(sessions, 1):
         diag = s["session_diag"] or {}
