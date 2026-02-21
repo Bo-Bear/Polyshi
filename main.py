@@ -1362,7 +1362,7 @@ class HedgeCandidate:
     extras: float
     poly_ref: str
     kalshi_ref: str
-    dead_zone_dollars: float = 0.0  # gap ($) where both legs lose; 0 = overlap or unknown
+    dead_zone_dollars: float = 0.0  # gap ($) where both legs lose; 0 = overlap, inf = unknown (fail closed)
 
 
 @dataclass
@@ -2828,10 +2828,14 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
                                 gap exists when strike < ref  → gap = ref - strike
         K_UP   (YES) + P_DOWN: K wins if price ≥ strike, P wins if price ≤ ref
                                 gap exists when ref < strike  → gap = strike - ref
-        Returns 0.0 when strikes overlap or when we lack data to compute.
+
+        FAIL CLOSED: returns inf when either price is unknown, so the trade is
+        rejected rather than silently assuming no dead zone exists.  The old
+        behaviour (return 0.0) caused both-legs-lose losses when the Poly
+        reference price differed from the Kalshi strike.
         """
         if kalshi_strike is None or ref is None:
-            return 0.0
+            return float('inf')
         if direction_on_kalshi == "DOWN":
             return max(0.0, ref - kalshi_strike)
         else:
@@ -6457,6 +6461,7 @@ def main() -> None:
     window_start_total = session_start_total             # Portfolio value at start of current window
     consecutive_losing_windows = 0
     window_trades: List[dict] = []                       # Trades placed in the current window
+    window_open_spot_prices: Dict[str, float] = {}       # Spot prices at window open (best proxy for Poly ref)
     stop_reason: Optional[str] = None
 
     print(f"\n  Session started — will run until {session_end_utc.strftime('%H:%M:%S')} UTC ({duration_label})")
@@ -6584,6 +6589,7 @@ def main() -> None:
             window_trades = []
             current_window_close_ts = None  # Will be set from next market data
             window_open_utc = None  # Reset so startup delay triggers for new window
+            window_open_spot_prices = {}  # Reset — will be populated on first spot fetch of new window
             # Fresh HTTP connections for the new window — prevents stale keep-alive
             # connections from degrading Kalshi/Poly API latency across windows.
             _reset_session()
@@ -6725,6 +6731,13 @@ def main() -> None:
         # Fetch spot prices once per scan for strike reference
         spot_prices = fetch_spot_prices()
 
+        # Record spot prices at window open (best proxy for Poly reference price).
+        # The actual Poly "price to beat" is the spot price at window start, which
+        # differs from the current spot that drifts during the window.  Using current
+        # spot as a dead-zone proxy is the root cause of the dead-zone bypass bug.
+        if not window_open_spot_prices and spot_prices:
+            window_open_spot_prices = dict(spot_prices)
+
         _scan_poly_quotes.clear()
 
         for coin in selected_coins:
@@ -6836,8 +6849,17 @@ def main() -> None:
 
             # Compute edge if no safeguard skip
             if skip is None:
-                # Best available Poly reference price: parsed from description → spot fallback
-                _poly_ref = poly.ref_price if poly.ref_price is not None else spot_prices.get(coin)
+                # Best available Poly reference price for dead-zone calculation.
+                # Priority: 1) parsed from Poly description (exact), 2) window-open
+                # spot (best proxy — captured at first scan of each 15m window),
+                # 3) None (triggers fail-closed rejection in _dead_zone).
+                #
+                # IMPORTANT: Do NOT fall back to current spot_prices here.  Current
+                # spot drifts during the window and is NOT the Poly "price to beat".
+                # Using it caused the dead-zone bypass that led to both-legs-lose
+                # losses (the Kalshi strike and drifted spot looked close, hiding
+                # the real gap between the Kalshi strike and Poly's window-open ref).
+                _poly_ref = poly.ref_price if poly.ref_price is not None else window_open_spot_prices.get(coin)
                 best_for_coin, all_combos = best_hedge_for_coin(coin, poly, kalshi,
                                                                  poly_ref_price=_poly_ref)
                 if best_for_coin is None:
@@ -6857,9 +6879,14 @@ def main() -> None:
                         worst_gap = max(c.dead_zone_dollars for c in dz_rejected)
                         _k_str = f"K${float(kalshi.strike):,.2f}" if kalshi.strike else "K?"
                         _p_str = f"P${_poly_ref:,.2f}" if _poly_ref else "P?"
-                        skip = ("dead_zone",
-                                f"Dead zone ${worst_gap:,.2f} > ${MAX_DEAD_ZONE_DOLLARS:.2f} "
-                                f"({_k_str} vs {_p_str}) — both legs can lose")
+                        if worst_gap == float('inf'):
+                            skip = ("dead_zone_unknown",
+                                    f"Poly ref price unknown — cannot verify hedge safety "
+                                    f"({_k_str} vs {_p_str}) — SKIPPING to avoid both-legs-lose")
+                        else:
+                            skip = ("dead_zone",
+                                    f"Dead zone ${worst_gap:,.2f} > ${MAX_DEAD_ZONE_DOLLARS:.2f} "
+                                    f"({_k_str} vs {_p_str}) — both legs can lose")
                     else:
                         skip = ("no_viable_edge",
                                 f"Edge too low ({edge_str or 'none'} < {pct(MIN_NET_EDGE)} for {coin})")
@@ -6976,6 +7003,9 @@ def main() -> None:
                 "window_close_ts": best_global_kalshi.close_ts.isoformat(),
                 "spot_price": spot_prices.get(best_global.coin),
                 "kalshi_strike": best_global_kalshi.strike,
+                "dead_zone_dollars": best_global.dead_zone_dollars,
+                "poly_ref_source": "description" if best_global_poly.ref_price is not None else ("window_open_spot" if window_open_spot_prices.get(best_global.coin) is not None else "unknown"),
+                "window_open_spot": window_open_spot_prices.get(best_global.coin),
                 "strike_spot_divergence_pct": round(abs(float(best_global_kalshi.strike) - spot_prices.get(best_global.coin, 0)) / spot_prices.get(best_global.coin, 1) * 100, 4) if best_global_kalshi.strike else None,
                 # Poly book depth snapshot
                 "poly_book_levels": poly_depth["levels"] if poly_depth else None,
