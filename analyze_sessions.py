@@ -954,7 +954,7 @@ def main() -> None:
 
     print(f"\n{'╔' + '═' * 70 + '╗'}")
     print(f"{'║'} {'POLYSHI CROSS-SESSION DIAGNOSTICS':^68s} {'║'}")
-    print(f"{'║'} {f'{len(sessions)} sessions · {len(all_trades)} trades · {n_markets} markets':^68s} {'║'}")
+    print(f"{'║'} {f'{len(sessions)} sessions · {n_markets} markets · {len(all_trades)} trades':^68s} {'║'}")
     if args.coin:
         print(f"{'║'} {f'Filtered to {args.coin.upper()}':^68s} {'║'}")
     print(f"{'╚' + '═' * 70 + '╝'}")
