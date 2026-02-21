@@ -4097,11 +4097,13 @@ def check_balances(logfile: str) -> Dict[str, float]:
 
 
 def execute_leg(exchange: str, side: str, planned_price: float,
-                contracts: float, timeout: float = None, **kwargs) -> LegFill:
+                contracts: float, timeout: float = None,
+                max_price: float = None, **kwargs) -> LegFill:
     """Execute a single leg on an exchange. Returns fill details.
 
     In paper mode, simulates an instant fill at planned_price.
     In live mode, places a GTC limit order and polls until filled or timeout.
+    max_price: edge-aware ceiling for limit pricing (Kalshi only).
     """
     t0 = time.monotonic()
 
@@ -4128,7 +4130,7 @@ def execute_leg(exchange: str, side: str, planned_price: float,
         if exchange == "kalshi":
             order_id, actual_price, filled, status, error_msg = _execute_kalshi_leg(
                 side, planned_price, contracts, kwargs.get("ticker", ""),
-                timeout=leg_timeout,
+                timeout=leg_timeout, max_price=max_price,
             )
         elif exchange == "poly":
             order_id, actual_price, filled, status, error_msg = _execute_poly_leg(
@@ -4170,7 +4172,8 @@ def _kalshi_order_is_filled(o: dict, contracts: float, planned_price: float,
 
 
 def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
-                        ticker: str, timeout: float = None) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
+                        ticker: str, timeout: float = None,
+                        max_price: float = None) -> Tuple[Optional[str], Optional[float], float, str, Optional[str]]:
     """Place and poll a Kalshi limit order. Returns (order_id, actual_price, filled, status, error)."""
     fill_timeout = timeout or ORDER_TIMEOUT_S
     kalshi_side = "yes" if side == "UP" else "no"
@@ -4180,6 +4183,7 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
     # Set the limit at the VWAP + small buffer so we cross the spread and fill
     # instantly, instead of blindly adding LIVE_PRICE_BUFFER to a stale scan price.
     buffered = min(planned_price + LIVE_PRICE_BUFFER, 0.99)  # fallback
+    max_acceptable = max_price if max_price is not None else min(planned_price + POLY_MAX_SLIPPAGE + LIVE_PRICE_BUFFER, 0.99)
     try:
         ob = kalshi_get_orderbook(ticker)
         up_asks, down_asks = kalshi_asks_from_orderbook(ob)
@@ -4191,8 +4195,6 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
                 # Set limit above the worst book level we need to cross, not the average.
                 # CLOB gives price improvement, so we'll still fill at VWAP or better.
                 ob_price = min(worst_lvl + KALSHI_OB_BUFFER, 0.99)
-                # Safety: don't let orderbook price exceed planned + max acceptable slippage
-                max_acceptable = planned_price + POLY_MAX_SLIPPAGE + LIVE_PRICE_BUFFER
                 if ob_price <= max_acceptable:
                     if abs(ob_price - buffered) > 0.001:
                         print(f"  [kalshi-ob] VWAP ${vwap_avg:.3f}, worst level ${worst_lvl:.3f} "
@@ -4200,8 +4202,14 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
                               f"(was ${buffered:.3f}, Δ${ob_price - buffered:+.3f})")
                     buffered = ob_price
                 else:
+                    # Orderbook has moved beyond what the edge can absorb.
+                    # Abort immediately — placing a limit below the best ask
+                    # would just sit unfilled for the full timeout.
                     print(f"  [kalshi-ob] Worst level ${worst_lvl:.3f} → limit ${ob_price:.3f} "
-                          f"exceeds max ${max_acceptable:.3f} — using fallback ${buffered:.3f}")
+                          f"exceeds max ${max_acceptable:.3f} — edge consumed, aborting")
+                    return None, None, 0.0, "rejected", (
+                        f"orderbook moved: need ${ob_price:.3f} but max ${max_acceptable:.3f} "
+                        f"(planned ${planned_price:.3f})")
             else:
                 print(f"  [kalshi-ob] Insufficient orderbook depth for {int(contracts)} contracts — "
                       f"using fallback ${buffered:.3f}")
@@ -5040,12 +5048,19 @@ def execute_hedge(candidate: HedgeCandidate,
         print(f"  [preflight] VWAP check failed ({e}), proceeding with caution")
 
     # --- STEP 1: Execute Kalshi FIRST (fast, deterministic fills) ---
+    # Compute edge-aware price ceiling: how much can Kalshi cost before edge
+    # drops below MIN_NET_EDGE?  This replaces the old fixed $0.04 cap and
+    # ensures we abort instantly (no 15s timeout) when the book has moved.
+    edge_slack = max(0.0, candidate.net_edge - MIN_NET_EDGE)
+    # Floor at LIVE_PRICE_BUFFER so crossing orders aren't rejected by rounding
+    kalshi_max_price = min(candidate.kalshi_price + max(edge_slack, LIVE_PRICE_BUFFER), 0.99)
     t_total = time.monotonic()
     print(f"  [exec] STEP 1: KALSHI — Placing {int(contracts)}x "
           f"{'YES' if candidate.direction_on_kalshi == 'UP' else 'NO'} "
-          f"@ ${candidate.kalshi_price:.2f}...")
+          f"@ ${candidate.kalshi_price:.2f} (max ${kalshi_max_price:.3f})...")
     kalshi_fill = execute_leg("kalshi", candidate.direction_on_kalshi,
                               candidate.kalshi_price, contracts,
+                              max_price=kalshi_max_price,
                               ticker=kalshi_quote.ticker)
     kalshi_done = time.monotonic()
 
