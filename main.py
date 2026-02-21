@@ -207,13 +207,18 @@ ORDER_TIMEOUT_S = float(os.getenv("ORDER_TIMEOUT_S", "8"))  # max seconds to wai
 ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "0.5"))  # polling interval
 # Price buffer added to limit orders in live mode to improve fill rate.
 # CLOB gives price improvement, so actual fill price may be lower than limit.
-LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.03"))  # 3 cents — floors the max_acceptable ceiling
+LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.02"))  # 2 cents — Poly limit buffer + edge guard floor
 # Maximum slippage allowed above planned price on Polymarket.
 # If the best ask has moved more than this above planned_price, skip the fill attempt.
 POLY_MAX_SLIPPAGE = float(os.getenv("POLY_MAX_SLIPPAGE", "0.02"))  # 2 cents
 # Buffer added above the worst orderbook level when using VWAP pricing on Kalshi.
 # Covers book movement between VWAP calculation and order arrival.
 KALSHI_OB_BUFFER = float(os.getenv("KALSHI_OB_BUFFER", "0.02"))  # 2 cents
+# Extra headroom above worst ask level for the limit order sent to Kalshi.
+# CLOB gives price improvement (fill at VWAP), so this only affects fill
+# probability, not fill price.  Must be large enough to absorb book
+# micro-movement between OB fetch and order arrival on the matching engine.
+KALSHI_CROSSING_BUFFER = float(os.getenv("KALSHI_CROSSING_BUFFER", "0.05"))  # 5 cents
 
 # Poly orderbook-aware retry config (used when Kalshi fills first)
 POLY_FILL_MAX_RETRIES = int(os.getenv("POLY_FILL_MAX_RETRIES", "5"))
@@ -4537,16 +4542,19 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
     fill_timeout = timeout or ORDER_TIMEOUT_S
     kalshi_side = "yes" if side == "UP" else "no"
 
-    # --- Orderbook-aware pricing ---
-    # Fetch the live Kalshi orderbook and compute VWAP for our contract count.
-    # The CLOB guarantees price improvement: we fill at VWAP or better regardless
-    # of where the limit is set.  So we set the limit at max_acceptable (the
-    # edge-safe ceiling computed by execute_hedge) to maximise fill probability.
-    # The old approach of worst_lvl + KALSHI_OB_BUFFER was too tight and caused
-    # orders to rest unfilled when the book moved even slightly between fetch
-    # and placement.
+    # --- Orderbook-aware pricing (two-tier) ---
+    # Two separate concerns:
+    #   1) Edge guard  — abort if the VWAP already exceeds the edge-safe ceiling.
+    #      Uses max_acceptable (kalshi_price + edge_slack, floored at LIVE_PRICE_BUFFER).
+    #   2) Limit price — set generously above the worst ask to ensure the order
+    #      crosses even if the book shifts between OB fetch and order arrival.
+    #      CLOB gives price improvement: actual fill is at VWAP, not at limit.
+    #      Uses worst_lvl + KALSHI_CROSSING_BUFFER.
+    #
+    # Previously both jobs were served by max_acceptable alone, which was too
+    # tight for crossing thin books (3c headroom → 50% timeout rate).
     max_acceptable = max_price if max_price is not None else min(planned_price + POLY_MAX_SLIPPAGE + LIVE_PRICE_BUFFER, 0.99)
-    buffered = max_acceptable  # default: use the full edge-safe ceiling
+    buffered = max_acceptable  # fallback if OB fetch fails
     try:
         ob = kalshi_get_orderbook(ticker)
         up_asks, down_asks = kalshi_asks_from_orderbook(ob)
@@ -4555,24 +4563,30 @@ def _execute_kalshi_leg(side: str, planned_price: float, contracts: float,
             vwap_result = vwap_price_for_n_contracts(asks, contracts)
             if vwap_result is not None:
                 vwap_avg, _, _, worst_lvl = vwap_result
-                if worst_lvl > max_acceptable:
-                    # Orderbook has moved beyond what the edge can absorb.
-                    # Abort immediately — even at max_acceptable we can't cross.
-                    print(f"  [kalshi-ob] Worst level ${worst_lvl:.3f} exceeds max "
-                          f"${max_acceptable:.3f} — edge consumed, aborting")
+                # Edge guard: abort if VWAP exceeds the edge-safe ceiling.
+                # VWAP is the expected fill cost — if it already blows the edge,
+                # no limit price can save us.
+                if vwap_avg > max_acceptable:
+                    print(f"  [kalshi-ob] VWAP ${vwap_avg:.3f} exceeds edge cap "
+                          f"${max_acceptable:.3f} — aborting")
                     return None, None, 0.0, "rejected", (
-                        f"orderbook moved: worst ${worst_lvl:.3f} but max ${max_acceptable:.3f} "
+                        f"orderbook moved: VWAP ${vwap_avg:.3f} but cap ${max_acceptable:.3f} "
                         f"(planned ${planned_price:.3f})")
+                # Limit price: worst ask + crossing buffer.
+                # Generous so the order crosses even if the best ask gets taken
+                # between OB fetch and matching-engine arrival.
+                # Capped at 0.99 for Kalshi API compliance.
+                buffered = min(worst_lvl + KALSHI_CROSSING_BUFFER, 0.99)
                 print(f"  [kalshi-ob] VWAP ${vwap_avg:.3f}, worst level ${worst_lvl:.3f} "
                       f"for {int(contracts)} contracts — limit ${buffered:.3f} "
-                      f"(planned ${planned_price:.3f})")
+                      f"(edge cap ${max_acceptable:.3f}, planned ${planned_price:.3f})")
             else:
                 print(f"  [kalshi-ob] Insufficient orderbook depth for {int(contracts)} contracts — "
-                      f"using max_acceptable ${buffered:.3f}")
+                      f"using edge cap ${buffered:.3f}")
         else:
-            print(f"  [kalshi-ob] No ask levels on orderbook — using max_acceptable ${buffered:.3f}")
+            print(f"  [kalshi-ob] No ask levels on orderbook — using edge cap ${buffered:.3f}")
     except Exception as ob_err:
-        print(f"  [kalshi-ob] Orderbook fetch failed ({ob_err}) — using max_acceptable ${buffered:.3f}")
+        print(f"  [kalshi-ob] Orderbook fetch failed ({ob_err}) — using edge cap ${buffered:.3f}")
 
     price_cents = int(round(buffered * 100))
     client_order_id = f"polyshi-{uuid.uuid4().hex[:12]}"
