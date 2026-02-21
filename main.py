@@ -103,7 +103,7 @@ MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.00
 # chosen combo's win ranges don't overlap (e.g., K_DOWN wins if price < strike,
 # P_UP wins if price > ref, but strike < ref → gap).  Reject the combo if the gap
 # exceeds this tolerance.  Small default allows for minor rounding between exchanges.
-MAX_DEAD_ZONE_DOLLARS = float(os.getenv("MAX_DEAD_ZONE_DOLLARS", "0.25"))
+MAX_DEAD_ZONE_DOLLARS = float(os.getenv("MAX_DEAD_ZONE_DOLLARS", "0.15"))
 
 # Minimum account balance — stop session if either exchange drops below this ($)
 MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
