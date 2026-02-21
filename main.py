@@ -550,12 +550,18 @@ def _get_condition_id_for_token(token_id: str) -> Optional[str]:
 
 
 def _check_token_payouts(up_tid: str, down_tid: str) -> Tuple[Optional[float], Optional[float]]:
-    """Check Gamma API for resolved outcome prices of a token pair.
+    """Check which outcome won for a token pair.
 
-    Queries the market containing these tokens and extracts the final outcome
-    prices.  Returns (up_payout, down_payout) where 1.0 = winner, 0.0 = loser,
+    First tries the Gamma API ``outcomePrices`` field.  If that's missing
+    (older / delisted markets), falls back to reading ``payoutNumerators``
+    directly from the CTF contract on-chain.
+
+    Returns (up_payout, down_payout) where 1.0 = winner, 0.0 = loser,
     None = market not found or not yet resolved.
     """
+    condition_id: Optional[str] = None
+    token_index_map: Dict[str, int] = {}  # token_id → outcome index (0 or 1)
+
     for tid in (up_tid, down_tid):
         try:
             url = "https://gamma-api.polymarket.com/markets"
@@ -566,16 +572,23 @@ def _check_token_payouts(up_tid: str, down_tid: str) -> Tuple[Optional[float], O
                 continue
             m = markets[0]
 
+            # Grab conditionId + token ordering for on-chain fallback
+            if not condition_id:
+                condition_id = m.get("condition_id") or m.get("conditionId")
+            token_ids = m.get("clobTokenIds")
+            if isinstance(token_ids, str):
+                token_ids = json.loads(token_ids)
+            if token_ids and len(token_ids) >= 2:
+                for idx, t in enumerate(token_ids):
+                    token_index_map[str(t)] = idx
+
+            # Primary path: outcomePrices from Gamma
             outcome_prices = m.get("outcomePrices")
             if not outcome_prices:
                 continue
 
             if isinstance(outcome_prices, str):
                 outcome_prices = json.loads(outcome_prices)
-
-            token_ids = m.get("clobTokenIds")
-            if isinstance(token_ids, str):
-                token_ids = json.loads(token_ids)
 
             if not token_ids or not outcome_prices or len(token_ids) < 2 or len(outcome_prices) < 2:
                 continue
@@ -594,6 +607,23 @@ def _check_token_payouts(up_tid: str, down_tid: str) -> Tuple[Optional[float], O
                 return up_payout, down_payout
         except Exception:
             continue
+
+    # Fallback: read payoutNumerators directly from the CTF contract on-chain.
+    # This works even when Gamma's outcomePrices field is missing.
+    if condition_id and _is_condition_resolved(condition_id):
+        num_0 = _get_payout_numerator(condition_id, 0)
+        num_1 = _get_payout_numerator(condition_id, 1)
+        if num_0 is not None and num_1 is not None:
+            # Map outcome index → payout (>0 means winner)
+            idx_payout = {0: 1.0 if num_0 > 0 else 0.0,
+                          1: 1.0 if num_1 > 0 else 0.0}
+            up_idx = token_index_map.get(up_tid)
+            down_idx = token_index_map.get(down_tid)
+            up_payout = idx_payout.get(up_idx) if up_idx is not None else None
+            down_payout = idx_payout.get(down_idx) if down_idx is not None else None
+            if up_payout is not None or down_payout is not None:
+                return up_payout, down_payout
+
     return None, None
 
 
@@ -618,6 +648,42 @@ def _get_ctf_balance(owner: str, token_id: str, retries: int = 3) -> int:
 
 
 _BALANCE_OF_BATCH_SELECTOR = "0x4e1273f4"  # balanceOfBatch(address[],uint256[])
+
+# payoutNumerators(bytes32,uint256) — selector computed lazily at runtime because
+# Keccak-256 libraries (eth_hash) are only available when eth_account is installed.
+_PAYOUT_NUM_SELECTOR: Optional[str] = None  # set by _get_payout_num_selector()
+
+
+def _get_payout_num_selector() -> str:
+    """Lazily compute and cache the 4-byte selector for payoutNumerators(bytes32,uint256)."""
+    global _PAYOUT_NUM_SELECTOR
+    if _PAYOUT_NUM_SELECTOR is not None:
+        return _PAYOUT_NUM_SELECTOR
+    try:
+        from eth_hash.auto import keccak as _keccak
+        _PAYOUT_NUM_SELECTOR = "0x" + _keccak(b"payoutNumerators(bytes32,uint256)")[:4].hex()
+    except Exception:
+        _PAYOUT_NUM_SELECTOR = ""  # empty → on-chain check unavailable
+    return _PAYOUT_NUM_SELECTOR
+
+
+def _get_payout_numerator(condition_id: str, outcome_index: int) -> Optional[int]:
+    """Read payoutNumerators(conditionId, outcomeIndex) from the CTF contract.
+
+    Returns the payout numerator (0 = losing outcome, >0 = winning outcome),
+    or None if the on-chain check is unavailable.
+    """
+    selector = _get_payout_num_selector()
+    if not selector:
+        return None
+    cid_hex = condition_id.lower().replace("0x", "").zfill(64)
+    idx_hex = hex(outcome_index)[2:].zfill(64)
+    calldata = selector + cid_hex + idx_hex
+    try:
+        result = _polygon_rpc("eth_call", [{"to": _POLY_CTF, "data": calldata}, "latest"])
+        return int(result, 16) if result else None
+    except Exception:
+        return None
 
 
 def _get_ctf_balances_batch(owner: str, token_ids: List[str], batch_size: int = 40) -> Dict[str, int]:
@@ -757,6 +823,20 @@ def _redeem_positions(condition_id: str, yes_amount: int, no_amount: int,
     if not _is_condition_resolved(condition_id):
         print(f"  [redeem] Market not yet resolved — skipping")
         return None, 0, 0
+
+    # Bail early if we only hold losing tokens (saves gas — no payout to collect)
+    if yes_amount > 0 and no_amount == 0:
+        # Only hold YES/UP — check if outcome 0 lost (numerator = 0)
+        num = _get_payout_numerator(condition_id, 0)
+        if num is not None and num == 0:
+            print(f"  [redeem] Holding only YES tokens but outcome 0 lost — skipping (saves gas)")
+            return None, 0, 0
+    elif no_amount > 0 and yes_amount == 0:
+        # Only hold NO/DOWN — check if outcome 1 lost (numerator = 0)
+        num = _get_payout_numerator(condition_id, 1)
+        if num is not None and num == 0:
+            print(f"  [redeem] Holding only NO tokens but outcome 1 lost — skipping (saves gas)")
+            return None, 0, 0
 
     if nonce < 0:
         nonce_hex = _polygon_rpc("eth_getTransactionCount", [addr, "pending"])
