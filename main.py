@@ -203,11 +203,11 @@ POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
 POLY_FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "")
 
 # Order placement config
-ORDER_TIMEOUT_S = float(os.getenv("ORDER_TIMEOUT_S", "15"))  # max seconds to wait for fill
+ORDER_TIMEOUT_S = float(os.getenv("ORDER_TIMEOUT_S", "8"))  # max seconds to wait for fill — reduced from 15 to fail fast on resting orders
 ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "0.5"))  # polling interval
 # Price buffer added to limit orders in live mode to improve fill rate.
 # CLOB gives price improvement, so actual fill price may be lower than limit.
-LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.02"))  # 2 cents
+LIVE_PRICE_BUFFER = float(os.getenv("LIVE_PRICE_BUFFER", "0.03"))  # 3 cents — floors the max_acceptable ceiling
 # Maximum slippage allowed above planned price on Polymarket.
 # If the best ask has moved more than this above planned_price, skip the fill attempt.
 POLY_MAX_SLIPPAGE = float(os.getenv("POLY_MAX_SLIPPAGE", "0.02"))  # 2 cents
