@@ -181,6 +181,7 @@ POLY_TITLE_PREFIX = {
 
 # Output
 LOG_DIR = os.getenv("LOG_DIR", "logs")
+PORTFOLIO_HISTORY_FILE = os.path.join(LOG_DIR, "portfolio_history.jsonl")
 
 # Execution mode: "paper" (default) or "live"
 EXEC_MODE = os.getenv("EXEC_MODE", "paper").lower()  # "paper" or "live"
@@ -2120,6 +2121,7 @@ def prompt_execution_mode() -> str:
     print("3) Redeem Positions — collect unredeemed Polymarket winnings")
     print("4) Session History  — review past session trade summaries")
     print("5) Check Positions  — view current on-chain Poly holdings")
+    print("6) Portfolio History — track balance changes across sessions")
 
     while True:
         choice = input("\nSelect mode [1]: ").strip()
@@ -2133,7 +2135,9 @@ def prompt_execution_mode() -> str:
             return "history"
         if choice == "5":
             return "positions"
-        print("Invalid selection. Enter 1, 2, 3, 4, or 5.")
+        if choice == "6":
+            return "portfolio"
+        print("Invalid selection. Enter 1, 2, 3, 4, 5, or 6.")
 
 
 def prompt_coin_selection(available: List[str]) -> List[str]:
@@ -3213,6 +3217,197 @@ def print_trade_unwound(candidate, exec_result, kalshi_quote=None, poly_quote=No
 def append_log(path: str, row: dict) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
+
+
+# -----------------------------
+# Portfolio history tracking
+# -----------------------------
+def load_portfolio_history() -> List[dict]:
+    """Load all portfolio snapshots from the persistent history file."""
+    snapshots: List[dict] = []
+    if not os.path.exists(PORTFOLIO_HISTORY_FILE):
+        return snapshots
+    try:
+        with open(PORTFOLIO_HISTORY_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    snapshots.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return snapshots
+
+
+def save_portfolio_snapshot(
+    logfile: str,
+    exec_mode: str,
+    selected_coins: List[str],
+    session_duration_s: int,
+    end_reason: str,
+    start_balances: Dict[str, float],
+    end_balances: Optional[Dict[str, float]],
+    trades_executed: int,
+    trades_filled: int,
+    total_unwinds: int,
+    coin_trade_counts: Dict[str, int],
+) -> None:
+    """Record a portfolio snapshot at session end. Appends to the persistent history file."""
+    start_total = sum(v for v in start_balances.values() if v >= 0)
+    end_total = sum(v for v in end_balances.values() if v >= 0) if end_balances else -1.0
+
+    session_pnl = (end_total - start_total) if end_balances and end_total >= 0 and start_total >= 0 else None
+
+    # Build inter-session delta from previous snapshot
+    history = load_portfolio_history()
+    prev = history[-1] if history else None
+    inter_session_delta: Optional[dict] = None
+    if prev and end_balances and end_total >= 0:
+        prev_total = prev.get("end_balances", {}).get("total", -1)
+        if prev_total >= 0:
+            change = end_total - prev_total
+            inter_session_delta = {
+                "prev_session_ts": prev.get("ts"),
+                "prev_session_end_total": prev_total,
+                "balance_change": round(change, 4),
+                "pct_change": round((change / prev_total) * 100, 4) if prev_total > 0 else 0.0,
+            }
+
+    # Cumulative stats
+    all_pnls = [s.get("session_pnl") for s in history if s.get("session_pnl") is not None]
+    cumulative_pnl = sum(all_pnls) + (session_pnl or 0.0)
+    total_sessions = len(history) + 1
+    win_sessions = sum(1 for p in all_pnls if p > 0) + (1 if session_pnl and session_pnl > 0 else 0)
+    loss_sessions = sum(1 for p in all_pnls if p < 0) + (1 if session_pnl and session_pnl < 0 else 0)
+
+    # Peak/trough balance across all sessions
+    all_end_totals = [s.get("end_balances", {}).get("total", -1) for s in history]
+    all_end_totals = [t for t in all_end_totals if t >= 0]
+    if end_total >= 0:
+        all_end_totals.append(end_total)
+    peak_balance = max(all_end_totals) if all_end_totals else end_total
+    trough_balance = min(all_end_totals) if all_end_totals else end_total
+
+    snapshot = {
+        "log_type": "portfolio_snapshot",
+        "ts": utc_ts(),
+        "session_logfile": os.path.basename(logfile),
+        "exec_mode": exec_mode,
+        "coins": selected_coins,
+        "session_duration_s": session_duration_s,
+        "end_reason": end_reason,
+        "start_balances": {
+            "kalshi": start_balances.get("kalshi", -1),
+            "poly": start_balances.get("poly", -1),
+            "total": round(start_total, 4),
+        },
+        "end_balances": {
+            "kalshi": end_balances.get("kalshi", -1) if end_balances else -1,
+            "poly": end_balances.get("poly", -1) if end_balances else -1,
+            "total": round(end_total, 4) if end_total >= 0 else -1,
+        },
+        "session_pnl": round(session_pnl, 4) if session_pnl is not None else None,
+        "trades_executed": trades_executed,
+        "trades_filled": trades_filled,
+        "total_unwinds": total_unwinds,
+        "per_coin_trades": {c: coin_trade_counts.get(c, 0) for c in selected_coins},
+        "inter_session_delta": inter_session_delta,
+        "cumulative": {
+            "total_sessions": total_sessions,
+            "cumulative_pnl": round(cumulative_pnl, 4),
+            "peak_balance": round(peak_balance, 4),
+            "trough_balance": round(trough_balance, 4),
+            "win_sessions": win_sessions,
+            "loss_sessions": loss_sessions,
+            "session_win_rate": round((win_sessions / total_sessions) * 100, 1) if total_sessions > 0 else 0.0,
+        },
+    }
+
+    ensure_dir(LOG_DIR)
+    append_log(PORTFOLIO_HISTORY_FILE, snapshot)
+    print(f"\n  [portfolio] Snapshot saved to {PORTFOLIO_HISTORY_FILE}")
+
+
+def review_portfolio_history() -> None:
+    """Display portfolio history with inter-session deltas and cumulative tracking."""
+    history = load_portfolio_history()
+    if not history:
+        print("\n  No portfolio history found.")
+        print(f"  (Snapshots are recorded automatically after each trading session.)")
+        return
+
+    # Separate by mode
+    live_snaps = [s for s in history if s.get("exec_mode") == "live"]
+    paper_snaps = [s for s in history if s.get("exec_mode") == "paper"]
+
+    print(f"\nPORTFOLIO HISTORY")
+    print("=" * 80)
+    print(f"  Total snapshots: {len(history)}  (Live: {len(live_snaps)}, Paper: {len(paper_snaps)})")
+
+    if live_snaps:
+        _print_portfolio_table(live_snaps, "LIVE")
+    if paper_snaps:
+        _print_portfolio_table(paper_snaps, "PAPER")
+
+    # Cumulative summary from the latest snapshot
+    latest = history[-1]
+    cum = latest.get("cumulative", {})
+    if cum:
+        print(f"\n  CUMULATIVE (all sessions)")
+        print(f"  {'─' * 50}")
+        print(f"  Sessions:        {cum.get('total_sessions', 0)}  "
+              f"({cum.get('win_sessions', 0)}W / {cum.get('loss_sessions', 0)}L  "
+              f"— {cum.get('session_win_rate', 0):.0f}% win rate)")
+        cpnl = cum.get("cumulative_pnl", 0)
+        print(f"  Cumulative P&L:  ${cpnl:+.2f}")
+        print(f"  Peak balance:    ${cum.get('peak_balance', 0):.2f}")
+        print(f"  Trough balance:  ${cum.get('trough_balance', 0):.2f}")
+
+
+def _print_portfolio_table(snapshots: List[dict], mode_label: str) -> None:
+    """Print a formatted table of portfolio snapshots."""
+    print(f"\n  {mode_label} SESSIONS")
+    print(f"  {'─' * 76}")
+    print(f"  {'#':>3}  {'Timestamp':19s}  {'Coins':8s}  {'Start':>9s}  {'End':>9s}  "
+          f"{'P&L':>8s}  {'Delta':>8s}  {'Trades':>6s}")
+    print(f"  {'─' * 76}")
+
+    for i, snap in enumerate(snapshots):
+        ts = snap.get("ts", "?")[:19]
+        coins = ",".join(snap.get("coins", []))[:8]
+        start_t = snap.get("start_balances", {}).get("total", -1)
+        end_t = snap.get("end_balances", {}).get("total", -1)
+        pnl = snap.get("session_pnl")
+        delta_info = snap.get("inter_session_delta")
+        trades = snap.get("trades_filled", snap.get("trades_executed", 0))
+
+        start_str = f"${start_t:.2f}" if start_t >= 0 else "N/A"
+        end_str = f"${end_t:.2f}" if end_t >= 0 else "N/A"
+        pnl_str = f"${pnl:+.2f}" if pnl is not None else "N/A"
+        delta_str = ""
+        if delta_info:
+            bc = delta_info.get("balance_change", 0)
+            delta_str = f"${bc:+.2f}"
+
+        print(f"  {i+1:>3}  {ts:19s}  {coins:8s}  {start_str:>9s}  {end_str:>9s}  "
+              f"{pnl_str:>8s}  {delta_str:>8s}  {trades:>6}")
+
+    print(f"  {'─' * 76}")
+
+    # Per-exchange breakdown for the latest snapshot
+    latest = snapshots[-1]
+    end_bal = latest.get("end_balances", {})
+    if end_bal.get("kalshi", -1) >= 0 or end_bal.get("poly", -1) >= 0:
+        print(f"\n  Latest balances:")
+        if end_bal.get("kalshi", -1) >= 0:
+            print(f"    Kalshi:  ${end_bal['kalshi']:.2f}")
+        if end_bal.get("poly", -1) >= 0:
+            print(f"    Poly:    ${end_bal['poly']:.2f}")
+        if end_bal.get("total", -1) >= 0:
+            print(f"    Total:   ${end_bal['total']:.2f}")
 
 
 def summarize(log_rows: List[dict], coins: List[str], skip_counts: Optional[Dict[str, int]] = None,
@@ -6244,6 +6439,11 @@ def main() -> None:
         check_onchain_positions()
         return
 
+    # Portfolio history mode: view balance changes across sessions and exit
+    if EXEC_MODE == "portfolio":
+        review_portfolio_history()
+        return
+
     market_type = prompt_market_type()
     if market_type != "CRYPTO_15M_UPDOWN":
         raise RuntimeError(f"Market type not implemented: {market_type}")
@@ -7434,6 +7634,7 @@ def main() -> None:
             print(f"  [session-end] Final redemption failed: {e}")
 
     # Final balance check
+    final_bal: Optional[Dict[str, float]] = None
     if EXEC_MODE == "live":
         try:
             final_bal = check_balances(logfile)
@@ -7489,6 +7690,24 @@ def main() -> None:
 
     summarize(logged, selected_coins, skip_counts=skip_counts,
              start_balances=balances, logfile=logfile)
+
+    # Save portfolio snapshot for cross-session tracking
+    try:
+        save_portfolio_snapshot(
+            logfile=logfile,
+            exec_mode=EXEC_MODE,
+            selected_coins=selected_coins,
+            session_duration_s=session_duration_s,
+            end_reason=end_reason,
+            start_balances=balances,
+            end_balances=final_bal,
+            trades_executed=len(logged),
+            trades_filled=successful_trades,
+            total_unwinds=total_unwinds,
+            coin_trade_counts=coin_trade_counts,
+        )
+    except Exception as e:
+        print(f"  [portfolio] Failed to save snapshot: {e}")
 
 
 def _run_with_kill_switch() -> None:
