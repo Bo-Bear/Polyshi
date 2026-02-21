@@ -12,6 +12,7 @@ Usage:
     python analyze_sessions.py --live             # only live-mode sessions
     python analyze_sessions.py --coin BTC         # filter to BTC trades only
     python analyze_sessions.py --since-update     # sessions since last git pull
+    python analyze_sessions.py -n 10              # last 10 sessions (interactive shortcut)
     python analyze_sessions.py --json             # machine-readable output
 """
 
@@ -900,6 +901,7 @@ def output_json(sessions: List[dict], all_trades: List[dict]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cross-session diagnostics analyzer for Polyshi")
     parser.add_argument("--log-dir", default="logs", help="Path to logs directory (default: logs)")
+    parser.add_argument("-n", type=int, metavar="N", help="Number of recent sessions to analyze (interactive shortcut)")
     parser.add_argument("--last", type=int, help="Only analyze the last N sessions")
     parser.add_argument("--latest", action="store_true", help="Only analyze the most recent session (shortcut for --last 1)")
     parser.add_argument("--live", action="store_true", help="Only analyze live-mode sessions")
@@ -912,7 +914,9 @@ def main() -> None:
 
     sessions = load_sessions(args.log_dir)
 
-    # --latest is shorthand for --last 1
+    # -n and --latest are shorthands for --last
+    if args.n:
+        args.last = args.n
     if args.latest:
         args.last = 1
 
@@ -987,6 +991,7 @@ def main() -> None:
     print(f"\n{'═' * 72}")
     print(f"  Run with --json for machine-readable output")
     print(f"  Run with --coin BTC to focus on a single coin")
+    print(f"  Run with -n 5 to quickly pick the last N sessions")
     print(f"  Run with --last 3 to analyze only recent sessions")
     print(f"  Run with --latest to analyze only the most recent session")
     print(f"  Run with --since-update for sessions after last git pull")
