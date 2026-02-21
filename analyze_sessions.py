@@ -21,7 +21,7 @@ import os
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,10 +64,21 @@ def p95(vals: List[float]) -> float:
     return s[min(idx, len(s) - 1)]
 
 
-def bucket_hour(ts_str: str) -> Optional[int]:
-    """Extract UTC hour from an ISO timestamp string."""
+def _utc_to_cst(ts_str: str) -> str:
+    """Convert a 19-char ISO UTC timestamp to CST (UTC-6), return 19-char ISO."""
     try:
-        return int(ts_str[11:13])
+        dt = datetime.strptime(ts_str[:19], "%Y-%m-%dT%H:%M:%S")
+        dt -= timedelta(hours=6)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        return ts_str
+
+
+def bucket_hour(ts_str: str) -> Optional[int]:
+    """Extract CST hour from an ISO timestamp string (assumes UTC input)."""
+    try:
+        utc_h = int(ts_str[11:13])
+        return (utc_h - 6) % 24
     except (IndexError, ValueError, TypeError):
         return None
 
@@ -234,12 +245,12 @@ def analyze_session_overview(sessions: List[dict]) -> None:
     print(f"  Total sessions: {len(sessions)}")
     print()
     fmt = "  {idx:>3}  {ts:19s}  {mode:6s}  {dur:>6s}  {coins:16s}  {trades:>3} trades  {fills:>3} filled  {unwinds:>2} unwinds  {skips:>5} skips"
-    print(f"  {'#':>3}  {'Timestamp':19s}  {'Mode':6s}  {'Dur':>6s}  {'Coins':16s}  {'Trd':>10s}  {'Fill':>10s}  {'Unw':>11s}  {'Skips':>11s}")
+    print(f"  {'#':>3}  {'Timestamp (CST)':19s}  {'Mode':6s}  {'Dur':>6s}  {'Coins':16s}  {'Trd':>10s}  {'Fill':>10s}  {'Unw':>11s}  {'Skips':>11s}")
     print(f"  {'─' * 3}  {'─' * 19}  {'─' * 6}  {'─' * 6}  {'─' * 16}  {'─' * 10}  {'─' * 10}  {'─' * 11}  {'─' * 11}")
 
     for i, s in enumerate(sessions, 1):
         diag = s["session_diag"] or {}
-        ts = diag.get("ts", s["trades"][0]["ts"] if s["trades"] else "?")[:19]
+        ts = _utc_to_cst(diag.get("ts", s["trades"][0]["ts"] if s["trades"] else "?")[:19])
         mode = diag.get("exec_mode", s["trades"][0].get("exec_mode", "?") if s["trades"] else "?")
         coins = ",".join(diag.get("coins", []))
         if not coins and s["trades"]:
@@ -495,7 +506,7 @@ def analyze_timing(all_trades: List[dict]) -> None:
             hour_trades[h].append(t)
 
     if hour_trades:
-        print(f"  Trades by UTC hour:")
+        print(f"  Trades by CST hour:")
         for h in sorted(hour_trades.keys()):
             rows = hour_trades[h]
             verified = [t for t in rows if t.get("actual_pnl_total") is not None]
@@ -665,7 +676,7 @@ def analyze_pnl(all_trades: List[dict], sessions: List[dict]) -> None:
     if mismatches:
         print(f"\n  ⚠ HEDGE MISMATCHES: {len(mismatches)} trades where BOTH legs lost")
         for t in mismatches:
-            print(f"    [{t.get('ts', '?')}] {t.get('coin', '?')} | "
+            print(f"    [{_utc_to_cst(t.get('ts', '?'))}] {t.get('coin', '?')} | "
                   f"P&L {usd(t['actual_pnl_total'])} | edge {pct(t.get('net_edge', 0))} | "
                   f"strike_div {t.get('strike_spot_divergence_pct', '?')}%")
 
