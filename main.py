@@ -549,6 +549,54 @@ def _get_condition_id_for_token(token_id: str) -> Optional[str]:
     return cid
 
 
+def _check_token_payouts(up_tid: str, down_tid: str) -> Tuple[Optional[float], Optional[float]]:
+    """Check Gamma API for resolved outcome prices of a token pair.
+
+    Queries the market containing these tokens and extracts the final outcome
+    prices.  Returns (up_payout, down_payout) where 1.0 = winner, 0.0 = loser,
+    None = market not found or not yet resolved.
+    """
+    for tid in (up_tid, down_tid):
+        try:
+            url = "https://gamma-api.polymarket.com/markets"
+            r = _get_session().get(url, params={"clob_token_ids": str(tid)}, timeout=10)
+            r.raise_for_status()
+            markets = r.json()
+            if not markets:
+                continue
+            m = markets[0]
+
+            outcome_prices = m.get("outcomePrices")
+            if not outcome_prices:
+                continue
+
+            if isinstance(outcome_prices, str):
+                outcome_prices = json.loads(outcome_prices)
+
+            token_ids = m.get("clobTokenIds")
+            if isinstance(token_ids, str):
+                token_ids = json.loads(token_ids)
+
+            if not token_ids or not outcome_prices or len(token_ids) < 2 or len(outcome_prices) < 2:
+                continue
+
+            # Build token→price map
+            price_map: Dict[str, float] = {}
+            for t, p in zip(token_ids, outcome_prices):
+                try:
+                    price_map[str(t)] = float(p)
+                except (ValueError, TypeError):
+                    pass
+
+            up_payout = price_map.get(up_tid)
+            down_payout = price_map.get(down_tid)
+            if up_payout is not None or down_payout is not None:
+                return up_payout, down_payout
+        except Exception:
+            continue
+    return None, None
+
+
 def _get_ctf_balance(owner: str, token_id: str, retries: int = 3) -> int:
     """Check ERC-1155 CTF token balance on-chain. Returns raw balance.
     Retries on RPC failure to avoid returning 0 for transient network errors."""
@@ -870,6 +918,17 @@ def redeem_poly_positions(trade_rows: List[dict]) -> int:
 
         if up_bal == 0 and down_bal == 0:
             continue  # No tokens to redeem
+
+        # Skip if we only hold losing tokens — no payout, saves gas
+        up_payout, down_payout = _check_token_payouts(up_tid, down_tid)
+        has_winning = ((up_bal > 0 and up_payout is not None and up_payout > 0.5) or
+                       (down_bal > 0 and down_payout is not None and down_payout > 0.5))
+        all_known = (up_payout is not None and down_payout is not None)
+        if all_known and not has_winning:
+            losing_side = "UP" if up_bal > 0 else "DOWN"
+            print(f"  [redeem] Skipping {up_bal} UP + {down_bal} DOWN tokens — "
+                  f"only hold losing {losing_side} side (saves gas)")
+            continue
 
         # Get conditionId and market type from Gamma API
         condition_id, neg_risk = _get_market_info_for_token(up_tid)
@@ -1469,11 +1528,31 @@ def redeem_all_old_positions() -> int:
     nonce = int(nonce_hex, 16)
     print(f"  [redeem] Starting nonce: {nonce} (pending)")
 
+    # Pre-filter: skip positions where we only hold losing tokens (saves gas)
+    gas_saved = 0
+    redeemable = []
+    for up_tid, down_tid, up_bal, down_bal in non_zero:
+        up_payout, down_payout = _check_token_payouts(up_tid, down_tid)
+        has_winning = ((up_bal > 0 and up_payout is not None and up_payout > 0.5) or
+                       (down_bal > 0 and down_payout is not None and down_payout > 0.5))
+        all_known = (up_payout is not None and down_payout is not None)
+        if all_known and not has_winning:
+            losing_side = "UP" if up_bal > 0 else "DOWN"
+            print(f"  [redeem] Skipping {up_bal} UP + {down_bal} DOWN — "
+                  f"only hold losing {losing_side} side (saves gas)")
+            gas_saved += 1
+            continue
+        redeemable.append((up_tid, down_tid, up_bal, down_bal))
+
+    if gas_saved:
+        print(f"  [redeem] Skipped {gas_saved} losing-only position(s), "
+              f"{len(redeemable)} to redeem")
+
     # Redeem each non-zero position
     redeemed = 0
     errors = 0
     total_payout = 0  # micro-USDC
-    for i, (up_tid, down_tid, up_bal, down_bal) in enumerate(non_zero):
+    for i, (up_tid, down_tid, up_bal, down_bal) in enumerate(redeemable):
         # Get conditionId AND market type from Gamma API
         condition_id, neg_risk = _get_market_info_for_token(up_tid)
         if not condition_id:
@@ -1484,7 +1563,7 @@ def redeem_all_old_positions() -> int:
             continue
 
         mtype = "NegRisk" if neg_risk else "standard"
-        print(f"  [redeem] [{i+1}/{len(non_zero)}] Market {condition_id[:16]}... ({mtype}): {up_bal} UP + {down_bal} DOWN tokens")
+        print(f"  [redeem] [{i+1}/{len(redeemable)}] Market {condition_id[:16]}... ({mtype}): {up_bal} UP + {down_bal} DOWN tokens")
 
         # Check balance before to verify redemption actually burns tokens
         pre_up = _get_ctf_balance(addr, up_tid) if up_bal > 0 else 0
@@ -1516,7 +1595,8 @@ def redeem_all_old_positions() -> int:
             errors += 1
 
     payout_str = f", +${total_payout / 1e6:.2f} USDC.e recovered" if total_payout > 0 else ""
-    print(f"\n  [redeem] Done: {redeemed} redeemed{payout_str}, {skipped} already empty, {errors} errors")
+    gas_str = f", {gas_saved} losing skipped" if gas_saved else ""
+    print(f"\n  [redeem] Done: {redeemed} redeemed{payout_str}, {skipped} already empty{gas_str}, {errors} errors")
     return redeemed
 
 
