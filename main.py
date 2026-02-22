@@ -6882,6 +6882,7 @@ def main() -> None:
     window_trades: List[dict] = []                       # Trades placed in the current window
     window_open_spot_prices: Dict[str, float] = {}       # Spot prices at window open (best proxy for Poly ref)
     pending_redemption_trades: List[dict] = []            # Trades awaiting deferred redemption (2 min into next window)
+    pending_window_pnl: float = 0.0                       # P&L deferred until after redemptions complete
     stop_reason: Optional[str] = None
 
     if unlimited_session:
@@ -7032,7 +7033,11 @@ def main() -> None:
                     if not stop_reason:
                         window_pnl = current_total - window_start_total
                         if _dashboard:
-                            _dashboard.confirm_window_profit(window_pnl)
+                            if pending_redemption_trades:
+                                # Defer profit update until after deferred redemptions complete
+                                pending_window_pnl += window_pnl
+                            else:
+                                _dashboard.confirm_window_profit(window_pnl)
                         if window_pnl < 0:
                             consecutive_losing_windows += 1
                             print(f"  [window] Window P&L: ${window_pnl:+.2f} "
@@ -7207,13 +7212,16 @@ def main() -> None:
                     print(f"  [redeem] Deferred redemption failed: {e}")
                 pending_redemption_trades = []
 
-                # Refresh dashboard balances after deferred redemption
+                # Refresh dashboard balances and flush deferred profit after redemption
                 if _dashboard:
                     try:
                         refreshed_bal = check_balances(logfile)
                         _dashboard.update_balances(refreshed_bal)
                     except Exception:
                         pass  # non-critical — dashboard will show last known balances
+                    if pending_window_pnl != 0.0:
+                        _dashboard.confirm_window_profit(pending_window_pnl)
+                        pending_window_pnl = 0.0
 
         best_global: Optional[HedgeCandidate] = None
         best_global_poly: Optional[PolyMarketQuote] = None
@@ -7953,13 +7961,16 @@ def main() -> None:
         except Exception as e:
             print(f"  [session-end] Final redemption failed: {e}")
 
-        # Refresh dashboard balances after final redemption
+        # Refresh dashboard balances and flush deferred profit after final redemption
         if _dashboard:
             try:
                 refreshed_bal = check_balances(logfile)
                 _dashboard.update_balances(refreshed_bal)
             except Exception:
                 pass  # non-critical — final balance check below will also refresh
+            if pending_window_pnl != 0.0:
+                _dashboard.confirm_window_profit(pending_window_pnl)
+                pending_window_pnl = 0.0
 
     # Final balance check
     final_bal: Optional[Dict[str, float]] = None
