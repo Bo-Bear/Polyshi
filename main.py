@@ -3002,7 +3002,8 @@ class CleanDashboard:
         self._start_mono = session_start_mono
         # Stats — TOTAL
         self.markets_scanned = 0
-        self.profit = 0.0
+        self.profit = 0.0           # confirmed profit from ended windows only
+        self.confirmed_profit = 0.0  # accumulates only when a window closes
         # Stats — TRADES
         self.trades_total = 0
         self.trades_both_filled = 0
@@ -3051,6 +3052,10 @@ class CleanDashboard:
     def update_profit(self, profit: float) -> None:
         self.profit = profit
 
+    def confirm_window_profit(self, window_pnl: float) -> None:
+        """Lock in profit from a completed 15-min window."""
+        self.confirmed_profit += window_pnl
+
     def add_event(self, msg: str) -> None:
         self._add_event(msg)
 
@@ -3063,12 +3068,16 @@ class CleanDashboard:
         mins = int((elapsed % 3600) // 60)
         duration_str = f"{hours}h {mins}m"
 
-        per_hour = (self.profit / (elapsed / 3600)) if elapsed > 60 else 0.0
+        per_hour = (self.confirmed_profit / (elapsed / 3600)) if elapsed > 60 else 0.0
 
-        profit_color = GREEN if self.profit >= 0 else RED
-        per_hour_color = GREEN if per_hour >= 0 else RED
+        profit_color = RED if self.confirmed_profit < 0 else ""
+        profit_reset = RESET if self.confirmed_profit < 0 else ""
+        per_hour_color = RED if per_hour < 0 else ""
+        per_hour_reset = RESET if per_hour < 0 else ""
         failed_color = RED if self.unwinds_failed > 0 else ""
         failed_reset = RESET if self.unwinds_failed > 0 else ""
+        loss_color = RED if self.unwinds_total_loss < 0 else ""
+        loss_reset = RESET if self.unwinds_total_loss < 0 else ""
 
         lines = []
         lines.append("")
@@ -3077,9 +3086,9 @@ class CleanDashboard:
         lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
         lines.append(f" {BOLD}║{RESET}  {BOLD}TOTAL{RESET}                                                       {BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Duration:      {duration_str:<42}{BOLD}║{RESET}")
-        lines.append(f" {BOLD}║{RESET}    Markets:       {self.markets_scanned:<42}{BOLD}║{RESET}")
-        lines.append(f" {BOLD}║{RESET}    Profit:        {profit_color}${self.profit:+.2f}{RESET}{' ' * max(0, 40 - len(f'${self.profit:+.2f}'))}{BOLD}║{RESET}")
-        lines.append(f" {BOLD}║{RESET}    Per-Hour:      {per_hour_color}${per_hour:+.2f}{RESET}{' ' * max(0, 40 - len(f'${per_hour:+.2f}'))}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Scans:         {self.markets_scanned:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Profit:        {profit_color}${self.confirmed_profit:+.2f}{profit_reset}{' ' * max(0, 40 - len(f'${self.confirmed_profit:+.2f}'))}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Per-Hour:      {per_hour_color}${per_hour:+.2f}{per_hour_reset}{' ' * max(0, 40 - len(f'${per_hour:+.2f}'))}{BOLD}║{RESET}")
         lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
         lines.append(f" {BOLD}║{RESET}  {BOLD}TRADES{RESET}                                                      {BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Total:         {self.trades_total:<42}{BOLD}║{RESET}")
@@ -3091,7 +3100,7 @@ class CleanDashboard:
         lines.append(f" {BOLD}║{RESET}    Total:         {self.unwinds_total:<42}{BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Successful:    {self.unwinds_successful:<42}{BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Failed:        {failed_color}{self.unwinds_failed}{failed_reset}{' ' * max(0, 42 - len(str(self.unwinds_failed)))}{BOLD}║{RESET}")
-        lines.append(f" {BOLD}║{RESET}    Total Loss:    {RED}${self.unwinds_total_loss:.2f}{RESET}{' ' * max(0, 40 - len(f'${self.unwinds_total_loss:.2f}'))}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Total Loss:    {loss_color}${self.unwinds_total_loss:.2f}{loss_reset}{' ' * max(0, 40 - len(f'${self.unwinds_total_loss:.2f}'))}{BOLD}║{RESET}")
         lines.append(f" {BOLD}╚══════════════════════════════════════════════════════════════╝{RESET}")
         lines.append("")
 
@@ -6997,6 +7006,8 @@ def main() -> None:
                     # Stop contingency 2: consecutive losing windows
                     if not stop_reason:
                         window_pnl = current_total - window_start_total
+                        if _dashboard:
+                            _dashboard.confirm_window_profit(window_pnl)
                         if window_pnl < 0:
                             consecutive_losing_windows += 1
                             print(f"  [window] Window P&L: ${window_pnl:+.2f} "
