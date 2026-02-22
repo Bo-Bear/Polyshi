@@ -101,6 +101,13 @@ MAX_STRIKE_SPOT_DIVERGENCE = float(os.getenv("MAX_STRIKE_SPOT_DIVERGENCE", "0.00
 # exceeds this tolerance.  Small default allows for minor rounding between exchanges.
 MAX_DEAD_ZONE_DOLLARS = float(os.getenv("MAX_DEAD_ZONE_DOLLARS", "0.15"))
 
+# Directional combo pre-filter tolerance (in dollars).
+# When abs(kalshi_strike - poly_reference) > this, only evaluate the combo
+# whose win-zones overlap (the "safe" direction).  Inside this tolerance,
+# both combos are evaluated as before.
+# Setting to 0 = always pre-filter; setting to float('inf') = disable pre-filter.
+COMBO_DIRECTION_TOLERANCE = float(os.getenv("COMBO_DIRECTION_TOLERANCE", "0.50"))
+
 # Minimum account balance — stop session if either exchange drops below this ($)
 MIN_ACCOUNT_BALANCE = float(os.getenv("MIN_ACCOUNT_BALANCE", "50.0"))  # $50
 
@@ -1364,6 +1371,8 @@ class HedgeCandidate:
     poly_ref: str
     kalshi_ref: str
     dead_zone_dollars: float = 0.0  # gap ($) where both legs lose; 0 = overlap, inf = unknown (fail closed)
+    combo_prefilter: str = "both"  # "combo1_only", "combo2_only", or "both" — which combos were evaluated
+    strike_ref_gap: Optional[float] = None  # kalshi_strike - poly_reference ($); positive = Kalshi higher
 
 
 @dataclass
@@ -2851,55 +2860,86 @@ def best_hedge_for_coin(coin: str, poly: PolyMarketQuote, kalshi: KalshiMarketQu
 
     cands: List[HedgeCandidate] = []
 
-    # 1) Poly Up + Kalshi Down
-    total1 = poly.up_price + kalshi_down
-    gross1 = 1.0 - total1
-    poly_fee1, kalshi_fee1 = fees_for_leg(poly.up_price, kalshi_down)
-    net1 = 1.0 - total1 - (poly_fee1 + kalshi_fee1 + extras) / PAPER_CONTRACTS - EXECUTION_SLIPPAGE_BUDGET
+    # --- Directional combo pre-filter ---
+    # When kalshi_strike and poly reference are both known, use their gap
+    # direction to skip the combo whose win-zones don't overlap (dead-zone
+    # side).  Inside the tolerance band, evaluate both combos as before.
+    #   gap > +tolerance  → Kalshi higher → only Combo 1 (K_DOWN + P_UP)
+    #   gap < -tolerance  → Poly higher   → only Combo 2 (K_UP + P_DOWN)
+    #   |gap| <= tolerance → evaluate both
+    _build_combo1 = True   # P_UP  + K_DOWN
+    _build_combo2 = True   # P_DOWN + K_UP
+    _combo_prefilter = "both"  # for logging: "combo1_only", "combo2_only", "both"
+    _strike_ref_gap: Optional[float] = None
 
-    cands.append(
-        HedgeCandidate(
-            coin=coin,
-            direction_on_poly="UP",
-            direction_on_kalshi="DOWN",
-            poly_price=poly.up_price,
-            kalshi_price=kalshi_down,
-            total_cost=total1,
-            gross_edge=gross1,
-            net_edge=net1,
-            poly_fee=poly_fee1,
-            kalshi_fee=kalshi_fee1,
-            extras=extras,
-            poly_ref=f"{poly.event_slug}/{poly.market_slug}",
-            kalshi_ref=kalshi.ticker,
-            dead_zone_dollars=_dead_zone("DOWN"),
+    if kalshi_strike is not None and ref is not None:
+        _strike_ref_gap = kalshi_strike - ref
+        if _strike_ref_gap > COMBO_DIRECTION_TOLERANCE:
+            # Kalshi strike higher → Combo 1 has overlap zone, Combo 2 has dead zone
+            _build_combo1 = True
+            _build_combo2 = False
+            _combo_prefilter = "combo1_only"
+        elif _strike_ref_gap < -COMBO_DIRECTION_TOLERANCE:
+            # Poly reference higher → Combo 2 has overlap zone, Combo 1 has dead zone
+            _build_combo1 = False
+            _build_combo2 = True
+            _combo_prefilter = "combo2_only"
+
+    # 1) Poly Up + Kalshi Down
+    if _build_combo1:
+        total1 = poly.up_price + kalshi_down
+        gross1 = 1.0 - total1
+        poly_fee1, kalshi_fee1 = fees_for_leg(poly.up_price, kalshi_down)
+        net1 = 1.0 - total1 - (poly_fee1 + kalshi_fee1 + extras) / PAPER_CONTRACTS - EXECUTION_SLIPPAGE_BUDGET
+
+        cands.append(
+            HedgeCandidate(
+                coin=coin,
+                direction_on_poly="UP",
+                direction_on_kalshi="DOWN",
+                poly_price=poly.up_price,
+                kalshi_price=kalshi_down,
+                total_cost=total1,
+                gross_edge=gross1,
+                net_edge=net1,
+                poly_fee=poly_fee1,
+                kalshi_fee=kalshi_fee1,
+                extras=extras,
+                poly_ref=f"{poly.event_slug}/{poly.market_slug}",
+                kalshi_ref=kalshi.ticker,
+                dead_zone_dollars=_dead_zone("DOWN"),
+                combo_prefilter=_combo_prefilter,
+                strike_ref_gap=round(_strike_ref_gap, 2) if _strike_ref_gap is not None else None,
+            )
         )
-    )
 
     # 2) Poly Down + Kalshi Up
-    total2 = poly.down_price + kalshi_up
-    gross2 = 1.0 - total2
-    poly_fee2, kalshi_fee2 = fees_for_leg(poly.down_price, kalshi_up)
-    net2 = 1.0 - total2 - (poly_fee2 + kalshi_fee2 + extras) / PAPER_CONTRACTS - EXECUTION_SLIPPAGE_BUDGET
+    if _build_combo2:
+        total2 = poly.down_price + kalshi_up
+        gross2 = 1.0 - total2
+        poly_fee2, kalshi_fee2 = fees_for_leg(poly.down_price, kalshi_up)
+        net2 = 1.0 - total2 - (poly_fee2 + kalshi_fee2 + extras) / PAPER_CONTRACTS - EXECUTION_SLIPPAGE_BUDGET
 
-    cands.append(
-        HedgeCandidate(
-            coin=coin,
-            direction_on_poly="DOWN",
-            direction_on_kalshi="UP",
-            poly_price=poly.down_price,
-            kalshi_price=kalshi_up,
-            total_cost=total2,
-            gross_edge=gross2,
-            net_edge=net2,
-            poly_fee=poly_fee2,
-            kalshi_fee=kalshi_fee2,
-            extras=extras,
-            poly_ref=f"{poly.event_slug}/{poly.market_slug}",
-            kalshi_ref=kalshi.ticker,
-            dead_zone_dollars=_dead_zone("UP"),
+        cands.append(
+            HedgeCandidate(
+                coin=coin,
+                direction_on_poly="DOWN",
+                direction_on_kalshi="UP",
+                poly_price=poly.down_price,
+                kalshi_price=kalshi_up,
+                total_cost=total2,
+                gross_edge=gross2,
+                net_edge=net2,
+                poly_fee=poly_fee2,
+                kalshi_fee=kalshi_fee2,
+                extras=extras,
+                poly_ref=f"{poly.event_slug}/{poly.market_slug}",
+                kalshi_ref=kalshi.ticker,
+                dead_zone_dollars=_dead_zone("UP"),
+                combo_prefilter=_combo_prefilter,
+                strike_ref_gap=round(_strike_ref_gap, 2) if _strike_ref_gap is not None else None,
+            )
         )
-    )
 
     # Fee-aware viability with execution safeguards:
     viable = [c for c in cands if c.total_cost < MAX_TOTAL_COST
@@ -7525,6 +7565,8 @@ def main() -> None:
                 "spot_price": spot_prices.get(best_global.coin),
                 "kalshi_strike": best_global_kalshi.strike,
                 "dead_zone_dollars": best_global.dead_zone_dollars,
+                "combo_prefilter": best_global.combo_prefilter,
+                "strike_ref_gap": best_global.strike_ref_gap,
                 "poly_ref_source": "description" if best_global_poly.ref_price is not None else ("window_open_spot" if window_open_spot_prices.get(best_global.coin) is not None else "unknown"),
                 "window_open_spot": window_open_spot_prices.get(best_global.coin),
                 "strike_spot_divergence_pct": round(abs(float(best_global_kalshi.strike) - spot_prices.get(best_global.coin, 0)) / spot_prices.get(best_global.coin, 1) * 100, 4) if best_global_kalshi.strike else None,
