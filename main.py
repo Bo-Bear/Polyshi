@@ -2996,7 +2996,7 @@ def _stdin_stop_listener() -> None:
 class CleanDashboard:
     """Static terminal dashboard that redraws in place for live_clean mode."""
 
-    DASHBOARD_LINES = 25  # fixed number of lines the dashboard occupies
+    DASHBOARD_LINES = 28  # fixed number of lines the dashboard occupies
 
     def __init__(self, session_start_mono: float, kalshi_balance: float = 0.0, poly_balance: float = 0.0):
         self._start_mono = session_start_mono
@@ -3012,6 +3012,9 @@ class CleanDashboard:
         self.trades_both_filled = 0
         self.trades_one_legged = 0
         self.trades_neither_filled = 0
+        self.pending_trades = 0
+        self.pending_exposure = 0.0
+        self.pending_potential = 0.0
         # Stats — UNWINDS
         self.unwinds_total = 0
         self.unwinds_successful = 0
@@ -3051,6 +3054,24 @@ class CleanDashboard:
                 self.unwinds_total_loss += loss
                 self._add_event(f"{YELLOW}UNWIND{RESET}  {row.get('coin','?')} "
                                 f"sold @ ${exec_result.unwind_sell_price:.2f}  loss=${loss:.2f}")
+
+    def update_pending(self, window_trades: list, pending_redemption_trades: list) -> None:
+        """Recompute pending trade stats from current trade lists."""
+        all_pending = [t for t in list(window_trades) + list(pending_redemption_trades)
+                       if t.get("exec_both_filled")]
+        self.pending_trades = len(all_pending)
+        exposure = 0.0
+        potential = 0.0
+        for t in all_pending:
+            poly_px = t.get("exec_leg1_actual_price") or t.get("poly_price", 0)
+            kalshi_px = t.get("exec_leg2_actual_price") or t.get("kalshi_price", 0)
+            p_qty = t.get("exec_leg1_filled_qty", 0) or 0
+            k_qty = t.get("exec_leg2_filled_qty", 0) or 0
+            hedged = min(p_qty, k_qty)
+            exposure += poly_px * p_qty + kalshi_px * k_qty
+            potential += t.get("net_edge", 0) * hedged
+        self.pending_exposure = exposure
+        self.pending_potential = potential
 
     def update_profit(self, profit: float) -> None:
         self.profit = profit
@@ -3113,6 +3134,11 @@ class CleanDashboard:
         lines.append(f" {BOLD}║{RESET}    Both Filled:    {self.trades_both_filled:<41}{BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    One-Legged:     {self.trades_one_legged:<41}{BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Neither Filled: {self.trades_neither_filled:<41}{BOLD}║{RESET}")
+        pending_exposure_str = f"${self.pending_exposure:,.2f}"
+        pending_potential_str = f"${self.pending_potential:,.4f}"
+        lines.append(f" {BOLD}║{RESET}    Pending Trades:    {self.pending_trades:<38}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Pending Exposure:  {pending_exposure_str:<38}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Pending Potential: {pending_potential_str:<38}{BOLD}║{RESET}")
         lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
         lines.append(f" {BOLD}║{RESET}  {BOLD}UNWINDS{RESET}                                                     {BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Total:         {self.unwinds_total:<42}{BOLD}║{RESET}")
@@ -6944,6 +6970,10 @@ def main() -> None:
                 print(f"  [window] Queued {len(window_trades)} trade(s) for deferred redemption "
                       f"(will attempt ~2 min into next window)")
 
+            # Update pending stats after trades move to deferred redemption
+            if _dashboard:
+                _dashboard.update_pending(window_trades, pending_redemption_trades)
+
             # 1b. Refresh portfolio balances on dashboard after window close
             if _dashboard:
                 try:
@@ -7055,6 +7085,8 @@ def main() -> None:
                     print(f"  [window] Post-market cycle failed: {e}")
 
             window_trades = []
+            if _dashboard:
+                _dashboard.update_pending(window_trades, pending_redemption_trades)
             current_window_close_ts = None  # Will be set from next market data
             window_open_utc = None  # Reset so startup delay triggers for new window
             window_open_spot_prices = {}  # Reset — will be populated on first spot fetch of new window
@@ -7214,6 +7246,7 @@ def main() -> None:
 
                 # Refresh dashboard balances and flush deferred profit after redemption
                 if _dashboard:
+                    _dashboard.update_pending(window_trades, pending_redemption_trades)
                     try:
                         refreshed_bal = check_balances(logfile)
                         _dashboard.update_balances(refreshed_bal)
@@ -7759,6 +7792,7 @@ def main() -> None:
 
             if _dashboard:
                 _dashboard.record_trade(exec_result, row)
+                _dashboard.update_pending(window_trades, pending_redemption_trades)
 
             # Per-coin tracking: update trade count, edge history, and unwind counter
             traded_coin = best_global.coin
