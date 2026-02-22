@@ -3130,10 +3130,10 @@ class CleanDashboard:
         lines.append(f" {BOLD}║{RESET}    Per-Hour:      {per_hour_color}${per_hour:+.2f}{per_hour_reset}{' ' * max(0, 40 - len(f'${per_hour:+.2f}'))}{BOLD}║{RESET}")
         lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
         lines.append(f" {BOLD}║{RESET}  {BOLD}TRADES{RESET}                                                      {BOLD}║{RESET}")
-        lines.append(f" {BOLD}║{RESET}    Total:          {self.trades_total:<41}{BOLD}║{RESET}")
-        lines.append(f" {BOLD}║{RESET}    Both Filled:    {self.trades_both_filled:<41}{BOLD}║{RESET}")
-        lines.append(f" {BOLD}║{RESET}    One-Legged:     {self.trades_one_legged:<41}{BOLD}║{RESET}")
-        lines.append(f" {BOLD}║{RESET}    Neither Filled: {self.trades_neither_filled:<41}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Total:             {self.trades_total:<38}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Both Filled:       {self.trades_both_filled:<38}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    One-Legged:        {self.trades_one_legged:<38}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Neither Filled:    {self.trades_neither_filled:<38}{BOLD}║{RESET}")
         pending_exposure_str = f"${self.pending_exposure:,.2f}"
         pending_potential_str = f"${self.pending_potential:,.4f}"
         lines.append(f" {BOLD}║{RESET}    Pending Trades:    {self.pending_trades:<38}{BOLD}║{RESET}")
