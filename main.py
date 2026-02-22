@@ -2167,6 +2167,7 @@ SESSION_DURATION_OPTIONS = {
     "1": ("15 minutes", 15 * 60),
     "2": ("30 minutes", 30 * 60),
     "3": ("1 hour", 60 * 60),
+    "4": ("Unlimited", 0),
 }
 
 def prompt_session_duration() -> int:
@@ -2183,7 +2184,7 @@ def prompt_session_duration() -> int:
             label, seconds = SESSION_DURATION_OPTIONS[key]
             print(f"\nSession duration: {label}")
             return seconds
-        print("Invalid selection. Enter 1, 2, or 3.")
+        print("Invalid selection. Enter 1, 2, 3, or 4.")
 
 
 def dollars_from_cents_maybe(x) -> Optional[float]:
@@ -3853,7 +3854,7 @@ def print_session_diagnostics(
     print(f"  Version:             {VERSION}")
     print(f"  Mode:                {EXEC_MODE}")
     print(f"  Coins:               {', '.join(selected_coins)}")
-    print(f"  Duration:            {session_duration_s:.0f}s ({session_duration_s / 60:.0f}m)")
+    print(f"  Duration:            {'Unlimited' if session_duration_s == 0 else f'{session_duration_s:.0f}s ({session_duration_s / 60:.0f}m)'}")
     print(f"  Contracts:           {int(PAPER_CONTRACTS)}")
     print(f"  End reason:          {end_reason}")
     print(f"  Total scans:         {scan_count}")
@@ -6491,7 +6492,12 @@ def main() -> None:
     print("\nConfirm settings")
     print("=" * 45)
     mode_label = "*** LIVE TRADING ***" if EXEC_MODE == "live" else "Paper Testing"
-    duration_label = f"{session_duration_s // 60} minutes" if session_duration_s < 3600 else "1 hour"
+    if session_duration_s == 0:
+        duration_label = "Unlimited"
+    elif session_duration_s < 3600:
+        duration_label = f"{session_duration_s // 60} minutes"
+    else:
+        duration_label = "1 hour"
     print(f"Execution:  {mode_label}")
     print(f"Market Type: {market_type}")
     print(f"Coins: {', '.join(selected_coins)}")
@@ -6665,8 +6671,9 @@ def main() -> None:
     _scan_poly_quotes: Dict[str, Optional[PolyMarketQuote]] = {}
 
     # --- Timed session + window tracking ---
-    session_deadline = time.monotonic() + session_duration_s
-    session_end_utc = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=session_duration_s)
+    unlimited_session = session_duration_s == 0
+    session_deadline = float('inf') if unlimited_session else time.monotonic() + session_duration_s
+    session_end_utc = None if unlimited_session else datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=session_duration_s)
     current_window_close_ts: Optional[datetime] = None  # UTC close time of current 15m window
     window_open_utc: Optional[datetime] = None           # UTC time when current window was first detected
     window_start_total = session_start_total             # Portfolio value at start of current window
@@ -6675,7 +6682,10 @@ def main() -> None:
     window_open_spot_prices: Dict[str, float] = {}       # Spot prices at window open (best proxy for Poly ref)
     stop_reason: Optional[str] = None
 
-    print(f"\n  Session started — will run until {session_end_utc.strftime('%H:%M:%S')} UTC ({duration_label})")
+    if unlimited_session:
+        print(f"\n  Session started — running indefinitely (Unlimited)")
+    else:
+        print(f"\n  Session started — will run until {session_end_utc.strftime('%H:%M:%S')} UTC ({duration_label})")
 
     while time.monotonic() < session_deadline:
         scan_i += 1
@@ -6824,10 +6834,14 @@ def main() -> None:
 
         # Show remaining session time in header
         session_remaining_s = max(0, session_deadline - time.monotonic())
-        session_remaining_m = int(session_remaining_s // 60)
-        session_remaining_sec = int(session_remaining_s % 60)
+        if unlimited_session:
+            time_part = "unlimited"
+        else:
+            session_remaining_m = int(session_remaining_s // 60)
+            session_remaining_sec = int(session_remaining_s % 60)
+            time_part = f"{session_remaining_m}m {session_remaining_sec}s left"
         print_scan_header(scan_i,
-                          f"{session_remaining_m}m {session_remaining_sec}s left · "
+                          f"{time_part} · "
                           f"{successful_trades} trades · {consecutive_losing_windows}/2 losing windows")
 
         # Overlap Gamma event fetch with Kalshi fetches so neither exchange's
