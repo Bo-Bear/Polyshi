@@ -7207,6 +7207,14 @@ def main() -> None:
                     print(f"  [redeem] Deferred redemption failed: {e}")
                 pending_redemption_trades = []
 
+                # Refresh dashboard balances after deferred redemption
+                if _dashboard:
+                    try:
+                        refreshed_bal = check_balances(logfile)
+                        _dashboard.update_balances(refreshed_bal)
+                    except Exception:
+                        pass  # non-critical — dashboard will show last known balances
+
         best_global: Optional[HedgeCandidate] = None
         best_global_poly: Optional[PolyMarketQuote] = None
         best_global_kalshi: Optional[KalshiMarketQuote] = None
@@ -7944,6 +7952,14 @@ def main() -> None:
                 print(f"  [session-end] Redeemed {n} position(s)")
         except Exception as e:
             print(f"  [session-end] Final redemption failed: {e}")
+
+        # Refresh dashboard balances after final redemption
+        if _dashboard:
+            try:
+                refreshed_bal = check_balances(logfile)
+                _dashboard.update_balances(refreshed_bal)
+            except Exception:
+                pass  # non-critical — final balance check below will also refresh
 
     # Final balance check
     final_bal: Optional[Dict[str, float]] = None
