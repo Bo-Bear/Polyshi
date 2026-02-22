@@ -7933,6 +7933,7 @@ def main() -> None:
                     _sys.stdout = _sys.__stdout__
                     _dashboard.add_event(f"{RED}CIRCUIT BREAKER{RESET}  {MAX_CONSECUTIVE_SKIPS} consecutive skips")
                     _dashboard.render()
+                stop_reason = f"CIRCUIT BREAKER: {MAX_CONSECUTIVE_SKIPS} consecutive scans with no viable trades"
                 break
 
         # Background sweep: retry any failed unwinds between scans
