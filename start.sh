@@ -42,5 +42,5 @@ if [[ -f "$DIR/venv/bin/activate" ]]; then
 fi
 
 # ── Launch new tmux session with the bot ─────────────────────────
-tmux new-session -d -s "$SESSION" -c "$DIR" "${ACTIVATE}python main.py"
+tmux new-session -d -s "$SESSION" -c "$DIR" "${ACTIVATE}python3 main.py"
 exec tmux attach -t "$SESSION"
