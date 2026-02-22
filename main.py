@@ -78,10 +78,6 @@ MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.10"))  # 10%
 PRICE_FLOOR = float(os.getenv("PRICE_FLOOR", "0.10"))   # skip legs below 10c
 PRICE_CEILING = float(os.getenv("PRICE_CEILING", "0.98"))  # skip legs priced above 98c
 
-# Session-level circuit breaker: stop scanning after this many consecutive no-trade scans
-# (may indicate stale data or broken feeds)
-MAX_CONSECUTIVE_SKIPS = int(os.getenv("MAX_CONSECUTIVE_SKIPS", "500"))
-
 # Maximum gross cost we'll accept (tighter than 1.0 to leave room for execution slippage)
 MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "0.98"))
 
@@ -6750,7 +6746,6 @@ def main() -> None:
     print(f"  Depth cap ratio:    {POLY_DEPTH_CAP_RATIO:.0%} of Poly book (min {MIN_CONTRACTS} contracts)")
     print(f"  Poly min notional:  ${POLY_MIN_ORDER_NOTIONAL:.2f} (auto-raises contract count)")
     print(f"  Max unhedged time:  {MAX_UNHEDGED_SECONDS:.0f}s per attempt (3-pass unwind: best_bid → best_bid-$0.02 → $0.01 floor)")
-    print(f"  Circuit breaker:    {MAX_CONSECUTIVE_SKIPS} consecutive skips")
     print(f"  Poly fill retries:  {POLY_FILL_MAX_RETRIES} attempts x {POLY_FILL_RETRY_TIMEOUT_S:.0f}s each")
     print(f"  Per-coin trade cap: {MAX_TRADES_PER_COIN} trades/coin (incl. unwinds)")
     print(f"  Per-window cap:     {MAX_TRADES_PER_COIN_PER_WINDOW} trades/coin/window (resets each 15m)")
@@ -7927,14 +7922,6 @@ def main() -> None:
                 for reason, count in top_reasons:
                     print(f"    {reason:30s} {count:4d} ({count/total_skips*100:5.1f}%)")
                 print()
-            if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
-                print(f"\n⚠ Circuit breaker: {MAX_CONSECUTIVE_SKIPS} consecutive scans with no viable trades. Stopping.")
-                if _dashboard:
-                    _sys.stdout = _sys.__stdout__
-                    _dashboard.add_event(f"{RED}CIRCUIT BREAKER{RESET}  {MAX_CONSECUTIVE_SKIPS} consecutive skips")
-                    _dashboard.render()
-                stop_reason = f"CIRCUIT BREAKER: {MAX_CONSECUTIVE_SKIPS} consecutive scans with no viable trades"
-                break
 
         # Background sweep: retry any failed unwinds between scans
         if pending_unwinds:
