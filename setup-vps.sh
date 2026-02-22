@@ -20,7 +20,7 @@ set -euo pipefail
 
 echo "==> Installing system dependencies..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq python3 python3-pip python3-venv git
+sudo apt-get install -y -qq python3 python3-pip python3-venv git tmux
 
 echo "==> Creating Python virtual environment..."
 python3 -m venv venv
@@ -51,5 +51,8 @@ fi
 echo ""
 echo "==> Setup complete. To run:"
 echo "    cd ~/Polyshi"
+echo "    ./start.sh              # launches in tmux (recommended)"
+echo ""
+echo "    Or without tmux:"
 echo "    source venv/bin/activate"
 echo "    python main.py"
