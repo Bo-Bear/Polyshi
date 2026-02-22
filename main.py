@@ -6976,14 +6976,6 @@ def main() -> None:
             if _dashboard:
                 _dashboard.update_pending(window_trades, pending_redemption_trades)
 
-            # 1b. Refresh portfolio balances on dashboard after window close
-            if _dashboard:
-                try:
-                    refreshed_bal = check_balances(logfile)
-                    _dashboard.update_balances(refreshed_bal)
-                except Exception:
-                    pass  # non-critical — dashboard will show last known balances
-
             # 2. Window contract breakdown by coin and platform
             if window_trades:
                 # Gather per-coin, per-exchange fill data from execution legs
