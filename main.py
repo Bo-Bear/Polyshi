@@ -2973,6 +2973,25 @@ _ANSI_RESTORE_CURSOR = "\033[u"
 _ANSI_CLEAR_TO_END = "\033[J"
 DIM = "\033[2m"
 
+# ---------------------------------------------------------------------------
+# Graceful "stop" command listener
+# ---------------------------------------------------------------------------
+_stop_event = threading.Event()
+
+
+def _stdin_stop_listener() -> None:
+    """Daemon thread: waits for the user to type 'stop' on stdin, then sets the event."""
+    try:
+        while not _stop_event.is_set():
+            line = _sys.stdin.readline()
+            if not line:
+                break  # EOF / stdin closed
+            if line.strip().lower() == "stop":
+                _stop_event.set()
+                break
+    except Exception:
+        pass  # stdin not readable (e.g. piped) — silently ignore
+
 
 class CleanDashboard:
     """Static terminal dashboard that redraws in place for live_clean mode."""
@@ -6851,7 +6870,23 @@ def main() -> None:
         _sys.stdout.flush()
         _dashboard.render()
 
+    # Start background thread listening for "stop" command on stdin
+    _stop_event.clear()
+    _stop_thread = threading.Thread(target=_stdin_stop_listener, daemon=True)
+    _stop_thread.start()
+    print('  Type "stop" and press Enter at any time to gracefully end this session.\n')
+
     while time.monotonic() < session_deadline:
+        # Check for user "stop" command
+        if _stop_event.is_set():
+            stop_reason = "USER STOP: 'stop' command received"
+            print(f"\n*** {stop_reason} — stopping session ***")
+            if _dashboard:
+                _sys.stdout = _sys.__stdout__
+                _dashboard.add_event(f"{RED}SESSION STOPPED{RESET}  {stop_reason}")
+                _dashboard.render()
+            break
+
         scan_i += 1
         scan_t0 = time.monotonic()
 
