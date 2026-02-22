@@ -3003,6 +3003,7 @@ class CleanDashboard:
         # Stats — PORTFOLIO
         self.kalshi_balance = kalshi_balance
         self.poly_balance = poly_balance
+        self.initial_combined = kalshi_balance + poly_balance  # combined value at session start
         # Stats — TOTAL
         self.markets_scanned = 0
         self.profit = 0.0           # confirmed profit from ended windows only
@@ -3099,10 +3100,11 @@ class CleanDashboard:
         mins = int((elapsed % 3600) // 60)
         duration_str = f"{hours}h {mins}m"
 
-        per_hour = (self.confirmed_profit / (elapsed / 3600)) if elapsed > 60 else 0.0
+        live_profit = (self.kalshi_balance + self.poly_balance) - self.initial_combined
+        per_hour = (live_profit / (elapsed / 3600)) if elapsed > 60 else 0.0
 
-        profit_color = RED if self.confirmed_profit < 0 else ""
-        profit_reset = RESET if self.confirmed_profit < 0 else ""
+        profit_color = RED if live_profit < 0 else ""
+        profit_reset = RESET if live_profit < 0 else ""
         per_hour_color = RED if per_hour < 0 else ""
         per_hour_reset = RESET if per_hour < 0 else ""
         failed_color = RED if self.unwinds_failed > 0 else ""
@@ -3126,7 +3128,7 @@ class CleanDashboard:
         lines.append(f" {BOLD}║{RESET}  {BOLD}TOTAL{RESET}                                                       {BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Duration:      {duration_str:<42}{BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Scans:         {self.markets_scanned:<42}{BOLD}║{RESET}")
-        lines.append(f" {BOLD}║{RESET}    Profit:        {profit_color}${self.confirmed_profit:+.2f}{profit_reset}{' ' * max(0, 40 - len(f'${self.confirmed_profit:+.2f}'))}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Profit:        {profit_color}${live_profit:+.2f}{profit_reset}{' ' * max(0, 40 - len(f'${live_profit:+.2f}'))}{BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Per-Hour:      {per_hour_color}${per_hour:+.2f}{per_hour_reset}{' ' * max(0, 40 - len(f'${per_hour:+.2f}'))}{BOLD}║{RESET}")
         lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
         lines.append(f" {BOLD}║{RESET}  {BOLD}TRADES{RESET}                                                      {BOLD}║{RESET}")
