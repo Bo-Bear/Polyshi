@@ -250,9 +250,8 @@ GUARANTEED_TRADES_PER_COIN = int(os.getenv("GUARANTEED_TRADES_PER_COIN", "3"))
 AVG_EDGE_GATE = float(os.getenv("AVG_EDGE_GATE", "0.045"))  # 4.5%
 
 # Window startup: block trading for the first N seconds of each 15m window
-# to let orderbooks settle. Kalshi connections + strikes load in ~60s,
-# Poly scrape stabilizes shortly after. 75s balances reliability vs. opportunity.
-WINDOW_STARTUP_DELAY_S = float(os.getenv("WINDOW_STARTUP_DELAY_S", "75"))  # 75 seconds
+# to let orderbooks settle after window opens.
+WINDOW_STARTUP_DELAY_S = float(os.getenv("WINDOW_STARTUP_DELAY_S", "30"))  # 30 seconds
 
 
 # -----------------------------
