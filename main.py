@@ -6881,6 +6881,7 @@ def main() -> None:
     consecutive_losing_windows = 0
     window_trades: List[dict] = []                       # Trades placed in the current window
     window_open_spot_prices: Dict[str, float] = {}       # Spot prices at window open (best proxy for Poly ref)
+    pending_redemption_trades: List[dict] = []            # Trades awaiting deferred redemption (2 min into next window)
     stop_reason: Optional[str] = None
 
     if unlimited_session:
@@ -6935,18 +6936,12 @@ def main() -> None:
             print(f"  15-MIN WINDOW ENDED — Running post-market cycle")
             print(f"{'='*60}")
 
-            # Brief pause for market settlement before redemption
-            if window_trades and EXEC_MODE == "live":
-                print("  Waiting 15s for market settlement...")
-                time.sleep(15)
-
-            # 1. Redeem winning positions from the ended window
+            # Defer redemption: stash trades for redemption 2 min into the next window
+            # (gives time for positions to be closed out and ready for redemption)
             if window_trades and EXEC_MODE == "live" and POLY_SIGNATURE_TYPE == 0:
-                try:
-                    n = redeem_poly_positions(window_trades)
-                    print(f"  [window] Redeemed {n} position(s)")
-                except Exception as e:
-                    print(f"  [window] Redemption failed: {e}")
+                pending_redemption_trades.extend(window_trades)
+                print(f"  [window] Queued {len(window_trades)} trade(s) for deferred redemption "
+                      f"(will attempt ~2 min into next window)")
 
             # 1b. Refresh portfolio balances on dashboard after window close
             if _dashboard:
@@ -7198,6 +7193,19 @@ def main() -> None:
                 remaining_startup = WINDOW_STARTUP_DELAY_S - window_age_s
                 print(f"  [startup] {remaining_startup:.0f}s until trading opens "
                       f"(orderbooks settling)")
+
+        # Deferred redemption: redeem positions from previous window ~2 min into new window
+        if pending_redemption_trades and window_open_utc is not None:
+            redemption_delay_s = (datetime.now(timezone.utc) - window_open_utc).total_seconds()
+            if redemption_delay_s >= 120:  # 2 minutes into new window
+                print(f"  [redeem] 2 min into new window — attempting deferred redemption "
+                      f"of {len(pending_redemption_trades)} trade(s)...")
+                try:
+                    n = redeem_poly_positions(pending_redemption_trades)
+                    print(f"  [redeem] Deferred redemption: redeemed {n} position(s)")
+                except Exception as e:
+                    print(f"  [redeem] Deferred redemption failed: {e}")
+                pending_redemption_trades = []
 
         best_global: Optional[HedgeCandidate] = None
         best_global_poly: Optional[PolyMarketQuote] = None
@@ -7924,12 +7932,14 @@ def main() -> None:
     print(f"Trades executed: {len(logged)}")
     print(f"Wrote logs to: {logfile}")
 
-    # Final redemption pass for any remaining window trades
-    if window_trades and EXEC_MODE == "live" and POLY_SIGNATURE_TYPE == 0:
-        print(f"\n  [session-end] Running final redemption for {len(window_trades)} trade(s) in last window...")
+    # Final redemption pass for any remaining window trades + pending deferred trades
+    all_unredeemed = list(pending_redemption_trades) + list(window_trades)
+    if all_unredeemed and EXEC_MODE == "live" and POLY_SIGNATURE_TYPE == 0:
+        print(f"\n  [session-end] Running final redemption for {len(all_unredeemed)} trade(s) "
+              f"({len(pending_redemption_trades)} deferred + {len(window_trades)} current window)...")
         try:
             time.sleep(15)  # Wait for settlement
-            n = redeem_poly_positions(window_trades)
+            n = redeem_poly_positions(all_unredeemed)
             if n > 0:
                 print(f"  [session-end] Redeemed {n} position(s)")
         except Exception as e:
