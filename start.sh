@@ -43,4 +43,5 @@ fi
 
 # ── Launch new tmux session with the bot ─────────────────────────
 tmux new-session -d -s "$SESSION" -c "$DIR" "${ACTIVATE}python3 main.py"
+tmux set-option -t "$SESSION" -g mouse on
 exec tmux attach -t "$SESSION"
