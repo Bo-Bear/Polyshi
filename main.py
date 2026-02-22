@@ -203,7 +203,7 @@ POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
 POLY_FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "")
 
 # Order placement config
-ORDER_TIMEOUT_S = float(os.getenv("ORDER_TIMEOUT_S", "8"))  # max seconds to wait for fill — reduced from 15 to fail fast on resting orders
+ORDER_TIMEOUT_S = float(os.getenv("ORDER_TIMEOUT_S", "4"))  # max seconds to wait for fill — fail fast on resting orders
 ORDER_POLL_INTERVAL_S = float(os.getenv("ORDER_POLL_INTERVAL_S", "0.5"))  # polling interval
 # Price buffer added to limit orders in live mode to improve fill rate.
 # CLOB gives price improvement, so actual fill price may be lower than limit.
@@ -218,7 +218,7 @@ KALSHI_OB_BUFFER = float(os.getenv("KALSHI_OB_BUFFER", "0.02"))  # 2 cents
 # CLOB gives price improvement (fill at VWAP), so this only affects fill
 # probability, not fill price.  Must be large enough to absorb book
 # micro-movement between OB fetch and order arrival on the matching engine.
-KALSHI_CROSSING_BUFFER = float(os.getenv("KALSHI_CROSSING_BUFFER", "0.05"))  # 5 cents
+KALSHI_CROSSING_BUFFER = float(os.getenv("KALSHI_CROSSING_BUFFER", "0.08"))  # 8 cents
 
 # Poly orderbook-aware retry config (used when Kalshi fills first)
 POLY_FILL_MAX_RETRIES = int(os.getenv("POLY_FILL_MAX_RETRIES", "5"))
