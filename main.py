@@ -2996,10 +2996,13 @@ def _stdin_stop_listener() -> None:
 class CleanDashboard:
     """Static terminal dashboard that redraws in place for live_clean mode."""
 
-    DASHBOARD_LINES = 20  # fixed number of lines the dashboard occupies
+    DASHBOARD_LINES = 25  # fixed number of lines the dashboard occupies
 
-    def __init__(self, session_start_mono: float):
+    def __init__(self, session_start_mono: float, kalshi_balance: float = 0.0, poly_balance: float = 0.0):
         self._start_mono = session_start_mono
+        # Stats — PORTFOLIO
+        self.kalshi_balance = kalshi_balance
+        self.poly_balance = poly_balance
         # Stats — TOTAL
         self.markets_scanned = 0
         self.profit = 0.0           # confirmed profit from ended windows only
@@ -3059,6 +3062,13 @@ class CleanDashboard:
     def add_event(self, msg: str) -> None:
         self._add_event(msg)
 
+    def update_balances(self, balances: Dict[str, float]) -> None:
+        """Update portfolio balances from a check_balances() result."""
+        if "kalshi" in balances and balances["kalshi"] >= 0:
+            self.kalshi_balance = balances["kalshi"]
+        if "poly" in balances and balances["poly"] >= 0:
+            self.poly_balance = balances["poly"]
+
     # ---- rendering ----
 
     def render(self) -> None:
@@ -3083,6 +3093,14 @@ class CleanDashboard:
         lines.append("")
         lines.append(f" {BOLD}╔══════════════════════════════════════════════════════════════╗{RESET}")
         lines.append(f" {BOLD}║{'LIVE TRADING (clean)':^62}║{RESET}")
+        lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
+        kalshi_str = f"${self.kalshi_balance:,.2f}"
+        poly_str = f"${self.poly_balance:,.2f}"
+        combined_str = f"${self.kalshi_balance + self.poly_balance:,.2f}"
+        lines.append(f" {BOLD}║{RESET}  {BOLD}PORTFOLIO{RESET}                                                   {BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Kalshi:        {kalshi_str:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Polymarket:    {poly_str:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Combined:      {combined_str:<42}{BOLD}║{RESET}")
         lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
         lines.append(f" {BOLD}║{RESET}  {BOLD}TOTAL{RESET}                                                       {BOLD}║{RESET}")
         lines.append(f" {BOLD}║{RESET}    Duration:      {duration_str:<42}{BOLD}║{RESET}")
@@ -6873,7 +6891,11 @@ def main() -> None:
     # Initialize clean-mode dashboard
     _dashboard: Optional[CleanDashboard] = None
     if clean_mode:
-        _dashboard = CleanDashboard(session_start_mono=time.monotonic())
+        _dashboard = CleanDashboard(
+            session_start_mono=time.monotonic(),
+            kalshi_balance=balances.get("kalshi", 0.0) if balances.get("kalshi", -1) >= 0 else 0.0,
+            poly_balance=balances.get("poly", 0.0) if balances.get("poly", -1) >= 0 else 0.0,
+        )
         time.sleep(1)  # brief pause so user sees the "session started" message
         _sys.stdout.write(_ANSI_CLEAR_SCREEN)
         _sys.stdout.flush()
@@ -6925,6 +6947,14 @@ def main() -> None:
                     print(f"  [window] Redeemed {n} position(s)")
                 except Exception as e:
                     print(f"  [window] Redemption failed: {e}")
+
+            # 1b. Refresh portfolio balances on dashboard after window close
+            if _dashboard:
+                try:
+                    refreshed_bal = check_balances(logfile)
+                    _dashboard.update_balances(refreshed_bal)
+                except Exception:
+                    pass  # non-critical — dashboard will show last known balances
 
             # 2. Window contract breakdown by coin and platform
             if window_trades:
