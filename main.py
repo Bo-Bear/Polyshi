@@ -2121,12 +2121,13 @@ def prompt_execution_mode() -> str:
     """Prompt user to choose between live trading and paper testing."""
     print("\nSELECT EXECUTION MODE")
     print("=" * 45)
-    print("1) Paper Testing   — simulated trades, no real money")
-    print("2) Live Trading    — real orders on Kalshi & Polymarket")
-    print("3) Redeem Positions — collect unredeemed Polymarket winnings")
-    print("4) Session History  — review past session trade summaries")
-    print("5) Check Positions  — view current on-chain Poly holdings")
-    print("6) Portfolio History — track balance changes across sessions")
+    print("1) Paper Testing        — simulated trades, no real money")
+    print("2) Live Trading         — real orders on Kalshi & Polymarket")
+    print("3) Live Trading (clean) — live trades, streamlined dashboard")
+    print("4) Redeem Positions     — collect unredeemed Polymarket winnings")
+    print("5) Session History      — review past session trade summaries")
+    print("6) Check Positions      — view current on-chain Poly holdings")
+    print("7) Portfolio History    — track balance changes across sessions")
 
     while True:
         choice = input("\nSelect mode [1]: ").strip()
@@ -2135,14 +2136,16 @@ def prompt_execution_mode() -> str:
         if choice == "2":
             return "live"
         if choice == "3":
-            return "redeem"
+            return "live_clean"
         if choice == "4":
-            return "history"
+            return "redeem"
         if choice == "5":
-            return "positions"
+            return "history"
         if choice == "6":
+            return "positions"
+        if choice == "7":
             return "portfolio"
-        print("Invalid selection. Enter 1, 2, 3, 4, 5, or 6.")
+        print("Invalid selection. Enter 1, 2, 3, 4, 5, 6, or 7.")
 
 
 def prompt_coin_selection(available: List[str]) -> List[str]:
@@ -2955,6 +2958,150 @@ def print_scan_header(scan_i: int, extra: str = "") -> None:
         print(f"{'':>12}{extra}")
     else:
         print(line)
+
+
+# ---------------------------------------------------------------------------
+# Clean-mode dashboard
+# ---------------------------------------------------------------------------
+import sys as _sys
+import io as _io
+
+_ANSI_CLEAR_SCREEN = "\033[2J"
+_ANSI_HOME = "\033[H"
+_ANSI_SAVE_CURSOR = "\033[s"
+_ANSI_RESTORE_CURSOR = "\033[u"
+_ANSI_CLEAR_TO_END = "\033[J"
+DIM = "\033[2m"
+
+
+class CleanDashboard:
+    """Static terminal dashboard that redraws in place for live_clean mode."""
+
+    DASHBOARD_LINES = 20  # fixed number of lines the dashboard occupies
+
+    def __init__(self, session_start_mono: float):
+        self._start_mono = session_start_mono
+        # Stats — TOTAL
+        self.markets_scanned = 0
+        self.profit = 0.0
+        # Stats — TRADES
+        self.trades_total = 0
+        self.trades_both_filled = 0
+        self.trades_one_legged = 0
+        self.trades_neither_filled = 0
+        # Stats — UNWINDS
+        self.unwinds_total = 0
+        self.unwinds_successful = 0
+        self.unwinds_failed = 0
+        self.unwinds_total_loss = 0.0
+        # Event log (scrolling below dashboard)
+        self._events: list = []
+        self._first_draw = True
+
+    # ---- public update helpers ----
+
+    def record_trade(self, exec_result, row: dict) -> None:
+        """Call after each trade execution to update trade/unwind counters."""
+        self.trades_total += 1
+        if exec_result.both_filled:
+            self.trades_both_filled += 1
+            self._add_event(f"{GREEN}TRADE{RESET}  {row.get('coin','?')} both legs filled  "
+                            f"edge={row.get('net_edge', 0):.4f}")
+        elif exec_result.unwind_attempted:
+            self.trades_one_legged += 1
+            self._add_event(f"{YELLOW}TRADE{RESET}  {row.get('coin','?')} one-legged → unwind triggered")
+        else:
+            # Neither leg filled
+            self.trades_neither_filled += 1
+            self._add_event(f"{RED}TRADE{RESET}  {row.get('coin','?')} neither leg filled")
+
+        if exec_result.unwind_attempted:
+            self.unwinds_total += 1
+            if exec_result.unwind_failed:
+                self.unwinds_failed += 1
+                self._add_event(f"{RED}UNWIND FAILED{RESET}  {row.get('coin','?')} "
+                                f"{exec_result.unwind_exchange} "
+                                f"{exec_result.unwind_contracts:.0f}x")
+            else:
+                self.unwinds_successful += 1
+                loss = (exec_result.unwind_buy_price - (exec_result.unwind_sell_price or 0)) * exec_result.unwind_contracts
+                self.unwinds_total_loss += loss
+                self._add_event(f"{YELLOW}UNWIND{RESET}  {row.get('coin','?')} "
+                                f"sold @ ${exec_result.unwind_sell_price:.2f}  loss=${loss:.2f}")
+
+    def update_profit(self, profit: float) -> None:
+        self.profit = profit
+
+    def add_event(self, msg: str) -> None:
+        self._add_event(msg)
+
+    # ---- rendering ----
+
+    def render(self) -> None:
+        """Redraw the full dashboard + event log."""
+        elapsed = time.monotonic() - self._start_mono
+        hours = int(elapsed // 3600)
+        mins = int((elapsed % 3600) // 60)
+        duration_str = f"{hours}h {mins}m"
+
+        per_hour = (self.profit / (elapsed / 3600)) if elapsed > 60 else 0.0
+
+        profit_color = GREEN if self.profit >= 0 else RED
+        per_hour_color = GREEN if per_hour >= 0 else RED
+        failed_color = RED if self.unwinds_failed > 0 else ""
+        failed_reset = RESET if self.unwinds_failed > 0 else ""
+
+        lines = []
+        lines.append("")
+        lines.append(f" {BOLD}╔══════════════════════════════════════════════════════════════╗{RESET}")
+        lines.append(f" {BOLD}║{'LIVE TRADING (clean)':^62}║{RESET}")
+        lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
+        lines.append(f" {BOLD}║{RESET}  {BOLD}TOTAL{RESET}                                                       {BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Duration:      {duration_str:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Markets:       {self.markets_scanned:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Profit:        {profit_color}${self.profit:+.2f}{RESET}{' ' * max(0, 40 - len(f'${self.profit:+.2f}'))}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Per-Hour:      {per_hour_color}${per_hour:+.2f}{RESET}{' ' * max(0, 40 - len(f'${per_hour:+.2f}'))}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
+        lines.append(f" {BOLD}║{RESET}  {BOLD}TRADES{RESET}                                                      {BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Total:         {self.trades_total:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Both Filled:   {self.trades_both_filled:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    One-Legged:    {self.trades_one_legged:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Neither Filled: {self.trades_neither_filled:<41}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}╠══════════════════════════════════════════════════════════════╣{RESET}")
+        lines.append(f" {BOLD}║{RESET}  {BOLD}UNWINDS{RESET}                                                     {BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Total:         {self.unwinds_total:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Successful:    {self.unwinds_successful:<42}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Failed:        {failed_color}{self.unwinds_failed}{failed_reset}{' ' * max(0, 42 - len(str(self.unwinds_failed)))}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}║{RESET}    Total Loss:    {RED}${self.unwinds_total_loss:.2f}{RESET}{' ' * max(0, 40 - len(f'${self.unwinds_total_loss:.2f}'))}{BOLD}║{RESET}")
+        lines.append(f" {BOLD}╚══════════════════════════════════════════════════════════════╝{RESET}")
+        lines.append("")
+
+        # Build full output: dashboard + event log
+        output = _ANSI_HOME + _ANSI_CLEAR_TO_END
+        output += "\n".join(lines)
+
+        # Event log section
+        if self._events:
+            output += f" {DIM}{'─' * 62}{RESET}\n"
+            output += f" {BOLD} EVENTS{RESET}\n"
+            # Show last 15 events
+            for evt in self._events[-15:]:
+                output += f"  {evt}\n"
+
+        _sys.stdout.write(output)
+        _sys.stdout.flush()
+
+        if self._first_draw:
+            self._first_draw = False
+
+    # ---- internals ----
+
+    def _add_event(self, msg: str) -> None:
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        self._events.append(f"{DIM}{ts}{RESET}  {msg}")
+        # Keep max 50 events in memory
+        if len(self._events) > 50:
+            self._events = self._events[-50:]
 
 
 def fmt_money(x: float) -> str:
@@ -6427,6 +6574,9 @@ def main() -> None:
 
     # First choice: execution mode
     EXEC_MODE = prompt_execution_mode()
+    clean_mode = EXEC_MODE == "live_clean"
+    if clean_mode:
+        EXEC_MODE = "live"  # behaves like live trading with streamlined UI
 
     # Redeem mode: collect unredeemed Polymarket winnings and exit
     if EXEC_MODE == "redeem":
@@ -6491,7 +6641,12 @@ def main() -> None:
 
     print("\nConfirm settings")
     print("=" * 45)
-    mode_label = "*** LIVE TRADING ***" if EXEC_MODE == "live" else "Paper Testing"
+    if clean_mode:
+        mode_label = "*** LIVE TRADING (clean) ***"
+    elif EXEC_MODE == "live":
+        mode_label = "*** LIVE TRADING ***"
+    else:
+        mode_label = "Paper Testing"
     if session_duration_s == 0:
         duration_label = "Unlimited"
     elif session_duration_s < 3600:
@@ -6687,13 +6842,29 @@ def main() -> None:
     else:
         print(f"\n  Session started — will run until {session_end_utc.strftime('%H:%M:%S')} UTC ({duration_label})")
 
+    # Initialize clean-mode dashboard
+    _dashboard: Optional[CleanDashboard] = None
+    if clean_mode:
+        _dashboard = CleanDashboard(session_start_mono=time.monotonic())
+        time.sleep(1)  # brief pause so user sees the "session started" message
+        _sys.stdout.write(_ANSI_CLEAR_SCREEN)
+        _sys.stdout.flush()
+        _dashboard.render()
+
     while time.monotonic() < session_deadline:
         scan_i += 1
         scan_t0 = time.monotonic()
 
+        # In clean mode, suppress all verbose output
+        if _dashboard:
+            _dashboard.markets_scanned = scan_i
+            _sys.stdout = _io.StringIO()  # suppress prints
+
         # --- Window transition: detect when the previous 15m window has closed ---
         now_utc = datetime.now(timezone.utc)
         if current_window_close_ts and now_utc > current_window_close_ts:
+            if _dashboard:
+                _dashboard.add_event(f"{BOLD}WINDOW{RESET}  15-min window ended — post-market cycle")
             print(f"\n{'='*60}")
             print(f"  15-MIN WINDOW ENDED — Running post-market cycle")
             print(f"{'='*60}")
@@ -6830,6 +7001,10 @@ def main() -> None:
 
             if stop_reason:
                 print(f"\n*** {stop_reason} — stopping session ***")
+                if _dashboard:
+                    _sys.stdout = _sys.__stdout__
+                    _dashboard.add_event(f"{RED}SESSION STOPPED{RESET}  {stop_reason}")
+                    _dashboard.render()
                 break
 
         # Show remaining session time in header
@@ -7482,6 +7657,9 @@ def main() -> None:
             if exec_result.both_filled:
                 successful_trades += 1
 
+            if _dashboard:
+                _dashboard.record_trade(exec_result, row)
+
             # Per-coin tracking: update trade count, edge history, and unwind counter
             traded_coin = best_global.coin
             coin_trade_counts[traded_coin] = coin_trade_counts.get(traded_coin, 0) + 1
@@ -7581,11 +7759,17 @@ def main() -> None:
                     current_bal = check_balances(logfile)
                     current_total = sum(v for v in current_bal.values() if v >= 0)
                     drawdown = session_start_total - current_total
+                    if _dashboard:
+                        _dashboard.update_profit(-drawdown)
                     print(f"\n  [drawdown] Session P&L: ${-drawdown:+.2f} "
                           f"(start: ${session_start_total:.2f}, now: ${current_total:.2f})")
                     if MAX_SESSION_DRAWDOWN > 0 and drawdown >= MAX_SESSION_DRAWDOWN:
                         stop_reason = f"DRAWDOWN LIMIT HIT: ${drawdown:.2f} >= ${MAX_SESSION_DRAWDOWN:.2f}"
                         print(f"\n*** {stop_reason} — stopping session ***")
+                        if _dashboard:
+                            _sys.stdout = _sys.__stdout__
+                            _dashboard.add_event(f"{RED}SESSION STOPPED{RESET}  {stop_reason}")
+                            _dashboard.render()
                         break
                     # Balance floor check: stop if either account < $50
                     for exch, bal in current_bal.items():
@@ -7595,6 +7779,10 @@ def main() -> None:
                             print(f"\n*** {stop_reason} — stopping session ***")
                             break
                     if stop_reason:
+                        if _dashboard:
+                            _sys.stdout = _sys.__stdout__
+                            _dashboard.add_event(f"{RED}SESSION STOPPED{RESET}  {stop_reason}")
+                            _dashboard.render()
                         break
                 except Exception as e:
                     print(f"  [drawdown] Balance check failed: {e}")
@@ -7614,14 +7802,27 @@ def main() -> None:
                 print()
             if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
                 print(f"\n⚠ Circuit breaker: {MAX_CONSECUTIVE_SKIPS} consecutive scans with no viable trades. Stopping.")
+                if _dashboard:
+                    _sys.stdout = _sys.__stdout__
+                    _dashboard.add_event(f"{RED}CIRCUIT BREAKER{RESET}  {MAX_CONSECUTIVE_SKIPS} consecutive skips")
+                    _dashboard.render()
                 break
 
         # Background sweep: retry any failed unwinds between scans
         if pending_unwinds:
             pending_unwinds = _retry_pending_unwinds(pending_unwinds, logfile, coin_stopped)
 
+        # Restore stdout and render dashboard in clean mode
+        if _dashboard:
+            _sys.stdout = _sys.__stdout__
+            _dashboard.render()
+
         if time.monotonic() < session_deadline:
             time.sleep(SCAN_SLEEP_SECONDS)
+
+    # Ensure stdout is restored after clean mode loop
+    if _dashboard:
+        _sys.stdout = _sys.__stdout__
 
     # Final sweep: one last attempt to close any remaining failed unwinds
     if pending_unwinds:
